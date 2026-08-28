@@ -1,0 +1,8 @@
+# Copy this file to the cloudflared service configuration directory.
+tunnel: YOUR_TUNNEL_UUID
+credentials-file: C:\\Windows\\System32\\config\\systemprofile\\.cloudflared\\YOUR_TUNNEL_UUID.json
+
+ingress:
+  - hostname: eve-mcp.example.com
+    service: http://127.0.0.1:3001
+  - service: http_status:404

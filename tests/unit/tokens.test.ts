@@ -17,6 +17,8 @@ import {
   listCharacters,
   getCurrentCharacter,
   setCurrentCharacterId,
+  recordLoyaltyPointSnapshot,
+  listLoyaltyPointActivity,
   closeAuthDb,
 } from "../../src/auth/tokens.js";
 import type { OAuthTokens, CharacterInfo } from "../../src/auth/oauth.js";
@@ -95,6 +97,58 @@ describe("token store lifecycle", () => {
 
   it("returns null for unknown character", () => {
     expect(getTokens(99999)).toBeNull();
+  });
+});
+
+describe("loyalty point snapshot tracking", () => {
+  it("uses the first observation as a baseline", () => {
+    const changes = recordLoyaltyPointSnapshot(4001, [
+      { corporationId: 1000125, loyaltyPoints: 1200 },
+    ], "2026-08-28T10:00:00.000Z");
+    expect(changes).toEqual([]);
+    expect(listLoyaltyPointActivity(4001)).toEqual([]);
+  });
+
+  it("records earned and spent LP deltas between observations", () => {
+    recordLoyaltyPointSnapshot(4002, [
+      { corporationId: 10, loyaltyPoints: 1000 },
+      { corporationId: 20, loyaltyPoints: 500 },
+    ], "2026-08-28T10:00:00.000Z");
+
+    const changes = recordLoyaltyPointSnapshot(4002, [
+      { corporationId: 10, loyaltyPoints: 1250 },
+      { corporationId: 20, loyaltyPoints: 300 },
+    ], "2026-08-28T11:00:00.000Z");
+
+    expect(changes.map((row) => [row.corporationId, row.delta])).toEqual([
+      [10, 250],
+      [20, -200],
+    ]);
+    expect(listLoyaltyPointActivity(4002, { corporationId: 20 })).toMatchObject([
+      { corporationId: 20, delta: -200, previousBalance: 500, currentBalance: 300 },
+    ]);
+  });
+
+  it("records a missing corporation as a zero balance", () => {
+    recordLoyaltyPointSnapshot(4003, [
+      { corporationId: 30, loyaltyPoints: 75 },
+    ], "2026-08-28T10:00:00.000Z");
+    recordLoyaltyPointSnapshot(4003, [], "2026-08-28T12:00:00.000Z");
+
+    expect(listLoyaltyPointActivity(4003)).toMatchObject([
+      { corporationId: 30, delta: -75, previousBalance: 75, currentBalance: 0 },
+    ]);
+  });
+
+  it("tracks a gain after an empty baseline", () => {
+    recordLoyaltyPointSnapshot(4004, [], "2026-08-28T10:00:00.000Z");
+    recordLoyaltyPointSnapshot(4004, [
+      { corporationId: 40, loyaltyPoints: 600 },
+    ], "2026-08-28T13:00:00.000Z");
+
+    expect(listLoyaltyPointActivity(4004)).toMatchObject([
+      { corporationId: 40, delta: 600, previousBalance: 0, currentBalance: 600 },
+    ]);
   });
 });
 

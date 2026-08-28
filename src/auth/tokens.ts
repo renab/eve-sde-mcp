@@ -43,6 +43,28 @@ function getAuthDb(): Database.Database {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS loyalty_point_balances (
+      character_id INTEGER NOT NULL,
+      corporation_id INTEGER NOT NULL,
+      loyalty_points INTEGER NOT NULL,
+      observed_at TEXT NOT NULL,
+      PRIMARY KEY (character_id, corporation_id)
+    );
+    CREATE TABLE IF NOT EXISTS loyalty_point_snapshots (
+      character_id INTEGER PRIMARY KEY,
+      observed_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS loyalty_point_activity (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      character_id INTEGER NOT NULL,
+      corporation_id INTEGER NOT NULL,
+      delta INTEGER NOT NULL,
+      previous_balance INTEGER NOT NULL,
+      current_balance INTEGER NOT NULL,
+      observed_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_loyalty_activity_character_time
+      ON loyalty_point_activity (character_id, observed_at DESC);
   `);
 
   return authDb;
@@ -161,6 +183,131 @@ export function getCurrentCharacter(): StoredCharacter | null {
     .get() as { character_id: number } | undefined;
   if (!row) return null;
   return getTokens(row.character_id);
+}
+
+export interface LoyaltyPointBalance {
+  corporationId: number;
+  loyaltyPoints: number;
+}
+
+export interface LoyaltyPointActivity {
+  id: number;
+  characterId: number;
+  corporationId: number;
+  delta: number;
+  previousBalance: number;
+  currentBalance: number;
+  observedAt: string;
+}
+
+export function recordLoyaltyPointSnapshot(
+  characterId: number,
+  balances: LoyaltyPointBalance[],
+  observedAt = new Date().toISOString()
+): LoyaltyPointActivity[] {
+  const db = getAuthDb();
+  const record = db.transaction(() => {
+    const previousRows = db
+      .prepare(
+        "SELECT corporation_id, loyalty_points FROM loyalty_point_balances WHERE character_id = ?"
+      )
+      .all(characterId) as Array<{ corporation_id: number; loyalty_points: number }>;
+    const previous = new Map(previousRows.map((row) => [row.corporation_id, row.loyalty_points]));
+    const current = new Map(balances.map((row) => [row.corporationId, row.loyaltyPoints]));
+    const hasBaseline = Boolean(
+      db.prepare("SELECT 1 FROM loyalty_point_snapshots WHERE character_id = ?").get(characterId)
+    );
+    const activity: LoyaltyPointActivity[] = [];
+
+    if (hasBaseline) {
+      const corporationIds = new Set([...previous.keys(), ...current.keys()]);
+      const insert = db.prepare(
+        `INSERT INTO loyalty_point_activity
+         (character_id, corporation_id, delta, previous_balance, current_balance, observed_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      );
+      for (const corporationId of corporationIds) {
+        const previousBalance = previous.get(corporationId) ?? 0;
+        const currentBalance = current.get(corporationId) ?? 0;
+        const delta = currentBalance - previousBalance;
+        if (delta === 0) continue;
+        const result = insert.run(
+          characterId,
+          corporationId,
+          delta,
+          previousBalance,
+          currentBalance,
+          observedAt
+        );
+        activity.push({
+          id: Number(result.lastInsertRowid),
+          characterId,
+          corporationId,
+          delta,
+          previousBalance,
+          currentBalance,
+          observedAt,
+        });
+      }
+    }
+
+    db.prepare("DELETE FROM loyalty_point_balances WHERE character_id = ?").run(characterId);
+    const upsert = db.prepare(
+      `INSERT INTO loyalty_point_balances
+       (character_id, corporation_id, loyalty_points, observed_at)
+       VALUES (?, ?, ?, ?)`
+    );
+    for (const balance of balances) {
+      upsert.run(characterId, balance.corporationId, balance.loyaltyPoints, observedAt);
+    }
+    db.prepare(
+      `INSERT INTO loyalty_point_snapshots (character_id, observed_at) VALUES (?, ?)
+       ON CONFLICT(character_id) DO UPDATE SET observed_at = excluded.observed_at`
+    ).run(characterId, observedAt);
+
+    return activity;
+  });
+
+  return record();
+}
+
+export function listLoyaltyPointActivity(
+  characterId: number,
+  options?: { corporationId?: number; since?: string; limit?: number }
+): LoyaltyPointActivity[] {
+  let sql = `SELECT id, character_id, corporation_id, delta, previous_balance,
+                    current_balance, observed_at
+             FROM loyalty_point_activity WHERE character_id = ?`;
+  const params: Array<number | string> = [characterId];
+  if (options?.corporationId !== undefined) {
+    sql += " AND corporation_id = ?";
+    params.push(options.corporationId);
+  }
+  if (options?.since) {
+    sql += " AND observed_at >= ?";
+    params.push(options.since);
+  }
+  sql += " ORDER BY observed_at DESC, id DESC LIMIT ?";
+  params.push(options?.limit ?? 100);
+
+  const rows = getAuthDb().prepare(sql).all(...params) as Array<{
+    id: number;
+    character_id: number;
+    corporation_id: number;
+    delta: number;
+    previous_balance: number;
+    current_balance: number;
+    observed_at: string;
+  }>;
+  return rows.map((row) => ({
+    id: row.id,
+    characterId: row.character_id,
+    corporationId: row.corporation_id,
+    delta: row.delta,
+    previousBalance: row.previous_balance,
+    currentBalance: row.current_balance,
+    observedAt: row.observed_at,
+  }));
 }
 
 export function closeAuthDb(): void {

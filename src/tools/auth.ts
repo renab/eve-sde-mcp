@@ -14,10 +14,19 @@ import {
 import { readClientId } from "../auth/esi-client.js";
 import { getSdeDir } from "../database.js";
 
+type LoginState =
+  | { status: "idle" }
+  | { status: "pending"; startedAt: string }
+  | { status: "succeeded"; characterName: string; characterId: number; completedAt: string }
+  | { status: "failed"; error: string; completedAt: string };
+
+let loginState: LoginState = { status: "idle" };
+let loginAttemptId = 0;
+
 export function registerAuthTools(server: McpServer): void {
   server.tool(
     "esi_login",
-    "Start EVE SSO login. Opens the browser for authentication and waits for completion (up to 5 minutes). Returns the authenticated character name when done.",
+    "Start EVE SSO login. Returns an authorization URL immediately. Open it on the MCP host within 5 minutes, then use esi_status to confirm completion.",
     {
       client_id: z
         .string()
@@ -49,41 +58,43 @@ export function registerAuthTools(server: McpServer): void {
       }
 
       const { authUrl } = startLoginFlow(clientId);
+      const attemptId = ++loginAttemptId;
+      loginState = { status: "pending", startedAt: new Date().toISOString() };
 
-      try {
-        const { execFile } = await import("child_process");
-        execFile("open", [authUrl]);
-      } catch {
-        // Browser open is best-effort
-      }
+      // Complete the callback and token storage independently of this MCP request.
+      // This keeps remote clients from timing out while the user signs in.
+      void waitForLogin()
+        .then((result) => {
+          if (attemptId !== loginAttemptId) return;
+          storeTokens(result.tokens, result.character);
+          setCurrentCharacterId(result.character.characterId);
+          loginState = {
+            status: "succeeded",
+            characterName: result.character.characterName,
+            characterId: result.character.characterId,
+            completedAt: new Date().toISOString(),
+          };
+          process.stderr.write(
+            `EVE SSO authenticated as ${result.character.characterName} (${result.character.characterId}).\n`
+          );
+        })
+        .catch((err) => {
+          if (attemptId !== loginAttemptId) return;
+          const message = err instanceof Error ? err.message : String(err);
+          loginState = { status: "failed", error: message, completedAt: new Date().toISOString() };
+          process.stderr.write(`EVE SSO login failed: ${message}\n`);
+        });
 
-      process.stderr.write(
-        `Waiting for EVE SSO callback (up to 5 minutes)...\n`
-      );
-
-      try {
-        const result = await waitForLogin();
-        storeTokens(result.tokens, result.character);
-        setCurrentCharacterId(result.character.characterId);
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Authenticated as ${result.character.characterName} (${result.character.characterId}). Scopes: ${result.character.scopes}`,
-            },
-          ],
-        };
-      } catch (err) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Login failed: ${err instanceof Error ? err.message : String(err)}. Try again with esi_login.`,
-            },
-          ],
-        };
-      }
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Open this EVE SSO authorization URL on the Windows machine running the MCP within 5 minutes:\n\n${authUrl}\n\n` +
+              "After approving the requested scopes and selecting a character, use esi_status to confirm the connection.",
+          },
+        ],
+      };
     }
   );
 
@@ -96,13 +107,26 @@ export function registerAuthTools(server: McpServer): void {
       if (characters.length === 0) {
         return {
           content: [
-            { type: "text", text: "No authenticated characters. Use esi_login to authenticate." },
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  login: loginState,
+                  currentCharacter: null,
+                  characters: [],
+                  message: "No authenticated characters. Use esi_login to authenticate.",
+                },
+                null,
+                2
+              ),
+            },
           ],
         };
       }
 
       const current = getCurrentCharacter();
       const result = {
+        login: loginState,
         currentCharacter: current
           ? { name: current.characterName, id: current.characterId }
           : null,

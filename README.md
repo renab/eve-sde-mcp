@@ -40,6 +40,8 @@ Static data is powered by the [Fuzzwork](https://www.fuzzwork.co.uk/dump/) SQLit
 | `get_skill_queue` | Current skill training queue |
 | `get_character_attributes` | Character attributes (int/mem/per/will/cha) |
 | `check_skill_requirements` | Check if character meets skill reqs for a ship/module |
+| `get_loyalty_points` | Current LP wallet balances by NPC corporation |
+| `get_loyalty_point_activity` | LP gains/spending observed between MCP balance polls |
 
 ### Market & Trading (ESI)
 
@@ -111,6 +113,57 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 Restart Claude Desktop to connect.
 
+## Remote HTTP Bridge (ChatGPT)
+
+The server also provides a stateless Streamable HTTP endpoint suitable for a
+ChatGPT MCP connector. It listens on loopback by default. Authentication for a
+remote deployment is enforced at the Cloudflare Access layer, matching the
+Sweetwater MCP deployment; the local origin does not implement authentication.
+
+```powershell
+Copy-Item .env.example .env
+npm install
+npm run build
+npm run start:http
+```
+
+Endpoints:
+
+- `GET /health` — unauthenticated, minimal health probe
+- `POST /mcp` — authenticated MCP Streamable HTTP endpoint
+
+The bridge writes structured JSON access logs to stdout for PM2. MCP request
+entries contain the JSON-RPC method, tool name, and complete arguments; matching
+response entries contain the HTTP status and duration. Request headers are not
+logged, keeping OAuth bearer tokens and Cloudflare credentials out of the log.
+View recent activity with `pm2 logs eve-sde-mcp --lines 100 --nostream`.
+
+### Persistent Windows deployment
+
+1. Install PM2 and its Windows service integration from an elevated terminal.
+2. Build the project, create `.env`, then register and persist the process:
+
+   ```powershell
+   pm2 start ecosystem.config.cjs
+   pm2 save
+   pm2 logs eve-sde-mcp
+   ```
+
+3. Configure the PM2 Windows service to run under the same Windows account. This
+   matters because the SDE, EVE SSO configuration, and encrypted character tokens
+   live in that account's `%USERPROFILE%\.eve-sde` directory.
+4. Create a named Cloudflare Tunnel whose public hostname routes to
+   `http://127.0.0.1:3001`. A configuration template is provided at
+   `deploy/cloudflared-config.yml.example`. Install `cloudflared` as a Windows
+   service so the tunnel survives logout and reboot.
+5. Protect the public hostname with a Cloudflare Access policy, then use
+   `https://YOUR_HOSTNAME/mcp` as the MCP URL in ChatGPT.
+
+Keep `.env`, the tunnel credentials JSON, and Cloudflare service tokens out of
+Git. Leave the origin bound to `127.0.0.1`; Cloudflare Tunnel does not require a
+public firewall port. Do not publish the origin directly: Cloudflare Access is
+the authentication boundary for this deployment.
+
 ## ESI Authentication
 
 To use the live character data tools, you need an EVE SSO application:
@@ -120,7 +173,9 @@ To use the live character data tools, you need an EVE SSO application:
    ```json
    { "clientId": "your_client_id_here" }
    ```
-3. Use the `esi_login` tool — it opens a browser for EVE SSO login and stores encrypted tokens locally
+3. Use the `esi_login` tool. It immediately returns an EVE SSO authorization URL.
+4. Open that URL on the Windows machine running the MCP within five minutes, approve the scopes, and select a character. EVE redirects the local browser to `http://localhost:8085/callback` and the MCP stores the tokens in the background.
+5. Use `esi_status` to confirm that authentication succeeded.
 
 Tokens are encrypted at rest (AES-256-GCM) and stored in `~/.eve-sde/auth.db`. Scopes include skill reading, wallet, market, industry, assets, contracts, and fittings (read+write). Multi-character support is built in.
 

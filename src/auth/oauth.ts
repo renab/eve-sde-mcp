@@ -23,6 +23,7 @@ const DEFAULT_SCOPES = [
   "esi-fittings.read_fittings.v1",
   "esi-fittings.write_fittings.v1",
   "esi-killmails.read_killmails.v1",
+  "esi-characters.read_loyalty.v1",
 ];
 
 export interface OAuthTokens {
