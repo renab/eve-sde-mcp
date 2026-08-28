@@ -43,6 +43,10 @@ Static data is powered by the [Fuzzwork](https://www.fuzzwork.co.uk/dump/) SQLit
 | `get_loyalty_points` | Current LP wallet balances by NPC corporation |
 | `get_loyalty_point_activity` | LP gains/spending observed between MCP balance polls |
 
+LP balance polls bypass the MCP's local ESI cache so activity tracking relies
+only on the upstream ESI cache. Upstream caching can still delay when an in-game
+LP change becomes visible to the tools.
+
 ### Market & Trading (ESI)
 
 | Tool | Description |

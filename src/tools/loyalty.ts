@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { esiGet, esiPost, getActiveCharacter, ESI_CACHE_TTL } from "../auth/esi-client.js";
+import { esiGet, esiPost, getActiveCharacter } from "../auth/esi-client.js";
 import {
   listLoyaltyPointActivity,
   recordLoyaltyPointSnapshot,
@@ -22,7 +22,7 @@ interface EsiName {
 async function fetchBalances(characterId: number): Promise<LoyaltyPointBalance[]> {
   const rows = await esiGet<EsiLoyaltyPoint[]>(
     `/characters/${characterId}/loyalty/points/`,
-    { characterId, cacheTtlMs: ESI_CACHE_TTL }
+    { characterId }
   );
   return rows.map((row) => ({
     corporationId: row.corporation_id,
@@ -102,7 +102,7 @@ export function registerLoyaltyTools(server: McpServer): void {
       return jsonResult({
         characterName: char.characterName,
         trackingNote:
-          "ESI exposes current LP balances only. These entries are changes observed between MCP polls, not CCP transaction records.",
+          "ESI exposes current LP balances only. These entries are changes observed between MCP polls, not Fenris Creations transaction records. The MCP does not cache LP balances, but upstream ESI caching can delay visible changes.",
         changesObservedThisPoll,
         count: activity.length,
         activity: activity.map((row) => ({
