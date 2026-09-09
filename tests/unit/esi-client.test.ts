@@ -10,11 +10,31 @@ vi.mock("../../src/auth/oauth.js", () => ({
   refreshAccessToken: vi.fn(),
 }));
 
-import { esiGet, esiGetAll, esiPost, esiDelete, esiGetWithMetadata } from "../../src/auth/esi-client.js";
+import { esiGet, esiGetAll, esiPost, esiDelete, esiGetWithMetadata, esiCalculateRoute } from "../../src/auth/esi-client.js";
 import { getTokens } from "../../src/auth/tokens.js";
 
 const mockFetch = vi.fn();
 vi.stubGlobal("fetch", mockFetch);
+
+describe("dated public route API", () => {
+  it("posts without authentication or a local cache", async () => {
+    mockFetch.mockReset();
+    mockFetch.mockImplementation(async () => jsonResponse({ route: [1, 2] }));
+    const body = { preference: "Safer" as const, security_penalty: 50, avoid_systems: [] };
+    expect(await esiCalculateRoute(1, 2, body)).toEqual({ route: [1, 2] });
+    await esiCalculateRoute(1, 2, body);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch).toHaveBeenCalledWith("https://esi.evetech.net/route/1/2", {
+      method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json", "X-Compatibility-Date": "2025-09-30" },
+      body: JSON.stringify(body),
+    });
+  });
+  it("surfaces route errors", async () => {
+    mockFetch.mockReset();
+    mockFetch.mockResolvedValue(jsonResponse({ error: "No route" }, { status: 404 }));
+    await expect(esiCalculateRoute(1, 2, { preference: "Shorter", security_penalty: 50, avoid_systems: [] })).rejects.toThrow();
+  });
+});
 
 function jsonResponse(data: unknown, opts?: { status?: number; headers?: Record<string, string> }): Response {
   const headers = new Headers({ "Content-Type": "application/json", ...(opts?.headers ?? {}) });

@@ -204,6 +204,25 @@ export async function esiGetAll<T>(
   return allData;
 }
 
+// The dated route API is public and explicitly not cached by ESI.
+export async function esiCalculateRoute(
+  origin: number,
+  destination: number,
+  body: { preference: "Shorter" | "Safer" | "LessSecure"; security_penalty: number; avoid_systems: number[] }
+): Promise<{ route: number[] }> {
+  const esiPath = `/route/${origin}/${destination}`;
+  const response = await fetchWithRetry(`https://esi.evetech.net${esiPath}`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "X-Compatibility-Date": "2025-09-30",
+    },
+    body: JSON.stringify(body),
+  }, esiPath);
+  return handleResponse<{ route: number[] }>(response, esiPath);
+}
+
 export async function esiPost<T>(
   esiPath: string,
   body: unknown,

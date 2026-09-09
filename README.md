@@ -87,6 +87,7 @@ LP change becomes visible to the tools.
 | `get_character_assets` | Items in hangars/containers with names |
 | `get_corporation_assets` | Corporation assets visible to a Director, with names and filters |
 | `set_autopilot_destination` | Set an in-game autopilot destination or waypoint |
+| `get_route` | Calculate an ESI route between system names/IDs, with shorter/safer/less_secure preferences, avoidance, and ordered names/security; does not read or change the client route |
 | `get_planetary_colonies` | List a character's planetary-industry colonies |
 | `get_planetary_colony` | Read pins, factories, extractors, links, and routes for one colony |
 | `get_planetary_schematic` | Look up PI schematic inputs, outputs, and cycle time |
