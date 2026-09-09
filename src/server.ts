@@ -11,6 +11,9 @@ import { registerIndustryEsiTools } from "./tools/industry-esi.js";
 import { registerFittingTools } from "./tools/fittings.js";
 import { registerKillmailTools } from "./tools/killmails.js";
 import { registerLoyaltyTools } from "./tools/loyalty.js";
+import { registerNavigationTools } from "./tools/navigation.js";
+import { registerPlanetaryTools } from "./tools/planetary.js";
+import { registerDailyTools } from "./tools/daily.js";
 
 export const SERVER_INFO = {
   name: "eve-sde",
@@ -33,6 +36,9 @@ export function createMcpServer(): McpServer {
   registerFittingTools(server);
   registerKillmailTools(server);
   registerLoyaltyTools(server);
+  registerNavigationTools(server);
+  registerPlanetaryTools(server);
+  registerDailyTools(server);
 
   return server;
 }

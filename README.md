@@ -85,6 +85,24 @@ LP change becomes visible to the tools.
 | `get_industry_jobs` | Active/recent manufacturing, research, invention jobs |
 | `get_industry_cost_indices` | System cost indices for industry (public) |
 | `get_character_assets` | Items in hangars/containers with names |
+| `get_corporation_assets` | Corporation assets visible to a Director, with names and filters |
+| `set_autopilot_destination` | Set an in-game autopilot destination or waypoint |
+| `get_planetary_colonies` | List a character's planetary-industry colonies |
+| `get_planetary_colony` | Read pins, factories, extractors, links, and routes for one colony |
+| `get_planetary_schematic` | Look up PI schematic inputs, outputs, and cycle time |
+| `get_character_location` | Current solar system and docked location |
+| `get_character_ship` | Current ship type, item ID, and name |
+| `get_character_clones` | Home station, jump clones and their implants |
+| `get_character_implants` | Active-clone implants with names |
+| `get_character_mining` | Available 30-day mining ledger with ore/system names |
+| `get_character_blueprints` | Owned blueprints, research levels, runs and locations |
+| `get_contract_items` | Included/requested items in a character contract |
+
+New ESI capabilities require running `esi_login` again for each character whose
+stored token lacks the required scopes. Enable these scopes on the EVE developer
+application as well. Refresh tokens cannot acquire additional scopes themselves.
+The daily-use tools rely on upstream ESI caching without adding a local cache.
+Ledger, blueprint and contract-item results support `type_id`, `limit` and `offset`.
 | `get_character_contracts` | Courier, item exchange, auction contracts |
 
 ## Setup
@@ -181,7 +199,7 @@ To use the live character data tools, you need an EVE SSO application:
 4. Open that URL on the Windows machine running the MCP within five minutes, approve the scopes, and select a character. EVE redirects the local browser to `http://localhost:8085/callback` and the MCP stores the tokens in the background.
 5. Use `esi_status` to confirm that authentication succeeded.
 
-Tokens are encrypted at rest (AES-256-GCM) and stored in `~/.eve-sde/auth.db`. Scopes include skill reading, wallet, market, industry, assets, contracts, and fittings (read+write). Multi-character support is built in.
+Tokens are encrypted at rest (AES-256-GCM) and stored in `~/.eve-sde/auth.db`. Scopes include skill reading, wallet, market, industry, planetary industry, character and corporation assets, contracts, fittings (read+write), and autopilot waypoint updates. Corporation assets require the authenticated character to have the Director role. ESI exposes planetary industry and skill queues as read-only, so neither can be modified through this MCP. Multi-character support is built in.
 
 ## Development
 

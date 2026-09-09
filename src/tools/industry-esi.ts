@@ -190,6 +190,88 @@ export function registerIndustryEsiTools(server: McpServer): void {
   );
 
   server.tool(
+    "get_corporation_assets",
+    "Get corporation assets visible to the authenticated character, enriched with SDE type names. Requires the esi-assets.read_corporation_assets.v1 scope and the Director corporation role.",
+    {
+      character_id: z.number().optional().describe("Character ID (uses active character if omitted)"),
+      corporation_id: z.number().optional().describe("Corporation ID (defaults to the authenticated character's current corporation)"),
+      type_name: z.string().optional().describe("Filter assets by item type name"),
+      location_id: z.number().optional().describe("Filter by location ID"),
+      location_flag: z.string().optional().describe("Filter by location flag, such as CorpSAG1 or Deliveries"),
+      limit: z.number().int().min(1).max(5000).default(500).describe("Maximum assets to return after filtering"),
+      offset: z.number().int().min(0).default(0).describe("Number of filtered assets to skip"),
+    },
+    async ({ character_id, corporation_id, type_name, location_id, location_flag, limit, offset }) => {
+      const char = await getActiveCharacter(character_id);
+      if (!char.scopes.split(" ").includes("esi-assets.read_corporation_assets.v1")) {
+        throw new Error(
+          "The selected character token does not include esi-assets.read_corporation_assets.v1. Run esi_login again and approve the updated scopes."
+        );
+      }
+      let corporationId = corporation_id;
+      if (!corporationId) {
+        const publicCharacter = await esiGet<{ corporation_id: number }>(
+          `/characters/${char.characterId}/`,
+          { public: true, cacheTtlMs: ESI_CACHE_TTL }
+        );
+        corporationId = publicCharacter.corporation_id;
+      }
+
+      const assets = await esiGetAll<{
+        item_id: number;
+        type_id: number;
+        location_id: number;
+        location_type: string;
+        quantity: number;
+        location_flag: string;
+        is_singleton: boolean;
+        is_blueprint_copy?: boolean;
+      }>(`/corporations/${corporationId}/assets/`, {
+        characterId: char.characterId,
+        cacheTtlMs: ESI_CACHE_TTL,
+      });
+
+      const db = getDatabase();
+      let enriched = assets.map((asset) => ({
+        itemId: asset.item_id,
+        typeName: enrichTypeName(db, asset.type_id),
+        typeId: asset.type_id,
+        quantity: asset.quantity,
+        locationId: asset.location_id,
+        locationType: asset.location_type,
+        locationFlag: asset.location_flag,
+        isSingleton: asset.is_singleton,
+        isBlueprintCopy: asset.is_blueprint_copy ?? false,
+      }));
+
+      if (type_name) {
+        const query = type_name.toLowerCase();
+        enriched = enriched.filter((asset) => asset.typeName.toLowerCase().includes(query));
+      }
+      if (location_id !== undefined) {
+        enriched = enriched.filter((asset) => asset.locationId === location_id);
+      }
+      if (location_flag) {
+        const query = location_flag.toLowerCase();
+        enriched = enriched.filter((asset) => asset.locationFlag.toLowerCase() === query);
+      }
+
+      const filteredAssetCount = enriched.length;
+      const page = enriched.slice(offset, offset + limit);
+      return jsonResult({
+        characterName: char.characterName,
+        corporationId,
+        totalCorporationAssets: assets.length,
+        filteredAssetCount,
+        returnedAssetCount: page.length,
+        offset,
+        limit,
+        assets: page,
+      });
+    }
+  );
+
+  server.tool(
     "get_character_contracts",
     "Get contracts for the authenticated character — courier, item exchange, and auction contracts. Supports filtering by type and status.",
     {

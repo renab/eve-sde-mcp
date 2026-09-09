@@ -19,11 +19,20 @@ const DEFAULT_SCOPES = [
   "esi-markets.structure_markets.v1",
   "esi-industry.read_character_jobs.v1",
   "esi-assets.read_assets.v1",
+  "esi-assets.read_corporation_assets.v1",
   "esi-contracts.read_character_contracts.v1",
   "esi-fittings.read_fittings.v1",
   "esi-fittings.write_fittings.v1",
   "esi-killmails.read_killmails.v1",
   "esi-characters.read_loyalty.v1",
+  "esi-ui.write_waypoint.v1",
+  "esi-planets.manage_planets.v1",
+  "esi-location.read_location.v1",
+  "esi-location.read_ship_type.v1",
+  "esi-clones.read_clones.v1",
+  "esi-clones.read_implants.v1",
+  "esi-industry.read_character_mining.v1",
+  "esi-characters.read_blueprints.v1",
 ];
 
 export interface OAuthTokens {
