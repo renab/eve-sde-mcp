@@ -142,6 +142,55 @@ async function buildHeaders(opts?: EsiRequestOptions): Promise<Record<string, st
   return headers;
 }
 
+interface CacheMetadata {
+  esiFetchedAt: string;
+  esiDate: string | null;
+  esiLastModified: string | null;
+  esiExpiresAt: string | null;
+  esiETag: string | null;
+  esiCacheControl: string | null;
+  esiAge: string | null;
+  localCacheExpiresAt: string | null;
+  cacheStatus: "esi_response" | "local_hit";
+}
+const metadataCache = new Map<string, { data: unknown; metadata: CacheMetadata; expiresAt: number }>();
+
+/** Cache only for the freshness lifetime supplied by ESI, never a fixed local TTL. */
+export async function esiGetWithMetadata<T>(esiPath: string, opts?: EsiRequestOptions): Promise<{ data: T; metadata: CacheMetadata }> {
+  const headers = await buildHeaders(opts); // Authenticate even when serving a cached response.
+  const key = `${headers.Authorization ?? "public"}:${esiPath}`;
+  const cached = metadataCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { data: structuredClone(cached.data) as T, metadata: { ...cached.metadata, cacheStatus: "local_hit" } };
+  }
+  metadataCache.delete(key);
+  const startedAt = Date.now();
+  const response = await fetchWithRetry(`${ESI_BASE}${esiPath}`, { headers }, esiPath);
+  const data = await handleResponse<T>(response, esiPath);
+  const now = Date.now();
+  const h = response.headers;
+  const control = h.get("cache-control") ?? "";
+  const maxAge = /(?:^|,)\s*max-age\s*=\s*"?(\d+)/i.exec(control);
+  const date = Date.parse(h.get("date") ?? "");
+  const expires = Date.parse(h.get("expires") ?? "");
+  const age = Math.max(0, Number(h.get("age") ?? 0) * 1000);
+  const lifetime = maxAge ? Number(maxAge[1]) * 1000 : Number.isFinite(expires) ? expires - (Number.isFinite(date) ? date : now) : 0;
+  const currentAge = Math.max(Number.isFinite(date) ? Math.max(0, now - date) : 0, age + now - startedAt);
+  const expiresAt = /(?:^|,)\s*(no-cache|no-store)\b/i.test(control) ? now : now + Math.max(0, lifetime - currentAge);
+  const metadata: CacheMetadata = {
+    esiFetchedAt: new Date(now).toISOString(), esiDate: h.get("date"),
+    esiLastModified: h.get("last-modified"), esiExpiresAt: h.get("expires"),
+    esiETag: h.get("etag"), esiCacheControl: h.get("cache-control"), esiAge: h.get("age"),
+    localCacheExpiresAt: expiresAt > now ? new Date(expiresAt).toISOString() : null,
+    cacheStatus: "esi_response",
+  };
+  if (expiresAt > now) {
+    if (metadataCache.size >= 256) metadataCache.delete(metadataCache.keys().next().value!);
+    metadataCache.set(key, { data: structuredClone(data), metadata, expiresAt });
+  }
+  return { data, metadata };
+}
+
 export async function esiGet<T>(
   esiPath: string,
   opts?: EsiRequestOptions & { cacheTtlMs?: number }

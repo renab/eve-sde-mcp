@@ -10,7 +10,7 @@ vi.mock("../../src/auth/oauth.js", () => ({
   refreshAccessToken: vi.fn(),
 }));
 
-import { esiGet, esiGetAll, esiPost, esiDelete } from "../../src/auth/esi-client.js";
+import { esiGet, esiGetAll, esiPost, esiDelete, esiGetWithMetadata } from "../../src/auth/esi-client.js";
 import { getTokens } from "../../src/auth/tokens.js";
 
 const mockFetch = vi.fn();
@@ -31,6 +31,43 @@ function setupAuth(): void {
     scopes: "esi-test.v1",
   });
 }
+
+describe("header-driven metadata cache", () => {
+  it("preserves metadata on hits and fetches again at upstream expiry", async () => {
+    vi.useFakeTimers();
+    try {
+      const now = new Date("2026-09-09T12:00:00Z");
+      vi.setSystemTime(now);
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(jsonResponse({ amount: 5500 }, { headers: {
+        Date: now.toUTCString(), Expires: new Date(+now + 60000).toUTCString(), ETag: '"pi-one"',
+      } }));
+      const first = await esiGetWithMetadata<{ amount: number }>("/pi-expiry-test/", { public: true });
+      first.data.amount = 0;
+      const hit = await esiGetWithMetadata<{ amount: number }>("/pi-expiry-test/", { public: true });
+      expect(hit.data.amount).toBe(5500);
+      expect(hit.metadata.cacheStatus).toBe("local_hit");
+      expect(hit.metadata.esiFetchedAt).toBe(first.metadata.esiFetchedAt);
+      expect(hit.metadata.esiETag).toBe('"pi-one"');
+      vi.setSystemTime(+now + 60000);
+      mockFetch.mockResolvedValueOnce(jsonResponse({ amount: 6000 }));
+      expect((await esiGetWithMetadata<{ amount: number }>("/pi-expiry-test/", { public: true })).data.amount).toBe(6000);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    } finally { vi.useRealTimers(); }
+  });
+  it("does not invent a TTL or cache no-store responses", async () => {
+    for (const control of ["", "no-store, max-age=600", "no-cache, max-age=600"]) {
+      mockFetch.mockReset();
+      for (let i = 0; i < 2; i++) {
+        mockFetch.mockResolvedValueOnce(jsonResponse({}, { headers: { "Cache-Control": control } }));
+        const result = await esiGetWithMetadata(`/pi-control/${control}`, { public: true });
+        expect(result.metadata.cacheStatus).toBe("esi_response");
+        expect(result.metadata.localCacheExpiresAt).toBeNull();
+      }
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    }
+  });
+});
 
 describe("esiGet", () => {
   beforeEach(() => {

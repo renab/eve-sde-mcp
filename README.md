@@ -90,6 +90,15 @@ LP change becomes visible to the tools.
 | `get_planetary_colonies` | List a character's planetary-industry colonies |
 | `get_planetary_colony` | Read pins, factories, extractors, links, and routes for one colony |
 | `get_planetary_schematic` | Look up PI schematic inputs, outputs, and cycle time |
+
+PI list and detail responses expose `esiFetchedAt`, `esiDate`, `esiLastModified`,
+`esiExpiresAt`, `esiETag`, `esiCacheControl`, `esiAge`, `localCacheExpiresAt`, and
+`cacheStatus` (`esi_response` or `local_hit`). Missing ESI headers are null.
+The PI cache uses upstream freshness headers, including Age, rather than a fixed
+ten-minute local TTL. `colonyLastUpdate` is the colony-list value, not the HTTP
+fetch time; details include separate `colonyListCacheMetadata`. Contents remain
+under `pins[].contents`. A fresh HTTP response does not prove the game recalculated
+the colony; cache metadata and unchanged quantities alone cannot prove a server bug.
 | `get_character_location` | Current solar system and docked location |
 | `get_character_ship` | Current ship type, item ID, and name |
 | `get_character_clones` | Home station, jump clones and their implants |

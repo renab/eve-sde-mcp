@@ -1,10 +1,9 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getDatabase } from "../database.js";
-import { esiGet, getActiveCharacter } from "../auth/esi-client.js";
+import { esiGet, esiGetWithMetadata, getActiveCharacter } from "../auth/esi-client.js";
 import { enrichSystemName, enrichTypeName, jsonResult, likeContains } from "../utils.js";
 
-const PLANETARY_CACHE_TTL = 10 * 60 * 1000;
 const UNIVERSE_PLANET_CACHE_TTL = 24 * 60 * 60 * 1000;
 const PLANETARY_SCOPE = "esi-planets.manage_planets.v1";
 
@@ -123,14 +122,13 @@ export function registerPlanetaryTools(server: McpServer): void {
     async ({ character_id }) => {
       const char = await getActiveCharacter(character_id);
       requirePlanetaryScope(char.scopes);
-      const colonies = await esiGet<EsiColony[]>(`/characters/${char.characterId}/planets/`, {
+      const snapshot = await esiGetWithMetadata<EsiColony[]>(`/characters/${char.characterId}/planets/`, {
         characterId: char.characterId,
-        cacheTtlMs: PLANETARY_CACHE_TTL,
       });
       const db = getDatabase();
 
       const enriched = await Promise.all(
-        colonies.map(async (colony) => {
+        snapshot.data.map(async (colony) => {
           const planet = await esiGet<EsiPlanetInfo>(`/universe/planets/${colony.planet_id}/`, {
             public: true,
             cacheTtlMs: UNIVERSE_PLANET_CACHE_TTL,
@@ -145,6 +143,7 @@ export function registerPlanetaryTools(server: McpServer): void {
             commandCenterUpgradeLevel: colony.upgrade_level,
             pinCount: colony.num_pins,
             lastUpdate: colony.last_update,
+            colonyLastUpdate: colony.last_update,
           };
         })
       );
@@ -152,6 +151,7 @@ export function registerPlanetaryTools(server: McpServer): void {
       return jsonResult({
         characterName: char.characterName,
         colonyCount: enriched.length,
+        ...snapshot.metadata,
         dataFreshnessNote:
           "EVE recalculates planetary colony data only when the colony is viewed in the game client.",
         colonies: enriched,
@@ -169,16 +169,17 @@ export function registerPlanetaryTools(server: McpServer): void {
     async ({ planet_id, character_id }) => {
       const char = await getActiveCharacter(character_id);
       requirePlanetaryScope(char.scopes);
-      const [layout, planet] = await Promise.all([
-        esiGet<EsiColonyLayout>(`/characters/${char.characterId}/planets/${planet_id}/`, {
+      const [snapshot, planet, colonyList] = await Promise.all([
+        esiGetWithMetadata<EsiColonyLayout>(`/characters/${char.characterId}/planets/${planet_id}/`, {
           characterId: char.characterId,
-          cacheTtlMs: PLANETARY_CACHE_TTL,
         }),
         esiGet<EsiPlanetInfo>(`/universe/planets/${planet_id}/`, {
           public: true,
           cacheTtlMs: UNIVERSE_PLANET_CACHE_TTL,
         }).catch(() => null),
+        esiGetWithMetadata<EsiColony[]>(`/characters/${char.characterId}/planets/`, { characterId: char.characterId }).catch(() => null),
       ]);
+      const layout = snapshot.data;
       const db = getDatabase();
 
       const pins = layout.pins.map((pin) => {
@@ -227,6 +228,9 @@ export function registerPlanetaryTools(server: McpServer): void {
       return jsonResult({
         characterName: char.characterName,
         planetId: planet_id,
+        ...snapshot.metadata,
+        colonyLastUpdate: colonyList?.data.find(colony => colony.planet_id === planet_id)?.last_update ?? null,
+        colonyListCacheMetadata: colonyList?.metadata ?? null,
         planetName: planet?.name ?? null,
         solarSystemId: planet?.system_id ?? null,
         solarSystemName: planet ? enrichSystemName(db, planet.system_id) : null,
