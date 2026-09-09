@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-const { get } = vi.hoisted(() => ({ get: vi.fn() }));
-vi.mock("../../src/database.js", () => ({ getDatabase: () => ({ prepare: () => ({ get }) }) }));
+const { get, all, prepare } = vi.hoisted(() => ({ get: vi.fn(), all: vi.fn(), prepare: vi.fn() }));
+vi.mock("../../src/database.js", () => ({ getDatabase: () => ({ prepare }) }));
 vi.mock("../../src/auth/esi-client.js", () => ({ esiCalculateRoute: vi.fn(), esiPost: vi.fn(), getActiveCharacter: vi.fn() }));
 vi.mock("../../src/utils.js", () => ({ jsonResult: (data: unknown) => data }));
 import { esiCalculateRoute, esiPost, getActiveCharacter } from "../../src/auth/esi-client.js";
@@ -12,10 +12,11 @@ describe("route calculation tool", () => {
   const args = { origin: "Aphi", destination: 2, preference: "safer", security_penalty: 50, avoid_systems: [9, 9] };
   beforeEach(() => {
     vi.resetAllMocks();
+    prepare.mockImplementation(() => ({ get, all }));
     registerNavigationTools({ tool: (name: string, _description: string, _schema: unknown, handler: any) => { handlers[name] = handler; } } as unknown as McpServer);
     get.mockImplementation(value => value === "Aphi" || value === 1
       ? { solarSystemID: 1, solarSystemName: "Aphi", security: 0.5 }
-      : value === 2 ? { solarSystemID: 2, solarSystemName: "Amarr", security: 1 } : undefined);
+      : value === 2 || value === "Amarr" ? { solarSystemID: 2, solarSystemName: "Amarr", security: 1 } : undefined);
   });
   it("resolves names and preserves ESI order with enrichment and unknown-system fallback", async () => {
     vi.mocked(esiCalculateRoute).mockResolvedValue({ route: [1, 3, 2] });
@@ -37,5 +38,38 @@ describe("route calculation tool", () => {
     vi.mocked(esiCalculateRoute).mockResolvedValue({ route: [1] });
     expect(await handlers.get_route({ ...args, origin: "1", destination: 1, preference: "less_secure" })).toMatchObject({ jumpCount: 0 });
     expect(esiCalculateRoute).toHaveBeenCalledWith(1, 1, expect.objectContaining({ preference: "LessSecure" }));
+  });
+  it.each([["shorter", "Shorter"], ["safer", "Safer"], ["less_secure", "LessSecure"]])("preserves %s preference and penalty", async (preference, mapped) => {
+    vi.mocked(esiCalculateRoute).mockResolvedValue({ route: [1, 2] });
+    const result = await handlers.get_route({ ...args, preference, security_penalty: 70, avoid_systems: ["Amarr", 2] });
+    // Exact-name lookup is modeled separately from the ID lookup in this fixture.
+    expect(result.avoidSystems).toEqual([2]);
+    expect(esiCalculateRoute).toHaveBeenCalledWith(1, 2, { preference: mapped, security_penalty: 70, avoid_systems: [2] });
+  });
+  it("rejects invalid avoided names", async () => {
+    await expect(handlers.get_route({ ...args, avoid_systems: ["Missing"] })).rejects.toThrow("search_systems");
+    expect(esiCalculateRoute).not.toHaveBeenCalled();
+  });
+  it("calculates highsec-only paths without ESI and filters both edge endpoints", async () => {
+    all.mockReturnValue([{ fromSolarSystemID: 1, toSolarSystemID: 2 }]);
+    const result = await handlers.get_route({ ...args, preference: "highsec_only" });
+    expect(result).toMatchObject({ systemIds: [1, 2], jumpCount: 1, minimumSecurity: 0.5, highsecSystemCount: 2, lowsecSystemCount: 0, nullsecSystemCount: 0, containsLowsec: false, containsNullsec: false });
+    expect(prepare).toHaveBeenCalledWith(expect.stringContaining("WHERE f.security >= 0.45 AND t.security >= 0.45"));
+    expect(esiCalculateRoute).not.toHaveBeenCalled();
+  });
+  it("rejects lowsec endpoints for highsec-only", async () => {
+    get.mockReturnValue({ solarSystemID: 1, solarSystemName: "Low", security: 0.449999 });
+    await expect(handlers.get_route({ ...args, preference: "highsec_only" })).rejects.toThrow("both origin and destination");
+  });
+  it("reports incomplete security rather than claiming unknown systems are safe", async () => {
+    vi.mocked(esiCalculateRoute).mockResolvedValue({ route: [1, 3, 2] });
+    expect(await handlers.get_route(args)).toMatchObject({ minimumSecurity: null, unknownSecuritySystemCount: 1, containsLowsec: null, containsNullsec: null });
+  });
+  it("summarizes lowsec and nullsec without changing raw values", async () => {
+    get.mockImplementation(id => ({ solarSystemID: id, solarSystemName: String(id), security: id === 1 ? 0.45 : id === 2 ? 0.01 : -0.2 }));
+    vi.mocked(esiCalculateRoute).mockResolvedValue({ route: [1, 2, 3] });
+    const result = await handlers.get_route({ ...args, origin: 1 });
+    expect(result).toMatchObject({ minimumSecurity: -0.2, highsecSystemCount: 1, lowsecSystemCount: 1, nullsecSystemCount: 1, containsLowsec: true, containsNullsec: true });
+    expect(result.systems[1]).toMatchObject({ securityStatus: 0.01, displaySecurity: 0.1, securityClass: "lowsec" });
   });
 });

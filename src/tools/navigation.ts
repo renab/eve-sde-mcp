@@ -3,17 +3,18 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getDatabase } from "../database.js";
 import { esiCalculateRoute, esiPost, getActiveCharacter } from "../auth/esi-client.js";
 import { jsonResult } from "../utils.js";
+import { securityInfo, shortestHighsecRoute } from "../route-security.js";
 
 export function registerNavigationTools(server: McpServer): void {
   server.tool(
     "get_route",
-    "Calculate a route using ESI between solar-system IDs or exact names, with ordered system IDs, names and security status. Public: no character login required. Does not read or change the in-game autopilot route. Safer is a routing preference, not a safety guarantee. For stations/structures, supply their solar system instead.",
+    "Calculate a route between solar-system IDs or exact names. Existing preferences use ESI; highsec_only finds the shortest stargate path in the installed SDE restricted to raw security >= 0.45, failing if none exists. Returns ordered systems and security summaries including both endpoints. Public: no login required; does not read or change autopilot. Safer/highsec are not safety guarantees. For stations/structures, supply their solar system.",
     {
       origin: z.union([z.number().int().positive(), z.string().trim().min(1)]),
       destination: z.union([z.number().int().positive(), z.string().trim().min(1)]),
-      preference: z.enum(["shorter", "safer", "less_secure"]).default("shorter"),
-      security_penalty: z.number().int().min(0).max(100).default(50).describe("Strictness of route preference"),
-      avoid_systems: z.array(z.number().int().positive()).max(1000).default([]),
+      preference: z.enum(["shorter", "safer", "less_secure", "highsec_only"]).default("shorter"),
+      security_penalty: z.number().int().min(0).max(100).default(50).describe("Strictness of ESI route preference; ignored for highsec_only"),
+      avoid_systems: z.array(z.union([z.number().int().positive(), z.string().trim().min(1)])).max(1000).default([]).describe("Solar-system IDs or exact names"),
     },
     async ({ origin, destination, preference, security_penalty, avoid_systems }) => {
       const db = getDatabase();
@@ -27,19 +28,44 @@ export function registerNavigationTools(server: McpServer): void {
       };
       const from = resolve(origin);
       const to = resolve(destination);
+      // Preserve numeric-ID forwarding for existing callers; resolve names just like endpoints.
+      const avoided = [...new Set(avoid_systems.map(value => typeof value === "number" ? value : resolve(value).solarSystemID))];
       const preferences = { shorter: "Shorter", safer: "Safer", less_secure: "LessSecure" } as const;
-      const { route } = await esiCalculateRoute(from.solarSystemID, to.solarSystemID, {
-        preference: preferences[preference], security_penalty, avoid_systems: [...new Set(avoid_systems)],
-      });
+      let route: number[];
+      if (preference === "highsec_only") {
+        if (securityInfo(from.security).securityClass !== "highsec" || securityInfo(to.security).securityClass !== "highsec") {
+          throw new Error("highsec_only requires both origin and destination to be highsec (raw security >= 0.45).");
+        }
+        const edges = db.prepare(`SELECT j.fromSolarSystemID, j.toSolarSystemID FROM mapSolarSystemJumps j
+          JOIN mapSolarSystems f ON f.solarSystemID = j.fromSolarSystemID
+          JOIN mapSolarSystems t ON t.solarSystemID = j.toSolarSystemID
+          WHERE f.security >= 0.45 AND t.security >= 0.45
+          ORDER BY j.fromSolarSystemID, j.toSolarSystemID`).all() as { fromSolarSystemID: number; toSolarSystemID: number }[];
+        route = shortestHighsecRoute(from.solarSystemID, to.solarSystemID, edges, avoided);
+      } else {
+        ({ route } = await esiCalculateRoute(from.solarSystemID, to.solarSystemID, {
+          preference: preferences[preference], security_penalty, avoid_systems: avoided,
+        }));
+      }
       const lookup = db.prepare("SELECT solarSystemID, solarSystemName, security FROM mapSolarSystems WHERE solarSystemID = ?");
+      const systems = route.map(id => {
+        const system = lookup.get(id) as System | undefined;
+        const securityStatus = system?.security ?? null;
+        return { systemId: id, systemName: system?.solarSystemName ?? null, securityStatus, ...securityInfo(securityStatus) };
+      });
+      const highsecSystemCount = systems.filter(s => s.securityClass === "highsec").length;
+      const lowsecSystemCount = systems.filter(s => s.securityClass === "lowsec").length;
+      const nullsecSystemCount = systems.filter(s => s.securityClass === "nullsec").length;
+      const unknownSecuritySystemCount = systems.filter(s => s.securityClass === null).length;
       return jsonResult({
-        source: "ESI route calculation", origin: from, destination: to, preference,
-        securityPenalty: security_penalty, avoidSystems: [...new Set(avoid_systems)],
+        source: preference === "highsec_only" ? "Installed SDE highsec-only stargate calculation" : "ESI route calculation", origin: from, destination: to, preference,
+        securityPenalty: security_penalty, avoidSystems: avoided,
         jumpCount: Math.max(0, route.length - 1), systemIds: route,
-        systems: route.map(id => {
-          const system = lookup.get(id) as System | undefined;
-          return { systemId: id, systemName: system?.solarSystemName ?? null, securityStatus: system?.security ?? null };
-        }),
+        systems,
+        minimumSecurity: unknownSecuritySystemCount || !systems.length ? null : Math.min(...systems.map(s => s.securityStatus!)),
+        highsecSystemCount, lowsecSystemCount, nullsecSystemCount, unknownSecuritySystemCount,
+        containsLowsec: lowsecSystemCount > 0 ? true : unknownSecuritySystemCount > 0 ? null : false,
+        containsNullsec: nullsecSystemCount > 0 ? true : unknownSecuritySystemCount > 0 ? null : false,
       });
     }
   );

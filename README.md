@@ -87,10 +87,29 @@ LP change becomes visible to the tools.
 | `get_character_assets` | Items in hangars/containers with names |
 | `get_corporation_assets` | Corporation assets visible to a Director, with names and filters |
 | `set_autopilot_destination` | Set an in-game autopilot destination or waypoint |
-| `get_route` | Calculate an ESI route between system names/IDs, with shorter/safer/less_secure preferences, avoidance, and ordered names/security; does not read or change the client route |
+| `get_route` | Calculate routes between system names/IDs: ESI shorter/safer/less_secure, or shortest SDE highsec_only; named/ID avoidance, ordered names/security and route security summary; does not read or change the client route |
 | `get_planetary_colonies` | List a character's planetary-industry colonies |
 | `get_planetary_colony` | Read pins, factories, extractors, links, and routes for one colony |
 | `get_planetary_schematic` | Look up PI schematic inputs, outputs, and cycle time |
+
+`get_route({origin: "Aphi", destination: "Jita", preference: "highsec_only"})`
+minimizes stargate jumps in the installed SDE, excluding systems with raw security
+below 0.45. It does not use ESI's weighted `safer` preference. Its `source` identifies
+the local calculation: results depend on the installed SDE's gate topology, exclude
+wormholes/jump bridges, and are not live gate-availability or safety guarantees.
+Refresh the SDE when topology changes. Both endpoints must be highsec; no valid path
+or an avoided endpoint produces an error, never a lowsec fallback. `security_penalty`
+is ignored for this preference. Existing preferences still use ESI unchanged.
+`avoid_systems` accepts IDs and exact case-insensitive names and returns deduplicated
+IDs in `avoidSystems`.
+
+Route security counts include origin and destination. `minimumSecurity` is raw;
+`displaySecurity` is rounded to one decimal (positive values display at least 0.1).
+Classification uses raw security: highsec >= 0.45, lowsec > 0 and < 0.45, nullsec <= 0,
+as described in the [EVE security guide](https://developers.eveonline.com/docs/guides/system-security/).
+Missing security yields null per-system enrichment and increments
+`unknownSecuritySystemCount`; the minimum and otherwise-false containment flags
+are null when unknown systems prevent a complete answer.
 
 PI list and detail responses expose `esiFetchedAt`, `esiDate`, `esiLastModified`,
 `esiExpiresAt`, `esiETag`, `esiCacheControl`, `esiAge`, `localCacheExpiresAt`, and
