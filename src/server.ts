@@ -14,6 +14,7 @@ import { registerLoyaltyTools } from "./tools/loyalty.js";
 import { registerNavigationTools } from "./tools/navigation.js";
 import { registerPlanetaryTools } from "./tools/planetary.js";
 import { registerDailyTools } from "./tools/daily.js";
+import { registerOperationTools } from "./tools/operations.js";
 
 export const SERVER_INFO = {
   name: "eve-sde",
@@ -39,6 +40,7 @@ export function createMcpServer(): McpServer {
   registerNavigationTools(server);
   registerPlanetaryTools(server);
   registerDailyTools(server);
+  registerOperationTools(server);
 
   return server;
 }

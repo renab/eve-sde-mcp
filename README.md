@@ -97,6 +97,28 @@ LP change becomes visible to the tools.
 | `get_character_mining` | Available 30-day mining ledger with ore/system names |
 | `get_character_blueprints` | Owned blueprints, research levels, runs and locations |
 | `get_contract_items` | Included/requested items in a character contract |
+| `get_loyalty_store_offers` | LP/ISK/item costs and output quantities for LP store offers |
+| `get_character_standings` | Agent, corporation and faction standings |
+| `get_character_notifications` | Game notifications, newest first |
+| `get_character_roles` | Character corporation roles |
+| `get_character_asset_names`, `get_character_asset_locations` | Custom asset names and coordinates |
+| `get_corporation_asset_names`, `get_corporation_asset_locations` | Corporation asset names and coordinates (Director) |
+| `get_structure` | Accessible player structure name, owner and system |
+| `get_corporation_wallets` | Corporation wallet division balances |
+| `get_corporation_wallet_journal`, `get_corporation_wallet_transactions` | Division journal and transactions (division 1–7 required) |
+| `get_corporation_blueprints` | Blueprint research levels and runs (Director) |
+| `get_corporation_industry_jobs` | Jobs, optionally completed (Factory Manager) |
+| `get_corporation_structures` | Structure state, fuel and service details (Station Manager) |
+| `get_system_jumps`, `get_system_kills` | Historical system activity, optionally filtered by system |
+| `get_sovereignty_map`, `get_sovereignty_campaigns`, `get_sovereignty_structures` | Ownership, campaigns and vulnerability information |
+| `get_incursions` | Active incursions and affected systems |
+
+Corporation wallet reads require Accountant or Junior Accountant access. Corporation
+IDs default to the selected character's current corporation. ESI enforces roles and
+structure access. New operational tools are read-only, preserve ESI response fields,
+and add type/system names where available. Lists support `limit`/`offset`; public
+activity and sovereignty tools also accept `system_id`. ESI's upstream cache applies;
+system activity is historical and does not establish whether a route is safe.
 
 New ESI capabilities require running `esi_login` again for each character whose
 stored token lacks the required scopes. Enable these scopes on the EVE developer

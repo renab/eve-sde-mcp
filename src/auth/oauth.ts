@@ -33,6 +33,14 @@ const DEFAULT_SCOPES = [
   "esi-clones.read_implants.v1",
   "esi-industry.read_character_mining.v1",
   "esi-characters.read_blueprints.v1",
+  "esi-characters.read_standings.v1",
+  "esi-characters.read_notifications.v1",
+  "esi-characters.read_corporation_roles.v1",
+  "esi-wallet.read_corporation_wallets.v1",
+  "esi-corporations.read_blueprints.v1",
+  "esi-industry.read_corporation_jobs.v1",
+  "esi-corporations.read_structures.v1",
+  "esi-universe.read_structures.v1",
 ];
 
 export interface OAuthTokens {
