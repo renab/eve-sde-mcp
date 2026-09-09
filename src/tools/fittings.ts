@@ -77,23 +77,25 @@ interface ParsedEft {
   fitName: string;
   items: FittingItem[];
   errors: string[];
+  warnings: string[];
 }
 
 export function parseEftFormat(db: ReturnType<typeof getDatabase>, eft: string): ParsedEft {
-  const lines = eft.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+  const lines = eft.trim().split("\n").map((l) => l.trim());
   const errors: string[] = [];
+  const warnings: string[] = [];
   const items: FittingItem[] = [];
 
   const headerMatch = lines[0]?.match(/^\[(.+?),\s*(.+)\]$/);
   if (!headerMatch) {
-    return { shipName: "", shipTypeId: 0, fitName: "", items: [], errors: ["Invalid EFT header. Expected: [Ship Name, Fit Name]"] };
+    return { shipName: "", shipTypeId: 0, fitName: "", items: [], warnings, errors: ["Invalid EFT header. Expected: [Ship Name, Fit Name]"] };
   }
 
   const shipName = headerMatch[1].trim();
   const fitName = headerMatch[2].trim();
   const shipTypeId = resolveTypeId(db, shipName);
   if (!shipTypeId) {
-    return { shipName, shipTypeId: 0, fitName, items: [], errors: [`Ship "${shipName}" not found in SDE`] };
+    return { shipName, shipTypeId: 0, fitName, items: [], warnings, errors: [`Ship "${shipName}" not found in SDE`] };
   }
 
   const slotCounters: Record<string, number> = { hi: 0, med: 0, lo: 0, rig: 0, sub: 0, service: 0 };
@@ -106,10 +108,21 @@ export function parseEftFormat(db: ReturnType<typeof getDatabase>, eft: string):
     service: "ServiceSlot",
   };
 
+  // EFT has no cargo label. Only infer fallback cargo after the final fitting
+  // section, separated by a blank line (or following a recognized cargo item).
+  let lastFittingLine = 0;
+  for (let i = 1; i < lines.length; i++) {
+    const name = lines[i].split(",")[0].replace(/\s+x\d+$/, "");
+    const id = resolveTypeId(db, name);
+    const slot = id ? getSlotType(db, id) : null;
+    if (lines[i].startsWith("[Empty") || (slot && FLAG_PREFIX[slot])) lastFittingLine = i;
+  }
+  let cargoSection = false;
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i];
 
     if (line === "" || line === "---") {
+      if (i > lastFittingLine) cargoSection = true;
       continue;
     }
 
@@ -143,10 +156,13 @@ export function parseEftFormat(db: ReturnType<typeof getDatabase>, eft: string):
       continue;
     }
 
-    const slotType = getSlotType(db, typeId);
+    let slotType = getSlotType(db, typeId);
+    if (slotType === "cargo" && i > lastFittingLine) cargoSection = true;
+    if (!slotType && cargoSection && i > lastFittingLine) slotType = "cargo";
 
     if (!slotType) {
       errors.push(`Could not determine slot type for "${itemName}"`);
+      warnings.push(`Resolved "${itemName}" (type ${typeId}) but its section is ambiguous; it was not included. Put ordinary cargo in a blank-line-separated section after all fitted modules, or use structured input with flag="Cargo".`);
       continue;
     }
 
@@ -178,7 +194,7 @@ export function parseEftFormat(db: ReturnType<typeof getDatabase>, eft: string):
     }
   }
 
-  return { shipName, shipTypeId, fitName, items, errors };
+  return { shipName, shipTypeId, fitName, items, errors, warnings };
 }
 
 export function registerFittingTools(server: McpServer): void {
@@ -223,7 +239,7 @@ export function registerFittingTools(server: McpServer): void {
 
   server.tool(
     "save_fitting",
-    "Save a fitting to the authenticated character's in-game fitting list. Accepts either EFT format (the standard Eve copy/paste format) or structured input. The fitting appears in-game immediately. This is a WRITE operation.",
+    "Save a fitting to the authenticated character's in-game fitting list. Accepts EFT or structured input. Uses the same classification as parse_eft: published non-slot items such as deployables are Cargo in a blank-line-separated section after fitted modules. Unknown names remain errors; partial-save warnings are returned explicitly. Preview with parse_eft first. This is a WRITE operation.",
     {
       eft: z
         .string()
@@ -252,11 +268,14 @@ export function registerFittingTools(server: McpServer): void {
       let fitDescription: string = description;
       let fitShipTypeId: number;
       let fitItems: FittingItem[];
+      let warnings: string[] = [];
 
       if (eft) {
         const parsed = parseEftFormat(db, eft);
+        warnings = [...parsed.warnings, ...parsed.errors];
         if (parsed.errors.length > 0 && parsed.items.length === 0) {
           return {
+            isError: true,
             content: [
               {
                 type: "text",
@@ -317,6 +336,7 @@ export function registerFittingTools(server: McpServer): void {
         ship: enrichTypeName(db, fitShipTypeId),
         characterName: char.characterName,
         itemCount: fitItems.length,
+        warnings: warnings.length ? warnings : undefined,
         items: itemSummary,
       });
     }
@@ -350,7 +370,7 @@ export function registerFittingTools(server: McpServer): void {
 
   server.tool(
     "parse_eft",
-    "Parse an EFT format fitting string and show what would be saved — resolves all item names to type IDs and slot flags. Does NOT save anything. Use this to preview before calling save_fitting.",
+    "Preview EFT using the same classification as save_fitting. Modules, rigs, drones and charges retain their flags. Published non-slot items (deployables, commodities, paste, etc.) are Cargo in a blank-line-separated section after fitted modules. Unknown names remain errors; ambiguous resolved items produce explicit warnings. Does NOT save anything.",
     {
       eft: z.string().describe("EFT format fitting string"),
     },
@@ -372,6 +392,7 @@ export function registerFittingTools(server: McpServer): void {
         itemCount: parsed.items.length,
         items: itemDetails,
         errors: parsed.errors.length > 0 ? parsed.errors : undefined,
+        warnings: parsed.warnings.length > 0 ? parsed.warnings : undefined,
         valid: parsed.errors.length === 0 && parsed.items.length > 0,
       });
     }

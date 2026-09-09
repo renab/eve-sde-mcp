@@ -92,6 +92,18 @@ LP change becomes visible to the tools.
 | `get_planetary_colony` | Read pins, factories, extractors, links, and routes for one colony |
 | `get_planetary_schematic` | Look up PI schematic inputs, outputs, and cycle time |
 
+`parse_eft` and EFT-mode `save_fitting` share cargo classification. Put operational
+cargo (for example `Mobile Tractor Unit x1`, commodities, scripts, ammunition, or
+repair paste) in a blank-line-separated section after all fitted modules/rigs.
+Published SDE types without a fitting slot are accepted there as `Cargo`; existing
+module, rig, drone, fighter and charge classification is unchanged. Quantities are
+preserved. Unknown names remain resolution errors, never invented cargo types.
+Resolved items outside a recognizable cargo section produce explicit ambiguity
+warnings. Preview before saving: legacy partial saves still save recognized items,
+but now return skipped-item errors/warnings in the response rather than only logs.
+Structured input with `flag: "Cargo"` remains available for explicit placement.
+Cargo parsing does not validate ship capacity or every in-game inventory restriction.
+
 `get_route({origin: "Aphi", destination: "Jita", preference: "highsec_only"})`
 minimizes stargate jumps in the installed SDE, excluding systems with raw security
 below 0.45. It does not use ESI's weighted `safer` preference. Its `source` identifies
