@@ -10,26 +10,9 @@ const RETRYABLE_STATUSES = new Set([502, 503, 504]);
 const MAX_RETRIES = 2;
 const RETRY_DELAY_MS = 1000;
 
-export const ESI_CACHE_TTL = 5 * 60 * 1000;
-
 export interface EsiRequestOptions {
   characterId?: number;
   public?: boolean;
-}
-
-const esiCache = new Map<string, { data: unknown; expiresAt: number }>();
-
-function getCached<T>(key: string): T | undefined {
-  const entry = esiCache.get(key);
-  if (!entry || Date.now() > entry.expiresAt) {
-    esiCache.delete(key);
-    return undefined;
-  }
-  return entry.data as T;
-}
-
-function setCached(key: string, data: unknown, ttlMs: number): void {
-  esiCache.set(key, { data, expiresAt: Date.now() + ttlMs });
 }
 
 export function readClientId(): string {
@@ -143,6 +126,7 @@ async function buildHeaders(opts?: EsiRequestOptions): Promise<Record<string, st
 }
 
 interface CacheMetadata {
+  esiPages: number;
   esiFetchedAt: string;
   esiDate: string | null;
   esiLastModified: string | null;
@@ -178,6 +162,7 @@ export async function esiGetWithMetadata<T>(esiPath: string, opts?: EsiRequestOp
   const currentAge = Math.max(Number.isFinite(date) ? Math.max(0, now - date) : 0, age + now - startedAt);
   const expiresAt = /(?:^|,)\s*(no-cache|no-store)\b/i.test(control) ? now : now + Math.max(0, lifetime - currentAge);
   const metadata: CacheMetadata = {
+    esiPages: Math.max(1, parseInt(h.get("x-pages") ?? "1", 10) || 1),
     esiFetchedAt: new Date(now).toISOString(), esiDate: h.get("date"),
     esiLastModified: h.get("last-modified"), esiExpiresAt: h.get("expires"),
     esiETag: h.get("etag"), esiCacheControl: h.get("cache-control"), esiAge: h.get("age"),
@@ -195,58 +180,27 @@ export async function esiGet<T>(
   esiPath: string,
   opts?: EsiRequestOptions & { cacheTtlMs?: number }
 ): Promise<T> {
-  if (opts?.cacheTtlMs) {
-    const cached = getCached<T>(esiPath);
-    if (cached !== undefined) return cached;
-  }
-
-  const url = `${ESI_BASE}${esiPath}`;
-  const headers = await buildHeaders(opts);
-  const response = await fetchWithRetry(url, { headers }, esiPath);
-  const data = await handleResponse<T>(response, esiPath);
-
-  if (opts?.cacheTtlMs) {
-    setCached(esiPath, data, opts.cacheTtlMs);
-  }
-
-  return data;
+  // Legacy cacheTtlMs arguments are deliberately ignored: only ESI sets freshness.
+  return (await esiGetWithMetadata<T>(esiPath, opts)).data;
 }
 
 export async function esiGetAll<T>(
   esiPath: string,
   opts?: EsiRequestOptions & { cacheTtlMs?: number }
 ): Promise<T[]> {
-  if (opts?.cacheTtlMs) {
-    const cached = getCached<T[]>(esiPath);
-    if (cached !== undefined) return cached;
+  const first = await esiGetWithMetadata<T[]>(esiPath, opts);
+  const allData = [...first.data];
+  // Each page has its own upstream expiry; never assign a new aggregate TTL.
+  // Bound concurrency to avoid flooding ESI for large corporate inventories.
+  for (let start = 2; start <= first.metadata.esiPages; start += 5) {
+    const pages: Promise<T[]>[] = [];
+    for (let page = start; page < start + 5 && page <= first.metadata.esiPages; page++) {
+      const url = new URL(`${ESI_BASE}${esiPath}`);
+      url.searchParams.set("page", String(page));
+      pages.push(esiGet<T[]>(url.pathname.replace(/^\/latest/, "") + url.search, opts));
+    }
+    allData.push(...(await Promise.all(pages)).flat());
   }
-
-  const url = `${ESI_BASE}${esiPath}`;
-  const headers = await buildHeaders(opts);
-
-  const firstResponse = await fetchWithRetry(url, { headers }, esiPath);
-  const firstPage = await handleResponse<T[]>(firstResponse, esiPath);
-
-  const totalPages = parseInt(firstResponse.headers.get("x-pages") ?? "1", 10);
-
-  if (totalPages <= 1) {
-    if (opts?.cacheTtlMs) setCached(esiPath, firstPage, opts.cacheTtlMs);
-    return firstPage;
-  }
-
-  const separator = esiPath.includes("?") ? "&" : "?";
-  const pagePromises: Promise<T[]>[] = [];
-  for (let page = 2; page <= totalPages; page++) {
-    const pageUrl = `${ESI_BASE}${esiPath}${separator}page=${page}`;
-    pagePromises.push(
-      fetchWithRetry(pageUrl, { headers }, esiPath).then((r) => handleResponse<T[]>(r, esiPath))
-    );
-  }
-
-  const remainingPages = await Promise.all(pagePromises);
-  const allData = firstPage.concat(...remainingPages);
-
-  if (opts?.cacheTtlMs) setCached(esiPath, allData, opts.cacheTtlMs);
   return allData;
 }
 
@@ -268,7 +222,10 @@ export async function esiPost<T>(
     body: JSON.stringify(body),
   }, esiPath);
 
-  return handleResponse<T>(response, esiPath);
+  const result = await handleResponse<T>(response, esiPath);
+  // Successful writes can change a previously cached representation.
+  if (esiPath.startsWith("/ui/") || /\/fittings\//.test(esiPath)) metadataCache.clear();
+  return result;
 }
 
 export async function esiDelete(
@@ -287,6 +244,7 @@ export async function esiDelete(
   }, esiPath);
 
   await handleResponse<void>(response, esiPath);
+  metadataCache.clear();
 }
 
 export async function getActiveCharacter(

@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getDatabase } from "../database.js";
-import { esiGet, esiGetAll, getActiveCharacter, ESI_CACHE_TTL } from "../auth/esi-client.js";
+import { esiGet, esiGetAll, getActiveCharacter } from "../auth/esi-client.js";
 import { enrichTypeName, likeContains, jsonResult } from "../utils.js";
 
 interface EsiIndustryJob {
@@ -48,7 +48,6 @@ const ACTIVITY_NAMES: Record<number, string> = {
   11: "Reaction",
 };
 
-const COST_INDEX_CACHE_TTL = 10 * 60 * 1000;
 
 export function registerIndustryEsiTools(server: McpServer): void {
   server.tool(
@@ -65,7 +64,7 @@ export function registerIndustryEsiTools(server: McpServer): void {
       let url = `/characters/${char.characterId}/industry/jobs/`;
       if (include_completed) url += "?include_completed=true";
 
-      const jobs = await esiGet<EsiIndustryJob[]>(url, { characterId: char.characterId, cacheTtlMs: ESI_CACHE_TTL });
+      const jobs = await esiGet<EsiIndustryJob[]>(url, { characterId: char.characterId });
 
       const db = getDatabase();
       let enriched = jobs.map((j) => ({
@@ -107,7 +106,6 @@ export function registerIndustryEsiTools(server: McpServer): void {
     async ({ system_name, system_id }) => {
       const indices = await esiGet<EsiCostIndex[]>("/industry/systems/", {
         public: true,
-        cacheTtlMs: COST_INDEX_CACHE_TTL,
       });
 
       let systemId = system_id;
@@ -162,7 +160,7 @@ export function registerIndustryEsiTools(server: McpServer): void {
         quantity: number;
         location_flag: string;
         is_singleton: boolean;
-      }>(`/characters/${char.characterId}/assets/`, { characterId: char.characterId, cacheTtlMs: ESI_CACHE_TTL });
+      }>(`/characters/${char.characterId}/assets/`, { characterId: char.characterId });
 
       const db = getDatabase();
       let enriched = assets.map((a) => ({
@@ -212,7 +210,7 @@ export function registerIndustryEsiTools(server: McpServer): void {
       if (!corporationId) {
         const publicCharacter = await esiGet<{ corporation_id: number }>(
           `/characters/${char.characterId}/`,
-          { public: true, cacheTtlMs: ESI_CACHE_TTL }
+          { public: true }
         );
         corporationId = publicCharacter.corporation_id;
       }
@@ -228,7 +226,6 @@ export function registerIndustryEsiTools(server: McpServer): void {
         is_blueprint_copy?: boolean;
       }>(`/corporations/${corporationId}/assets/`, {
         characterId: char.characterId,
-        cacheTtlMs: ESI_CACHE_TTL,
       });
 
       const db = getDatabase();
@@ -297,7 +294,7 @@ export function registerIndustryEsiTools(server: McpServer): void {
         date_completed?: string;
         start_location_id?: number;
         end_location_id?: number;
-      }>(`/characters/${char.characterId}/contracts/`, { characterId: char.characterId, cacheTtlMs: ESI_CACHE_TTL });
+      }>(`/characters/${char.characterId}/contracts/`, { characterId: char.characterId });
 
       if (type) contracts = contracts.filter((c) => c.type === type);
       if (status) contracts = contracts.filter((c) => c.status === status);

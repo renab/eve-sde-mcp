@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getDatabase } from "../database.js";
-import { esiGet, esiGetAll, getActiveCharacter, ESI_CACHE_TTL } from "../auth/esi-client.js";
+import { esiGet, esiGetAll, getActiveCharacter } from "../auth/esi-client.js";
 import { enrichTypeName, jsonResult } from "../utils.js";
 
 interface EsiOrder {
@@ -48,7 +48,6 @@ interface EsiTransaction {
   journal_ref_id: number;
 }
 
-const MARKET_PRICE_CACHE_TTL = 10 * 60 * 1000;
 const JITA_TRADE_HUB = 60003760;
 const MAX_CONCURRENT_ESI = 10;
 
@@ -107,7 +106,7 @@ export function registerMarketTools(server: McpServer): void {
       const char = await getActiveCharacter(character_id);
       let orders = await esiGet<EsiOrder[]>(
         `/characters/${char.characterId}/orders/`,
-        { characterId: char.characterId, cacheTtlMs: ESI_CACHE_TTL }
+        { characterId: char.characterId }
       );
 
       if (type_id) orders = orders.filter((o) => o.type_id === type_id);
@@ -159,7 +158,7 @@ export function registerMarketTools(server: McpServer): void {
       const char = await getActiveCharacter(character_id);
       let orders = await esiGetAll<EsiOrder & { state: string }>(
         `/characters/${char.characterId}/orders/history/`,
-        { characterId: char.characterId, cacheTtlMs: ESI_CACHE_TTL }
+        { characterId: char.characterId }
       );
 
       if (type_id) orders = orders.filter((o) => o.type_id === type_id);
@@ -202,7 +201,7 @@ export function registerMarketTools(server: McpServer): void {
       const char = await getActiveCharacter(character_id);
       let journal = await esiGetAll<EsiWalletJournalEntry>(
         `/characters/${char.characterId}/wallet/journal/`,
-        { characterId: char.characterId, cacheTtlMs: ESI_CACHE_TTL }
+        { characterId: char.characterId }
       );
 
       if (ref_type) journal = journal.filter((e) => e.ref_type === ref_type);
@@ -229,7 +228,7 @@ export function registerMarketTools(server: McpServer): void {
       const char = await getActiveCharacter(character_id);
       let transactions = await esiGet<EsiTransaction[]>(
         `/characters/${char.characterId}/wallet/transactions/`,
-        { characterId: char.characterId, cacheTtlMs: ESI_CACHE_TTL }
+        { characterId: char.characterId }
       );
 
       if (type_id) transactions = transactions.filter((t) => t.type_id === type_id);
@@ -267,7 +266,7 @@ export function registerMarketTools(server: McpServer): void {
     async ({ type_id }) => {
       const prices = await esiGet<Array<{ type_id: number; average_price?: number; adjusted_price?: number }>>(
         "/markets/prices/",
-        { public: true, cacheTtlMs: MARKET_PRICE_CACHE_TTL }
+        { public: true }
       );
 
       const db = getDatabase();
@@ -299,7 +298,7 @@ export function registerMarketTools(server: McpServer): void {
       else if (order_type === "sell") url += "&order_type=sell";
       else url += "&order_type=all";
 
-      let orders = await esiGetAll<EsiOrder>(url, { public: true, cacheTtlMs: ESI_CACHE_TTL });
+      let orders = await esiGetAll<EsiOrder>(url, { public: true });
 
       if (location_id) {
         orders = orders.filter((o) => o.location_id === location_id);
@@ -345,7 +344,7 @@ export function registerMarketTools(server: McpServer): void {
         lowest: number;
         order_count: number;
         volume: number;
-      }>>(`/markets/${region_id}/history/?type_id=${type_id}`, { public: true, cacheTtlMs: ESI_CACHE_TTL });
+      }>>(`/markets/${region_id}/history/?type_id=${type_id}`, { public: true });
 
       const db = getDatabase();
       const typeName = enrichTypeName(db, type_id);
@@ -367,7 +366,7 @@ export function registerMarketTools(server: McpServer): void {
       const char = await getActiveCharacter(character_id);
       const orders = await esiGetAll<EsiOrder>(
         `/markets/structures/${structure_id}/`,
-        { characterId: char.characterId, cacheTtlMs: ESI_CACHE_TTL }
+        { characterId: char.characterId }
       );
 
       const db = getDatabase();
@@ -441,7 +440,7 @@ export function registerMarketTools(server: McpServer): void {
         async (type_id) => {
           const url = `/markets/${region_id}/orders/?type_id=${type_id}&order_type=all`;
           try {
-            const allOrders = await esiGetAll<EsiOrder>(url, { public: true, cacheTtlMs: ESI_CACHE_TTL });
+            const allOrders = await esiGetAll<EsiOrder>(url, { public: true });
             const orders = allOrders.filter((o) => o.location_id === location_id);
 
             const buyOrders = orders.filter((o) => o.is_buy_order).sort((a, b) => b.price - a.price);

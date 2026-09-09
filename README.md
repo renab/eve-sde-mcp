@@ -132,7 +132,14 @@ system activity is historical and does not establish whether a route is safe.
 New ESI capabilities require running `esi_login` again for each character whose
 stored token lacks the required scopes. Enable these scopes on the EVE developer
 application as well. Refresh tokens cannot acquire additional scopes themselves.
-The daily-use tools rely on upstream ESI caching without adding a local cache.
+All ESI GET tools share a cache governed solely by upstream freshness headers:
+Cache-Control/max-age (accounting for Age and Date), or Expires when max-age is
+absent. Missing freshness information, no-cache, and no-store prevent reuse.
+There are no fixed local TTLs. Each paginated response page retains its own expiry;
+expired pages are fetched again without checking layout or Last-Modified values.
+Private responses are isolated by authentication context, and authentication is
+checked before cache hits. Successful fitting/UI writes and deletes invalidate
+local cached reads. ESI may still return its own cached representation afterward.
 Ledger, blueprint and contract-item results support `type_id`, `limit` and `offset`.
 | `get_character_contracts` | Courier, item exchange, auction contracts |
 

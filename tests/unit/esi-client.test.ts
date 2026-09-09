@@ -90,7 +90,7 @@ describe("esiGet", () => {
   });
 
   it("caches responses when cacheTtlMs is set", async () => {
-    mockFetch.mockResolvedValue(jsonResponse({ cached: true }));
+    mockFetch.mockResolvedValue(jsonResponse({ cached: true }, { headers: { "cache-control": "max-age=60" } }));
     const first = await esiGet("/cache-test/", { public: true, cacheTtlMs: 60000 });
     const second = await esiGet("/cache-test/", { public: true, cacheTtlMs: 60000 });
     expect(first).toEqual({ cached: true });
@@ -183,10 +183,10 @@ describe("esiGetAll (pagination)", () => {
     expect(secondUrl).toContain("?page=2");
   });
 
-  it("caches the concatenated result", async () => {
+  it("caches each page using its own upstream headers", async () => {
     mockFetch
-      .mockResolvedValueOnce(jsonResponse([1, 2], { headers: { "x-pages": "2" } }))
-      .mockResolvedValueOnce(jsonResponse([3, 4]));
+      .mockResolvedValueOnce(jsonResponse([1, 2], { headers: { "x-pages": "2", "cache-control": "max-age=60" } }))
+      .mockResolvedValueOnce(jsonResponse([3, 4], { headers: { "cache-control": "max-age=60" } }));
     await esiGetAll("/cached-pages/", { public: true, cacheTtlMs: 60000 });
     const second = await esiGetAll("/cached-pages/", { public: true, cacheTtlMs: 60000 });
     expect(second).toEqual([1, 2, 3, 4]);

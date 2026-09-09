@@ -102,7 +102,7 @@ export function registerLoyaltyTools(server: McpServer): void {
       return jsonResult({
         characterName: char.characterName,
         trackingNote:
-          "ESI exposes current LP balances only. These entries are changes observed between MCP polls, not Fenris Creations transaction records. The MCP does not cache LP balances, but upstream ESI caching can delay visible changes.",
+          "ESI exposes current LP balances only. These entries are changes observed between MCP polls, not Fenris Creations transaction records. The MCP respects ESI freshness headers; upstream caching can delay visible changes.",
         changesObservedThisPoll,
         count: activity.length,
         activity: activity.map((row) => ({

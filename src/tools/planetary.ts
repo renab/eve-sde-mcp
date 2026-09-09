@@ -4,7 +4,6 @@ import { getDatabase } from "../database.js";
 import { esiGet, esiGetWithMetadata, getActiveCharacter } from "../auth/esi-client.js";
 import { enrichSystemName, enrichTypeName, jsonResult, likeContains } from "../utils.js";
 
-const UNIVERSE_PLANET_CACHE_TTL = 24 * 60 * 60 * 1000;
 const PLANETARY_SCOPE = "esi-planets.manage_planets.v1";
 
 interface EsiColony {
@@ -131,7 +130,6 @@ export function registerPlanetaryTools(server: McpServer): void {
         snapshot.data.map(async (colony) => {
           const planet = await esiGet<EsiPlanetInfo>(`/universe/planets/${colony.planet_id}/`, {
             public: true,
-            cacheTtlMs: UNIVERSE_PLANET_CACHE_TTL,
           }).catch(() => null);
           return {
             planetId: colony.planet_id,
@@ -175,7 +173,6 @@ export function registerPlanetaryTools(server: McpServer): void {
         }),
         esiGet<EsiPlanetInfo>(`/universe/planets/${planet_id}/`, {
           public: true,
-          cacheTtlMs: UNIVERSE_PLANET_CACHE_TTL,
         }).catch(() => null),
         esiGetWithMetadata<EsiColony[]>(`/characters/${char.characterId}/planets/`, { characterId: char.characterId }).catch(() => null),
       ]);
