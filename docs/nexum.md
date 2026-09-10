@@ -17,7 +17,7 @@ Tools:
 | `nexum_add_credential` | Validate, encrypt, discover access, start background synchronization |
 | `nexum_list_credentials` | Safe metadata and access bindings |
 | `nexum_test_credential` | Explicit authentication/access/event capability check |
-| `nexum_update_credential` | Label, enabled state, validated replacement key |
+| `nexum_update_credential` | Label, user-confirmed `character_id`, enabled state, validated replacement key |
 | `nexum_remove_credential` | Delete Galaxy's copy and bindings; **does not revoke the key in Nexum** |
 | `nexum_list_maps` | Canonical maps, access and health |
 | `nexum_get_map_state` | Cached metadata, systems, connections, routes and bounded received jump/kill telemetry |
@@ -27,6 +27,8 @@ Tools:
 | `nexum_status` | Safe credential counts, access, stream state, timestamps, reconnect count, history count |
 
 Ordinary reads make **zero upstream requests**. Unknown chain fields remain omitted/null; mass/lifetime state is reported from Nexum, not fabricated. Connections preserve both signature references.
+
+To bind an existing credential without re-enrollment, call `nexum_update_credential` with `credential_id` and `character_id` (a positive decimal string of at most 20 digits). Galaxy stores `bound_character_id` and `identity_source: user_confirmed`; this is the user's assertion, not independent Nexum verification. Omitting `character_id` preserves the binding. Identity/label-only updates do not read or replace the key (label secret screening may read it), change map-access bindings, fetch Nexum, or restart streams. Existing JSON metadata storage needs no schema migration.
 
 ## Storage, lifecycle and recovery
 

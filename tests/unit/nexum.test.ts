@@ -91,6 +91,24 @@ describe("Nexum credentials and canonical synchronization",()=>{
     const result=await service.removeCredential(c.id);expect(result.nexum_key_revoked).toBe(false);expect(store.access()).toEqual([]);expect(up.live()).toHaveLength(0);
     expect(()=>secrets.get(c.id)).toThrow();expect(service.mapState(mapId).map.systems).toHaveLength(1);
   });
+  it("sets a user-confirmed binding through MCP without accessing secrets, refetching or restarting streams",async()=>{
+    const c=await enroll(),feed=up.live()[0],access=store.access(mapId);
+    const ciphertext=store.db.prepare("SELECT ciphertext FROM galaxy_secrets WHERE id=?").get(c.id);
+    const readSecret=vi.spyOn(secrets,"get"),writeSecret=vi.spyOn(secrets,"put");up.calls=[];up.stream.mockClear();
+    const tools:Record<string,any>={};registerNexumTools({tool:(n:any,_d:any,s:any,h:any)=>tools[n]={s:z.object(s),h}} as any,()=>service);
+    const args=tools.nexum_update_credential.s.parse({credential_id:c.id,character_id:"9007199254740993"});
+    const result=JSON.parse((await tools.nexum_update_credential.h(args)).content[0].text);
+    expect(result).toMatchObject({bound_character_id:"9007199254740993",identity_source:"user_confirmed",health:"healthy"});
+    expect(service.listCredentials()[0].bound_character_id).toBe("9007199254740993");
+    expect(service.listMaps()[0].access[0].character_id).toBe("9007199254740993");
+    expect(store.access(mapId)).toEqual(access);expect(up.live()).toEqual([feed]);expect(feed.closed).toBe(false);
+    expect(up.calls).toEqual([]);expect(up.stream).not.toHaveBeenCalled();expect(readSecret).not.toHaveBeenCalled();expect(writeSecret).not.toHaveBeenCalled();
+    expect(store.db.prepare("SELECT ciphertext FROM galaxy_secrets WHERE id=?").get(c.id)).toEqual(ciphertext);
+    await service.updateCredential(c.id,{enabled:true});expect(service.credentialResult(c.id).identity_source).toBe("user_confirmed");expect(up.stream).not.toHaveBeenCalled();
+    for(const character_id of ["", "0", "-1", "1.5", "pilot", "01", "123456789012345678901",1320166902])
+      expect(tools.nexum_update_credential.s.safeParse({credential_id:c.id,character_id}).success).toBe(false);
+    await expect(service.updateCredential(c.id,{character_id:"invalid"})).rejects.toBeInstanceOf(NexumError);
+  });
   it("refreshes access bindings when a map disappears",async()=>{
     const c=await enroll();up.visible=[];await service.testCredential(c.id);expect(store.access()).toEqual([]);expect(up.live()).toHaveLength(0);
   });

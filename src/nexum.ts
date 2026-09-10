@@ -89,21 +89,26 @@ export class NexumService {
     }catch(e){this.failure(c,e);await this.reconcileWorkers();}
     return this.credentialResult(id);
   });}
-  updateCredential(id:string,input:{label?:string;enabled?:boolean;api_key?:string}):Promise<Json>{return this.serialize(async()=>{
+  updateCredential(id:string,input:{character_id?:string;label?:string;enabled?:boolean;api_key?:string}):Promise<Json>{return this.serialize(async()=>{
     const c=this.store.credential(id);let maps:Json[]|undefined;
+    if(input.character_id!==undefined&&(typeof input.character_id!=="string"||!/^[1-9][0-9]{0,19}$/.test(input.character_id)))
+      throw new NexumError(0,0,"Character ID must be a positive decimal string of at most 20 digits");
     if(input.label?.includes(input.api_key??this.secrets.get(c.secret_ref)))throw new NexumError(0,0,"Secret supplied in metadata");
     if(input.api_key){
       maps=await this.discover(c,input.api_key);
       if(maps.length){const p=await this.transport.stream(c.base_url,input.api_key,`/api/v1/maps/${encodeURIComponent(String(maps[0].id))}/events`,this.lifetime.signal);p.close();}
     }
-    await this.stopCredentialWorkers(id);
+    const restart=!!input.api_key||(input.enabled!==undefined&&input.enabled!==c.enabled);
+    if(restart)await this.stopCredentialWorkers(id);
     this.store.db.transaction(()=>{
       if(input.api_key)this.secrets.put(c.secret_ref,input.api_key);
       this.store.patchCredential(id,{...(input.label!==undefined?{label:input.label}:{}),...(input.enabled!==undefined?{enabled:input.enabled}:{}),
+        ...(input.character_id!==undefined?{bound_character_id:input.character_id,identity_source:"user_confirmed",
+          ...(input.character_id!==c.bound_character_id?{bound_character_name:null}:{})}:{}),
         ...(maps?{health:"healthy",capabilities:maps.length?["read","live_events"]:["read"],last_success_at:this.now(),last_discovery_at:this.now(),last_error:null,retry_at:0}: {})});
       if(maps)this.store.discover(c,maps);
     })();
-    this.ensureWorkers();return this.credentialResult(id);
+    if(restart)this.ensureWorkers();return this.credentialResult(id);
   });}
   removeCredential(id:string):Promise<Json>{return this.serialize(async()=>{
     const c=this.store.credential(id);await this.stopCredentialWorkers(id);

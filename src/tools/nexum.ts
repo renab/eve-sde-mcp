@@ -16,8 +16,8 @@ export function registerNexumTools(server:McpServer, getService:()=>NexumService
     {api_key:secret,character_id:id.optional(),label:z.string().max(160).optional(),base_url:z.string().max(2048).optional()},(s,a)=>s.addCredential(a));
   tool("nexum_list_credentials","List safe Nexum credential metadata; never returns keys.",{},s=>s.listCredentials());
   tool("nexum_test_credential","Revalidate a stored Nexum key and discover map access and live-event capability.",{credential_id:id},(s,a)=>s.testCredential(a.credential_id));
-  tool("nexum_update_credential","Update Nexum label/enabled state or securely validate and replace its key.",
-    {credential_id:id,label:z.string().max(160).optional(),enabled:z.boolean().optional(),api_key:secret.optional()},(s,a)=>s.updateCredential(a.credential_id,a));
+  tool("nexum_update_credential","Update Nexum label/enabled state, set a user-confirmed character binding, or securely validate and replace its key. Character binding alone changes local metadata without touching the key or restarting sync; it is not verified by Nexum.",
+    {credential_id:id,character_id:z.string().regex(/^[1-9][0-9]{0,19}$/).describe("User-confirmed EVE character ID as a positive decimal string; records identity_source=user_confirmed.").optional(),label:z.string().max(160).optional(),enabled:z.boolean().optional(),api_key:secret.optional()},(s,a)=>s.updateCredential(a.credential_id,a));
   tool("nexum_remove_credential","Remove Galaxy's stored key and access bindings. This does NOT revoke the key in Nexum.",{credential_id:id},(s,a)=>s.removeCredential(a.credential_id));
   tool("nexum_list_maps","List canonical locally cached Nexum maps, freshness, and character access bindings. Zero upstream calls.",{},s=>s.listMaps());
   tool("nexum_get_map_state","Read local Nexum map metadata, systems, connections and freshness. Zero upstream calls.",{map_id:id},(s,a)=>s.mapState(a.map_id));
