@@ -2,6 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { esiGet, esiGetAll, esiPost, getActiveCharacter } from "../auth/esi-client.js";
 import { enrichDailyData } from "./daily.js";
+import { resolveStructure,structureIdSchema } from "../structures.js";
 import { jsonResult } from "../utils.js";
 
 const id = z.number().int().positive();
@@ -81,11 +82,11 @@ export function registerOperationTools(server: McpServer): void {
       });
     }
   }
-  server.tool("get_structure", "Resolve a player structure's name, system, type and owner. Requires docking/access permission and esi-universe.read_structures.v1.", {
-    character_id: id.optional(), structure_id: id,
+  server.tool("get_structure", "Resolve cached player-structure metadata with freshness and actual auth-character provenance. Names are mutable; ESI access requires esi-universe.read_structures.v1. Refresh failures may return explicitly stale last-known metadata. Pass large IDs as exact decimal strings.", {
+    character_id: id.optional(), structure_id: structureIdSchema,
   }, async ({ character_id, structure_id }) => {
-    const char = await authenticated(character_id, OPERATION_SCOPES[7]);
-    return jsonResult(enrichDailyData(await esiGet(`/universe/structures/${structure_id}/`, { characterId: char.characterId })));
+    const resolved=await resolveStructure(structure_id,character_id);
+    return jsonResult(resolved ?? {structure_id,resolution_warning:"Structure metadata unavailable for this character; raw ID retained. Access/auth/backoff may prevent resolution."});
   });
   for (const [name, route, description] of [
     ["get_system_jumps", "universe/system_jumps", "System jump counts from ESI's recent reporting window; historical activity, not live safety."],

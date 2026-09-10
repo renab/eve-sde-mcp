@@ -6,6 +6,10 @@ Static data is powered by the [Fuzzwork](https://www.fuzzwork.co.uk/dump/) SQLit
 
 ## Tools
 
+ESI read responses automatically enrich player-structure IDs with cached metadata
+when accessible, while preserving raw IDs. `get_structure` shares this resolver.
+See [structure cache, response additions and access limitations](docs/structures.md).
+
 ### Keep-warm subscriptions
 
 `keep_warm_dataset`, `remove_keep_warm_dataset`, `list_keep_warm_datasets`, and

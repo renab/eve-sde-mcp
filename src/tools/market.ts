@@ -1,3 +1,4 @@
+import { structureIdSchema } from "../structures.js";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getDatabase } from "../database.js";
@@ -101,7 +102,7 @@ export function registerMarketTools(server: McpServer): void {
       character_id: z.number().optional().describe("Character ID (uses active character if omitted)"),
       type_id: z.number().optional().describe("Filter to a specific item type ID"),
       side: z.enum(["buy", "sell"]).optional().describe("Filter to buy or sell orders only"),
-      location_id: z.number().optional().describe("Filter to a specific station/structure (e.g. 60003760 = Jita 4-4)"),
+      location_id: structureIdSchema.optional().describe("Filter to a specific station/structure (e.g. 60003760 = Jita 4-4)"),
     },
     async ({ character_id, type_id, side, location_id }) => {
       const char = await getActiveCharacter(character_id);
@@ -112,7 +113,7 @@ export function registerMarketTools(server: McpServer): void {
 
       if (type_id) orders = orders.filter((o) => o.type_id === type_id);
       if (side) orders = orders.filter((o) => side === "buy" ? o.is_buy_order : !o.is_buy_order);
-      if (location_id) orders = orders.filter((o) => o.location_id === location_id);
+      if (location_id) orders = orders.filter((o) => String(o.location_id) === String(location_id));
 
       const db = getDatabase();
       const enriched = orders.map((o) => ({
@@ -152,7 +153,7 @@ export function registerMarketTools(server: McpServer): void {
       type_id: z.number().optional().describe("Filter to a specific item type ID"),
       state: z.enum(["expired", "cancelled", "fulfilled"]).optional().describe("Filter by order state"),
       side: z.enum(["buy", "sell"]).optional().describe("Filter to buy or sell orders only"),
-      location_id: z.number().optional().describe("Filter to a specific station/structure (e.g. 60003760 = Jita 4-4)"),
+      location_id: structureIdSchema.optional().describe("Filter to a specific station/structure (e.g. 60003760 = Jita 4-4)"),
       issued_after: z.string().optional().describe("Only return orders issued after this ISO date (e.g. '2026-07-01')"),
     },
     async ({ character_id, type_id, state, side, location_id, issued_after }) => {
@@ -165,7 +166,7 @@ export function registerMarketTools(server: McpServer): void {
       if (type_id) orders = orders.filter((o) => o.type_id === type_id);
       if (state) orders = orders.filter((o) => o.state === state);
       if (side) orders = orders.filter((o) => side === "buy" ? o.is_buy_order : !o.is_buy_order);
-      if (location_id) orders = orders.filter((o) => o.location_id === location_id);
+      if (location_id) orders = orders.filter((o) => String(o.location_id) === String(location_id));
       if (issued_after) {
         const cutoff = new Date(issued_after).getTime();
         orders = orders.filter((o) => new Date(o.issued).getTime() >= cutoff);
@@ -222,7 +223,7 @@ export function registerMarketTools(server: McpServer): void {
       character_id: z.number().optional().describe("Character ID (uses active character if omitted)"),
       type_id: z.number().optional().describe("Filter to a specific item type ID"),
       side: z.enum(["buy", "sell"]).optional().describe("Filter to buy or sell transactions only"),
-      location_id: z.number().optional().describe("Filter to a specific station/structure (e.g. 60003760 = Jita 4-4)"),
+      location_id: structureIdSchema.optional().describe("Filter to a specific station/structure (e.g. 60003760 = Jita 4-4)"),
       since: z.string().optional().describe("Only return transactions after this ISO date (e.g. '2026-07-01')"),
     },
     async ({ character_id, type_id, side, location_id, since }) => {
@@ -234,7 +235,7 @@ export function registerMarketTools(server: McpServer): void {
 
       if (type_id) transactions = transactions.filter((t) => t.type_id === type_id);
       if (side) transactions = transactions.filter((t) => side === "buy" ? t.is_buy : !t.is_buy);
-      if (location_id) transactions = transactions.filter((t) => t.location_id === location_id);
+      if (location_id) transactions = transactions.filter((t) => String(t.location_id) === String(location_id));
       if (since) {
         const cutoff = new Date(since).getTime();
         transactions = transactions.filter((t) => new Date(t.date).getTime() >= cutoff);
@@ -291,7 +292,7 @@ export function registerMarketTools(server: McpServer): void {
       region_id: z.number().describe("Region ID (10000002 = The Forge/Jita, 10000043 = Domain/Amarr)"),
       type_id: z.number().describe("Type ID of the item"),
       order_type: z.enum(["buy", "sell", "all"]).default("all").describe("Filter by order type"),
-      location_id: z.number().optional().describe("Filter to a specific station/structure (e.g. 60003760 = Jita 4-4 CNAP)"),
+      location_id: structureIdSchema.optional().describe("Filter to a specific station/structure (e.g. 60003760 = Jita 4-4 CNAP)"),
     },
     async ({ region_id, type_id, order_type, location_id }) => {
       let url = `/markets/${region_id}/orders/?type_id=${type_id}`;
@@ -302,7 +303,7 @@ export function registerMarketTools(server: McpServer): void {
       let orders = await esiGetAll<EsiOrder>(url, { public: true });
 
       if (location_id) {
-        orders = orders.filter((o) => o.location_id === location_id);
+        orders = orders.filter((o) => String(o.location_id) === String(location_id));
       }
 
       const db = getDatabase();
@@ -428,7 +429,7 @@ export function registerMarketTools(server: McpServer): void {
     {
       type_ids: z.array(z.number()).describe("Array of type IDs to check"),
       region_id: z.number().default(10000002).describe("Region ID (default: 10000002 = The Forge)"),
-      location_id: z.number().default(JITA_TRADE_HUB).describe("Station/structure to filter orders to (default: 60003760 = Jita 4-4 CNAP)"),
+      location_id: structureIdSchema.default(JITA_TRADE_HUB).describe("Station/structure to filter orders to (default: 60003760 = Jita 4-4 CNAP)"),
       sales_tax_pct: z.number().default(3.6).describe("Sales tax percentage (default 3.6% for Accounting V + no standings)"),
       broker_fee_pct: z.number().default(1.0).describe("Broker fee percentage (default 1.0% for Broker Relations V + no standings)"),
     },
@@ -442,7 +443,7 @@ export function registerMarketTools(server: McpServer): void {
           const url = `/markets/${region_id}/orders/?type_id=${type_id}&order_type=all`;
           try {
             const allOrders = await esiGetAll<EsiOrder>(url, { public: true });
-            const orders = allOrders.filter((o) => o.location_id === location_id);
+            const orders = allOrders.filter((o) => String(o.location_id) === String(location_id));
 
             const buyOrders = orders.filter((o) => o.is_buy_order).sort((a, b) => b.price - a.price);
             const sellOrders = orders.filter((o) => !o.is_buy_order).sort((a, b) => a.price - b.price);

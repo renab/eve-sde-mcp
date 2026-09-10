@@ -1,4 +1,5 @@
 import { getStateDatabase } from "./persistence.js";
+import { parseEsiJson } from "./esi-json.js";
 import { claimUpstreamAttempt,isBackground } from "./work-priority.js";
 
 export interface CacheMetadata {
@@ -97,7 +98,7 @@ export async function cachedEsiGet<T>(key: string, endpoint: string, fetcher: (c
         throw new Error(`ESI ${endpoint} failed (${response.status}): ${await response.text()}`);
       }
       if (response.status === 304 && !cached) throw new Error("ESI returned 304 without a stored representation");
-      const data = response.status === 304 ? cached!.data : await response.json();
+      const data = response.status === 304 ? cached!.data : parseEsiJson(await response.text());
       const now = Date.now();
       const h = response.headers;
       const control = h.get("cache-control") ?? (response.status === 304 ? cached!.metadata.esiCacheControl : null) ?? "";

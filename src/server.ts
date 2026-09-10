@@ -18,6 +18,7 @@ import { registerOperationTools } from "./tools/operations.js";
 import { registerPersistenceTools } from "./tools/persistence.js";
 import { registerKeepWarmTools } from "./tools/keep-warm.js";
 import { beginForeground } from "./work-priority.js";
+import { enrichStructureToolResult } from "./structures.js";
 
 export const SERVER_INFO = {
   name: "eve-sde",
@@ -29,11 +30,16 @@ export function createMcpServer(): McpServer {
   const server = new McpServer(SERVER_INFO);
   // Central callback boundary covers both stdio and HTTP without changing tool results.
   const register=server.tool.bind(server);
+  let enrichEsiResults=false;
   server.tool=((...args:any[])=>{
     const callback=args[args.length-1];
+    const enrich=enrichEsiResults && String(args[0]).startsWith("get_") && args[0]!=="get_structure";
     args[args.length-1]=async(...values:any[])=>{
       const done=beginForeground();
-      try{return await callback(...values);}finally{done();}
+      try{
+        const result=await callback(...values);
+        return enrich ? await enrichStructureToolResult(result,values[0]?.character_id):result;
+      }finally{done();}
     };
     return (register as (...args:any[])=>any)(...args);
   }) as typeof server.tool;
@@ -45,6 +51,7 @@ export function createMcpServer(): McpServer {
   registerMetaTools(server);
   registerAuthTools(server);
   registerSkillTools(server);
+  enrichEsiResults=true;
   registerMarketTools(server);
   registerIndustryEsiTools(server);
   registerFittingTools(server);
@@ -54,6 +61,7 @@ export function createMcpServer(): McpServer {
   registerPlanetaryTools(server);
   registerDailyTools(server);
   registerOperationTools(server);
+  enrichEsiResults=false;
   registerPersistenceTools(server);
   registerKeepWarmTools(server);
 

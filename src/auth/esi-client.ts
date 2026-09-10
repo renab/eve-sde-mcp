@@ -1,4 +1,5 @@
 import fs from "fs";
+import { parseEsiJson } from "../esi-json.js";
 import path from "path";
 import os from "os";
 import { refreshAccessToken } from "./oauth.js";
@@ -103,7 +104,7 @@ async function handleResponse<T>(response: Response, esiPath: string): Promise<T
   }
 
   if (response.status === 204) return undefined as T;
-  return (await response.json()) as T;
+  return parseEsiJson(await response.text()) as T;
 }
 
 async function fetchWithRetry(

@@ -1,3 +1,4 @@
+import { structureIdSchema } from "../structures.js";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getDatabase } from "../database.js";
@@ -82,6 +83,9 @@ export function registerIndustryEsiTools(server: McpServer): void {
         completedDate: j.completed_date ?? null,
         successfulRuns: j.successful_runs ?? null,
         facilityId: j.facility_id,
+        stationId: j.station_id,
+        blueprintLocationId: j.blueprint_location_id,
+        outputLocationId: j.output_location_id,
       }));
 
       if (activity) enriched = enriched.filter((j) => j.activity.toLowerCase() === activity.toLowerCase());
@@ -148,7 +152,7 @@ export function registerIndustryEsiTools(server: McpServer): void {
     {
       character_id: z.number().optional().describe("Character ID (uses active character if omitted)"),
       type_name: z.string().optional().describe("Filter assets by item name"),
-      location_id: z.number().optional().describe("Filter by location ID"),
+      location_id: structureIdSchema.optional().describe("Filter by location ID"),
     },
     async ({ character_id, type_name, location_id }) => {
       const char = await getActiveCharacter(character_id);
@@ -180,7 +184,7 @@ export function registerIndustryEsiTools(server: McpServer): void {
         );
       }
       if (location_id) {
-        enriched = enriched.filter((a) => a.locationId === location_id);
+        enriched = enriched.filter((a) => String(a.locationId) === String(location_id));
       }
 
       return jsonResult({ characterName: char.characterName, assetCount: enriched.length, assets: enriched });
@@ -194,7 +198,7 @@ export function registerIndustryEsiTools(server: McpServer): void {
       character_id: z.number().optional().describe("Character ID (uses active character if omitted)"),
       corporation_id: z.number().optional().describe("Corporation ID (defaults to the authenticated character's current corporation)"),
       type_name: z.string().optional().describe("Filter assets by item type name"),
-      location_id: z.number().optional().describe("Filter by location ID"),
+      location_id: structureIdSchema.optional().describe("Filter by location ID"),
       location_flag: z.string().optional().describe("Filter by location flag, such as CorpSAG1 or Deliveries"),
       limit: z.number().int().min(1).max(5000).default(500).describe("Maximum assets to return after filtering"),
       offset: z.number().int().min(0).default(0).describe("Number of filtered assets to skip"),
@@ -246,7 +250,7 @@ export function registerIndustryEsiTools(server: McpServer): void {
         enriched = enriched.filter((asset) => asset.typeName.toLowerCase().includes(query));
       }
       if (location_id !== undefined) {
-        enriched = enriched.filter((asset) => asset.locationId === location_id);
+        enriched = enriched.filter((asset) => String(asset.locationId) === String(location_id));
       }
       if (location_flag) {
         const query = location_flag.toLowerCase();

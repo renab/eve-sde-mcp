@@ -27,7 +27,7 @@ export function enrichDailyData(value: unknown): unknown {
 
 export function registerDailyTools(server: McpServer): void {
   const singles = [
-    ["get_character_location", "location", "esi-location.read_location.v1", "Read current solar system and docked station/structure IDs."],
+    ["get_character_location", "location", "esi-location.read_location.v1", "Read current system and docked station/structure IDs. Player structures are automatically enriched with cached names/type/owner and freshness when accessible; raw IDs always remain available."],
     ["get_character_ship", "ship", "esi-location.read_ship_type.v1", "Read the character's current ship, its item ID, type and custom name."],
     ["get_character_clones", "clones", "esi-clones.read_clones.v1", "Read home station, jump clones, installed clone implants and jump timestamps."],
     ["get_character_implants", "implants", "esi-clones.read_implants.v1", "Read active-clone implant IDs and names for training and fitting decisions."],

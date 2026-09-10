@@ -54,6 +54,12 @@ function setupAuth(): void {
 }
 
 describe("header-driven metadata cache", () => {
+  it("preserves oversized ESI integer IDs before caching/serialization",async()=>{
+    mockFetch.mockReset();mockFetch.mockResolvedValueOnce(new Response('{"structure_id":9007199254740993}',{headers:{"Cache-Control":"max-age=600"}}));
+    expect(await esiGet("/large-integer/",{public:true})).toEqual({structure_id:"9007199254740993"});
+    expect(await esiGet("/large-integer/",{public:true})).toEqual({structure_id:"9007199254740993"});
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
   it("shares public calls across character selections without authentication",async()=>{
     mockFetch.mockReset();
     mockFetch.mockResolvedValueOnce(jsonResponse({x:1},{headers:{"Cache-Control":"max-age=600"}}));
