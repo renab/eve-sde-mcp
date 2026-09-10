@@ -6,6 +6,19 @@ Static data is powered by the [Fuzzwork](https://www.fuzzwork.co.uk/dump/) SQLit
 
 ## Tools
 
+### Persistence and recaps
+
+Galaxy now includes a SQLite-backed respectful ESI cache and append-first JSON ledger.
+New tools: `store_record`, `get_record`, `search_records`, `get_record_history`,
+`supersede_record`, `link_records`, `search_relationships`, `describe_record_kind`,
+and `render_recap` (run/daily/trial). New record kinds/fields require no migrations.
+Recaps return Markdown for external publication; **Obsidian infrastructure is untouched**.
+See [persistence design, safety rules and usage](docs/persistence.md).
+
+State defaults to `~/.eve-sde/galaxy-state.db` (`GALAXY_STATE_DB` override), separate
+from the replaceable SDE and auth databases. Back up this database; it contains the
+permanent ledger. Treat private cached data and records as sensitive local files.
+
 ### Static Data (SDE)
 
 | Tool | Description |

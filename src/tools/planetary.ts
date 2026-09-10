@@ -117,12 +117,14 @@ export function registerPlanetaryTools(server: McpServer): void {
     "List the authenticated character's planetary-industry colonies with planet and system names. Requires esi-planets.manage_planets.v1. ESI colony data may remain stale until the colony is viewed in the EVE client.",
     {
       character_id: z.number().optional().describe("Character ID (uses active character if omitted)"),
+      force_refresh: z.boolean().default(false).describe("Request refresh when upstream freshness permits; never bypass ESI expiry or backoff"),
     },
-    async ({ character_id }) => {
+    async ({ character_id, force_refresh }) => {
       const char = await getActiveCharacter(character_id);
       requirePlanetaryScope(char.scopes);
       const snapshot = await esiGetWithMetadata<EsiColony[]>(`/characters/${char.characterId}/planets/`, {
         characterId: char.characterId,
+        forceRefresh: force_refresh, allowStale: true,
       });
       const db = getDatabase();
 
@@ -163,18 +165,20 @@ export function registerPlanetaryTools(server: McpServer): void {
     {
       planet_id: z.number().int().positive().describe("Planet ID from get_planetary_colonies"),
       character_id: z.number().optional().describe("Character ID (uses active character if omitted)"),
+      force_refresh: z.boolean().default(false).describe("Request refresh when upstream freshness permits; never bypass ESI expiry or backoff"),
     },
-    async ({ planet_id, character_id }) => {
+    async ({ planet_id, character_id, force_refresh }) => {
       const char = await getActiveCharacter(character_id);
       requirePlanetaryScope(char.scopes);
       const [snapshot, planet, colonyList] = await Promise.all([
         esiGetWithMetadata<EsiColonyLayout>(`/characters/${char.characterId}/planets/${planet_id}/`, {
           characterId: char.characterId,
+          forceRefresh: force_refresh, allowStale: true,
         }),
         esiGet<EsiPlanetInfo>(`/universe/planets/${planet_id}/`, {
           public: true,
         }).catch(() => null),
-        esiGetWithMetadata<EsiColony[]>(`/characters/${char.characterId}/planets/`, { characterId: char.characterId }).catch(() => null),
+        esiGetWithMetadata<EsiColony[]>(`/characters/${char.characterId}/planets/`, { characterId: char.characterId, forceRefresh: force_refresh, allowStale: true }).catch(() => null),
       ]);
       const layout = snapshot.data;
       const db = getDatabase();

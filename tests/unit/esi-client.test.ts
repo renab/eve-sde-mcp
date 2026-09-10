@@ -27,6 +27,7 @@ describe("dated public route API", () => {
     expect(mockFetch).toHaveBeenCalledWith("https://esi.evetech.net/route/1/2", {
       method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json", "X-Compatibility-Date": "2025-09-30" },
       body: JSON.stringify(body),
+      signal: expect.any(AbortSignal),
     });
   });
   it("surfaces route errors", async () => {
@@ -53,6 +54,27 @@ function setupAuth(): void {
 }
 
 describe("header-driven metadata cache", () => {
+  it("shares public calls across character selections without authentication",async()=>{
+    mockFetch.mockReset();
+    mockFetch.mockResolvedValueOnce(jsonResponse({x:1},{headers:{"Cache-Control":"max-age=600"}}));
+    await esiGet("/public-share/",{public:true,characterId:1});
+    await esiGet("/public-share/",{public:true,characterId:2});
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(mockFetch.mock.calls[0][1].headers.Authorization).toBeUndefined();
+  });
+  it("isolates private caches by character but not by access-token rotation",async()=>{
+    mockFetch.mockReset(); setupAuth();
+    mockFetch.mockResolvedValue(jsonResponse({x:1},{headers:{"Cache-Control":"max-age=600"}}));
+    await esiGet("/private-share/",{characterId:12345});
+    const character=vi.mocked(getTokens).mock.results.at(-1)!.value;
+    vi.mocked(getTokens).mockReturnValue({...character,accessToken:"rotated"});
+    await esiGet("/private-share/",{characterId:12345});
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    vi.mocked(getTokens).mockReturnValue({...character,characterId:54321});
+    mockFetch.mockResolvedValueOnce(jsonResponse({x:2},{headers:{"Cache-Control":"max-age=600"}}));
+    expect(await esiGet("/private-share/",{characterId:54321})).toEqual({x:2});
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
   it("preserves metadata on hits and fetches again at upstream expiry", async () => {
     vi.useFakeTimers();
     try {
