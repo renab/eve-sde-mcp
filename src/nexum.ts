@@ -1,3 +1,4 @@
+import { NexumEsiLocations, type LocationProvider } from "./nexum-esi.js";
 import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -20,6 +21,7 @@ type Worker={controller:AbortController; task:Promise<void>; credential?:string;
 export interface NexumOptions { debounceMs?:number; staleMs?:number; retentionMs?:number; retryMs?:number; accessRefreshMs?:number; random?:()=>number; }
 
 export class NexumService {
+  readonly esiLocations:NexumEsiLocations;
   private workers=new Map<string,Worker>();
   private pending=new Map<string,NodeJS.Timeout>();
   private queues=new Map<string,Promise<void>>();
@@ -30,7 +32,8 @@ export class NexumService {
   private discovering=false;
   readonly options:Required<NexumOptions>;
   constructor(readonly store:NexumStore, private secrets:Pick<SecretStore,"put"|"get"|"remove">,
-    private transport:NexumTransport=new HttpNexumTransport(), options:NexumOptions={}) {
+    private transport:NexumTransport=new HttpNexumTransport(), options:NexumOptions={}, locationProvider?:LocationProvider) {
+    this.esiLocations=new NexumEsiLocations(store,locationProvider);
     this.options={debounceMs:250,staleMs:300_000,retentionMs:48*3600_000,retryMs:1000,accessRefreshMs:6*3600_000,random:Math.random,...options};
     for(const k of ["debounceMs","staleMs","retentionMs","retryMs","accessRefreshMs"] as const)
       if(!Number.isFinite(this.options[k])||this.options[k]<=0)throw new Error("Invalid Nexum timing configuration");
@@ -136,8 +139,9 @@ export class NexumService {
     if(this.lifetime.signal.aborted)this.lifetime=new AbortController();
     if(this.pruneTimer)return;
     for(const m of this.store.maps())this.store.patchMap(m.id,{stream_connected:false,health:m.hydrated_at?"degraded":"uninitialized",disconnected_at:this.now()});
-    this.pruneTimer=setInterval(()=>{this.store.prune(this.options.retentionMs);this.refreshAccess();this.ensureWorkers();},60_000);this.pruneTimer.unref();
+    this.pruneTimer=setInterval(()=>{this.store.prune(this.options.retentionMs);this.esiLocations.prune(this.options.retentionMs);this.refreshAccess();this.ensureWorkers();},60_000);this.pruneTimer.unref();
     // Background discovery has bounded HTTP calls and cannot block Galaxy startup.
+    this.esiLocations.start();
     this.refreshAccess(true);
   }
   private refreshAccess(force=false):void {
@@ -158,11 +162,13 @@ export class NexumService {
   }
   async stop():Promise<void>{
     this.stopped=true;this.lifetime.abort();clearInterval(this.pruneTimer);this.pruneTimer=undefined;
+    const esiStopped=this.esiLocations.stop();
     for(const t of this.pending.values())clearTimeout(t);this.pending.clear();
     for(const w of this.workers.values()){w.controller.abort();w.stream?.close();}
     await Promise.allSettled([...this.workers.values()].map(w=>w.task));
     await Promise.allSettled([...this.queues.values()]);
     await this.management;
+    await esiStopped;
   }
   private ensureWorkers():void {
     if(this.stopped)return;
@@ -329,18 +335,32 @@ export class NexumService {
   listMaps():Json[]{return this.store.maps().map(m=>({...this.freshness(m.id),access:this.store.access(m.id).map(a=>({credential_id:a.credential_id,
     character_id:this.store.credential(a.credential_id).bound_character_id,metadata:a.metadata}))}));}
   mapState(map:string):Json{const m=this.store.map(map);return {map:this.store.state(m.id),freshness:this.freshness(m.id)};}
+  private coverage(map:string):Json {return {...presenceCoverage(),esi_augmentation:this.esiLocations.coverage(map),
+    supplementation:"ESI location for bound characters; online status unknown. Not Nexum account or fleet API data."};}
+  private mergedPresence(map:string):Json[] {
+    const groups=new Map<string,Json[]>();
+    for(const p of [...this.store.currentPresence(map),...this.esiLocations.current(map)]) {
+      const id=String(p.characterId);groups.set(id,[...(groups.get(id)??[]),p]);
+    }
+    return [...groups.values()].map(observations=>{
+      observations.sort((a,b)=>(b.provenance==="nexum_presence"?(b.ts??b.observed_at):b.observed_at)-(a.provenance==="nexum_presence"?(a.ts??a.observed_at):a.observed_at));
+      const selected=observations[0];
+      return {...selected,observations,location_conflict:new Set(observations.filter(p=>p.eveSystemId!=null).map(p=>String(p.eveSystemId))).size>1,
+        in_map:this.store.state(map).systems.some((s:Json)=>String(s.eveSystemId)===String(selected.eveSystemId))};
+    });
+  }
   systemState(map:string,system:string):Json{
     const m=this.store.map(map),state=this.store.state(m.id),s=state.systems.filter((s:Json)=>String(s.id)===system||s.name===system||String(s.eveSystemId)===system);
     if(s.length!==1)throw new Error("System not found or ambiguous");
     return {system:s[0],...this.store.resources(m.id,String(s[0].id)),connections:state.connections.filter((c:Json)=>c.sourceId===s[0].id||c.targetId===s[0].id),
-      presence:this.store.currentPresence(m.id).filter(p=>p.eveSystemId!=null&&String(p.eveSystemId)===String(s[0].eveSystemId)),presence_coverage:presenceCoverage(),freshness:this.freshness(m.id)};
+      presence:this.mergedPresence(m.id).filter(p=>p.eveSystemId!=null&&String(p.eveSystemId)===String(s[0].eveSystemId)),presence_coverage:this.coverage(m.id),freshness:this.freshness(m.id)};
   }
   presence(map:string,options:{character?:string;system?:string;current_only?:boolean;since?:number}={}):Json{
-    const m=this.store.map(map);this.store.prune(this.options.retentionMs);
-    const rows=options.current_only===false?this.store.history(m.id,options.since):this.store.currentPresence(m.id);
+    const m=this.store.map(map);this.store.prune(this.options.retentionMs);this.esiLocations.prune(this.options.retentionMs);
+    const rows=options.current_only===false?[...this.store.history(m.id,options.since),...this.esiLocations.history(m.id,options.since)].sort((a,b)=>a.observed_at-b.observed_at):this.mergedPresence(m.id);
     return {presence:rows.filter(p=>(!options.character||String(p.characterId)===options.character||p.characterName===options.character)&&
       (!options.system||String(p.eveSystemId)===options.system)&& (options.current_only===false||options.since===undefined||p.observed_at>=options.since)),
-      provenance:"nexum_presence",presence_coverage:presenceCoverage(),interpretation:"Map viewers, not all online pilots or all account characters; location is telemetry, not an explicit user report. Leaving the viewer roster is not proof of leaving the system.",freshness:this.freshness(m.id)};
+      provenance:"source_labeled_telemetry",presence_coverage:this.coverage(m.id),interpretation:"Nexum viewers supplemented by ESI locations of bound, ESI-authorized characters. Location does not prove online status. Conflicts retain both observations; selected location uses the latest source timestamp. Telemetry is not an explicit user report. Leaving the viewer roster is not proof of leaving the system.",freshness:this.freshness(m.id)};
   }
   chain(map:string,options:{root?:string;depth?:number;include_presence?:boolean;include_sites?:boolean}={}):Json{
     const m=this.store.map(map),state=this.store.state(m.id);let selected=new Set(state.systems.map((s:Json)=>s.id));
@@ -356,7 +376,7 @@ export class NexumService {
         id:c.id,source:systems.find((s:Json)=>s.id===c.sourceId)?.name??c.sourceId,destination:systems.find((s:Json)=>s.id===c.targetId)?.name??c.targetId,
         wormhole_type:c.type,connection_type:c.connectionType,source_signature_id:c.sourceSignatureId,target_signature_id:c.targetSignatureId,
         lifetime_state:c.timeStatus,mass_state:c.massStatus,mass_used:c.massUsed,created_at:c.createdAt,eol_at:c.eolAt,lifetime_expires_at:c.lifetimeExpiresAt,broken:c.broken,notes:c.flagNote})),
-      ...(options.include_presence?{presence:this.store.currentPresence(m.id).filter(p=>p.eveSystemId!=null&&systems.some((s:Json)=>String(s.eveSystemId)===String(p.eveSystemId))),presence_coverage:presenceCoverage()}:{}),freshness:this.freshness(m.id)};
+      ...(options.include_presence?{presence:this.mergedPresence(m.id).filter(p=>p.eveSystemId!=null&&systems.some((s:Json)=>String(s.eveSystemId)===String(p.eveSystemId))),presence_coverage:this.coverage(m.id)}:{}),freshness:this.freshness(m.id)};
   }
   diagnostics():Json{return {credential_count:this.store.credentials().length,credentials:this.listCredentials(),maps:this.listMaps(),
     presence_history_rows:(this.store.db.prepare("SELECT count(*) n FROM nexum_presence_events").get() as any).n};}

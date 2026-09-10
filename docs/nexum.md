@@ -56,7 +56,7 @@ The server roster means **who is viewing a map**, not every character online in 
 
 Galaxy stores current presence and transitions (including departures inferred from authoritative roster replacement), not every unchanged heartbeat. It prunes history automatically every minute and on historical/current presence queries. A rolling retention-boundary baseline preserves a location that remained unchanged longer than 48 hours; it is labeled `presence.baseline` and retains `baseline_from`, not claimed as a new observation. Queries include the last retained pre-`since` transition per character. This supports approximate reconstruction within retention; it is not a complete EVE movement log, especially across stream gaps. Current stale presence carries the map freshness warning.
 
-All presence output has `provenance: nexum_presence`. A downstream inference must separately label `nexum_presence_inference` with its confidence. It must never become `explicit_user_report` without an actual report. McGreggor, Minner and Renab can share one canonical operating map regardless of which credential supplies its stream.
+Nexum observations have `provenance: nexum_presence`; ESI observations have `provenance: esi_location`. The combined envelope is `source_labeled_telemetry`. A downstream inference must separately label `nexum_presence_inference` with its confidence. It must never become `explicit_user_report` without an actual report. McGreggor, Minner and Renab can share one canonical operating map regardless of which credential supplies its stream.
 
 ### Occupancy badge versus streamed viewer presence
 
@@ -73,7 +73,26 @@ The frontend has distinct indicators in `web/src/components/map/SystemNode.tsx`:
 
 On 2026-09-10, a bounded direct SSE diagnostic of Cervantes using Minner's key returned a `presence.snapshot` with exactly one viewer (McGreggor, EVE ID `641570826`, system `31000398`), followed by a `presence.update` for the same viewer. Galaxy's live cache matched it. This verified an upstream **API exposure** gap rather than dropped snapshot entries or filtering to the credential's bound character. No alt locations were added to production from screenshot interpretation.
 
-Presence, system-state and presence-enabled chain results expose `presence_coverage: {scope: "map_viewers", includes_account_character_locations: false, includes_fleet_locations: false, limitation: ...}`. Missing roster entries are not proof of absence from the system; `presence.leave` means leaving the roster, not a confirmed system departure. A regression test verifies all three entries of a supplied multi-viewer snapshot survive, individual updates/departures affect only that viewer, history retains the transitions, and no REST calls occur. Complete account-location coverage requires a supported Nexum API extension or a separately authorized, distinctly labeled source such as ESI; it cannot be obtained by changing the current SSE normalization.
+Presence, system-state and presence-enabled chain results expose Nexum coverage plus per-character `esi_augmentation` availability. The Nexum scope remains `map_viewers`; its account/fleet APIs remain unavailable. Missing roster entries are not proof of absence from the system; `presence.leave` means leaving the roster, not a confirmed system departure. A regression test verifies all three entries of a supplied multi-viewer snapshot survive, individual updates/departures affect only that viewer, history retains the transitions, and no REST calls occur. Complete account-location coverage requires a supported Nexum API extension or a separately authorized, distinctly labeled source such as ESI; it cannot be obtained by changing the current SSE normalization.
+
+## ESI location augmentation
+
+User-authorized augmentation supplements the Nexum roster using Galaxy's existing ESI-authorized characters whose IDs match enabled Nexum credential bindings with map access. No new key enrollment or token transfer is needed. Characters without ESI location authorization report missing authorization in coverage. Disabling/removing a binding stops its sampling and contribution; losing ESI authorization excludes its current ESI contribution.
+
+A background scheduler checks every ten seconds while Galaxy is idle, samples at most one character per pass in fair rotation, and waits at least thirty seconds per character or until ESI expiry, whichever is later. Characters shared across maps use one observation. The existing ESI client provides expiry-aware caching, conditional revalidation, request coalescing, foreground priority and error/rate-limit backoff. Failures retry no sooner than sixty seconds and retain visibly stale last-known data with fixed, secret-free diagnostics. Ordinary MCP reads remain local-only. This adds **zero Nexum REST requests or streams**.
+
+| Input | Payload | Action | Upstream calls |
+| --- | --- | --- | --- |
+| ESI location sample | solar_system_id; optional station_id, structure_id; HTTP cache timestamps | Persist global character location; append only changed location/docking transitions | At most one GET /latest/characters/{character_id}/location/ per idle pass, using existing ESI cache; scope esi-location.read_location.v1 |
+| Unchanged/cached ESI response | Same location and original cache observation timestamp | Update freshness without duplicating transitions or renewing a cached observation's timestamp | Zero GET while cache remains fresh |
+| ESI error | No trustworthy new location | Retain old timestamp, mark unavailable/stale, back off | No Nexum call; no immediate retry |
+| MCP presence/system/chain read | Local observations | Merge by character, retain both sources and conflicts | Zero |
+
+The endpoint and scope were checked against [CCP's current OpenAPI specification](https://esi.evetech.net/meta/openapi.json). No online, ship, fleet, structure-name or public character-name calls are added. Names come from existing ESI authorization metadata. Online remains null: a location is not evidence that a character is logged in.
+
+Current output has one row per character, with all source observations and their timestamps. The latest source timestamp selects the displayed location (Nexum heartbeat ts, ESI cache fetched time); disagreement sets location_conflict. This selection is a telemetry heuristic, not proof of movement. ESI freshness uses its own expires_at/stale fields; map freshness continues to describe Nexum only. Nexum snapshot/leave never deletes ESI data. Bound characters outside the map remain visible in map-wide presence with in_map=false; system/chain filters use the selected location.
+
+Separate additive nexum_esi_locations and nexum_esi_location_events tables persist current locations and rolling 48-hour transitions without ledger writes. History retains both source timelines, including moves outside mapped systems. A labeled esi.location.baseline preserves the original baseline_from at the retention boundary. History gaps are possible during shutdown, foreground activity and upstream failures; this is not a complete movement log. Existing Nexum event handling and the full matrix below are unchanged.
 
 ## Authoritative public-source audit
 
@@ -139,3 +158,7 @@ Additional limitations: jump/kill history has no versioned backfill routes and i
 ## Verification
 
 `npm run build` compiles the integration. `npx vitest run` runs Galaxy's complete suite. New tests cover actual HTTP MCP enrollment/log redaction; encrypted storage and restart; multi-character canonical identity and stream count; zero-call cached reads/direct events; exact invalidation/resync call counts and coalescing; handoff buffering; malformed and 64-bit events; auth failure/failover, access loss, replacement/removal; presence transitions/history/pruning; stale-readable health; and transport Retry-After/redirect behavior. No real keys are committed as fixtures and no tests require a live Nexum account.
+
+### ESI augmentation verification (2026-09-10)
+
+Build passed; complete suite: 30 files, 280 tests passed. Five new ESI tests cover shared reads, three-character merging, zero-call cached reads, independent viewer removal, conflicting/out-of-map movement, authorization loss, sanitized errors, 48-hour baselines, persistence and in-flight shutdown. Live local MCP after PM2 restart returned all three bound characters in J154212 (31000398), all three ESI sources available, three ESI history entries and live Nexum map health. At verification Nexum supplied Minner; ESI supplemented McGreggor and Renab. ESI samples can expire between background passes and are explicitly labeled stale/last-known.
