@@ -2,6 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getDatabase } from "../database.js";
 import { esiGet, esiGetAll, getActiveCharacter } from "../auth/esi-client.js";
+import { walletJournalPath,walletTransactionsPath } from "../esi-datasets.js";
 import { enrichTypeName, jsonResult } from "../utils.js";
 
 interface EsiOrder {
@@ -200,7 +201,7 @@ export function registerMarketTools(server: McpServer): void {
     async ({ character_id, ref_type, since }) => {
       const char = await getActiveCharacter(character_id);
       let journal = await esiGetAll<EsiWalletJournalEntry>(
-        `/characters/${char.characterId}/wallet/journal/`,
+        walletJournalPath(char.characterId),
         { characterId: char.characterId }
       );
 
@@ -227,7 +228,7 @@ export function registerMarketTools(server: McpServer): void {
     async ({ character_id, type_id, side, location_id, since }) => {
       const char = await getActiveCharacter(character_id);
       let transactions = await esiGet<EsiTransaction[]>(
-        `/characters/${char.characterId}/wallet/transactions/`,
+        walletTransactionsPath(char.characterId),
         { characterId: char.characterId }
       );
 

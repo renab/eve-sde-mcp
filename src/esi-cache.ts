@@ -1,4 +1,5 @@
 import { getStateDatabase } from "./persistence.js";
+import { claimUpstreamAttempt,isBackground } from "./work-priority.js";
 
 export interface CacheMetadata {
   esiPages: number; esiFetchedAt: string; esiDate: string | null;
@@ -9,6 +10,16 @@ export interface CacheMetadata {
 }
 type Entry = { data: unknown; metadata: CacheMetadata; expiresAt: number; storedAt: number };
 const inflight = new Map<string, Promise<{ data: unknown; metadata: CacheMetadata }>>();
+/** Local-only view of the same cache identity and safety gates used by reads. */
+export function inspectEsiCache(key: string, url: string) {
+  const row = getStateDatabase().prepare(`SELECT expires_at AS expiresAt,
+    json_extract(entry,'$.metadata.esiPages') AS pages,
+    json_extract(entry,'$.metadata.localCacheExpiresAt') AS freshness
+    FROM esi_cache WHERE cache_key=?`).get(key) as {expiresAt:number;pages:number;freshness:string|null} | undefined;
+  const retryAt = Math.max(backoffUntil("global"),backoffUntil(`transport:${url}`),backoffUntil(`cache:${key}`));
+  return { exists:!!row, expiresAt:row?.expiresAt ?? null, pages:row?.pages ?? 1,
+    hasFreshness:!!row?.freshness, retryAt, inflight:inflight.has(key) };
+}
 export class EsiUnavailable extends Error {
   constructor(message: string, public retryAt: number) { super(message); }
 }
@@ -23,6 +34,7 @@ export async function disciplinedFetch(url: string, init: RequestInit): Promise<
   for (let attempt = 0; attempt < 3; attempt++) {
     const blocked = Math.max(backoffUntil("global"), backoffUntil(key));
     if (blocked > Date.now()) throw new EsiUnavailable("ESI rate limited/backoff; no upstream request made", blocked);
+    claimUpstreamAttempt();
     let response: Response;
     try { response = await fetch(url, { ...init, signal: init.signal ?? AbortSignal.timeout(30000) }); }
     catch (error) {
@@ -46,7 +58,7 @@ export async function disciplinedFetch(url: string, init: RequestInit): Promise<
       // Conservative global circuit breaker for rate limits (also covers endpoint buckets).
       setBackoff(response.status === 420 || response.status === 429 ? "global" : key, until);
       // Never automatically repeat writes; retry only idempotent GETs, with bounded waits.
-      if ((init.method ?? "GET") === "GET" && response.status >= 500 && attempt < 2 && delay < 5000 && remain >= 20) {
+      if (!isBackground() && (init.method ?? "GET") === "GET" && response.status >= 500 && attempt < 2 && delay < 5000 && remain >= 20) {
         await response.body?.cancel();
         await new Promise(resolve => setTimeout(resolve, Math.ceil(delay)));
         continue;

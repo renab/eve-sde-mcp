@@ -16,6 +16,8 @@ import { registerPlanetaryTools } from "./tools/planetary.js";
 import { registerDailyTools } from "./tools/daily.js";
 import { registerOperationTools } from "./tools/operations.js";
 import { registerPersistenceTools } from "./tools/persistence.js";
+import { registerKeepWarmTools } from "./tools/keep-warm.js";
+import { beginForeground } from "./work-priority.js";
 
 export const SERVER_INFO = {
   name: "eve-sde",
@@ -25,6 +27,16 @@ export const SERVER_INFO = {
 /** Create a fresh MCP server. HTTP requests require separate server instances. */
 export function createMcpServer(): McpServer {
   const server = new McpServer(SERVER_INFO);
+  // Central callback boundary covers both stdio and HTTP without changing tool results.
+  const register=server.tool.bind(server);
+  server.tool=((...args:any[])=>{
+    const callback=args[args.length-1];
+    args[args.length-1]=async(...values:any[])=>{
+      const done=beginForeground();
+      try{return await callback(...values);}finally{done();}
+    };
+    return (register as (...args:any[])=>any)(...args);
+  }) as typeof server.tool;
 
   registerTypeTools(server);
   registerGroupTools(server);
@@ -43,6 +55,7 @@ export function createMcpServer(): McpServer {
   registerDailyTools(server);
   registerOperationTools(server);
   registerPersistenceTools(server);
+  registerKeepWarmTools(server);
 
   return server;
 }

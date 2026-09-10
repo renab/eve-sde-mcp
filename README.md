@@ -6,6 +6,14 @@ Static data is powered by the [Fuzzwork](https://www.fuzzwork.co.uk/dump/) SQLit
 
 ## Tools
 
+### Keep-warm subscriptions
+
+`keep_warm_dataset`, `remove_keep_warm_dataset`, `list_keep_warm_datasets`, and
+`list_keep_warm_dataset_types` support explicit, persistent refresh-on-idle enrollment.
+Supported initially: character/corporation assets, wallet journal/transactions, and
+character industry jobs. No automatic enrollment or arbitrary URL warming.
+See [keep-warm schemas, scheduling and safety](docs/keep-warm.md).
+
 ### Persistence and recaps
 
 Galaxy now includes a SQLite-backed respectful ESI cache and append-first JSON ledger.

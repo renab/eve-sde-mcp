@@ -2,6 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getDatabase } from "../database.js";
 import { esiGet, esiGetAll, getActiveCharacter } from "../auth/esi-client.js";
+import { characterAssetsPath,corporationAssetsPath,industryJobsPath } from "../esi-datasets.js";
 import { enrichTypeName, likeContains, jsonResult } from "../utils.js";
 
 interface EsiIndustryJob {
@@ -61,8 +62,7 @@ export function registerIndustryEsiTools(server: McpServer): void {
     },
     async ({ character_id, include_completed, activity, status }) => {
       const char = await getActiveCharacter(character_id);
-      let url = `/characters/${char.characterId}/industry/jobs/`;
-      if (include_completed) url += "?include_completed=true";
+      const url = industryJobsPath(char.characterId,include_completed);
 
       const jobs = await esiGet<EsiIndustryJob[]>(url, { characterId: char.characterId });
 
@@ -160,7 +160,7 @@ export function registerIndustryEsiTools(server: McpServer): void {
         quantity: number;
         location_flag: string;
         is_singleton: boolean;
-      }>(`/characters/${char.characterId}/assets/`, { characterId: char.characterId });
+      }>(characterAssetsPath(char.characterId), { characterId: char.characterId });
 
       const db = getDatabase();
       let enriched = assets.map((a) => ({
@@ -224,7 +224,7 @@ export function registerIndustryEsiTools(server: McpServer): void {
         location_flag: string;
         is_singleton: boolean;
         is_blueprint_copy?: boolean;
-      }>(`/corporations/${corporationId}/assets/`, {
+      }>(corporationAssetsPath(corporationId), {
         characterId: char.characterId,
       });
 

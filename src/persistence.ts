@@ -16,6 +16,14 @@ export function openStateDatabase(filename: string): Database.Database {
       entry TEXT NOT NULL CHECK(json_valid(entry))
     );
     CREATE TABLE IF NOT EXISTS esi_backoff (key TEXT PRIMARY KEY, until_ms INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS keep_warm_subscriptions (
+      id TEXT PRIMARY KEY, dataset TEXT NOT NULL, subject_key TEXT NOT NULL,
+      params_json TEXT NOT NULL CHECK(json_valid(params_json)), enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL, last_considered_at TEXT, last_refresh_attempt_at TEXT,
+      last_refresh_success_at TEXT, last_error TEXT, status TEXT NOT NULL DEFAULT 'subscribed',
+      jitter_ms INTEGER NOT NULL,
+      UNIQUE(dataset,subject_key,params_json)
+    );
     CREATE TABLE IF NOT EXISTS records (
       id TEXT PRIMARY KEY, namespace TEXT NOT NULL, kind TEXT NOT NULL, key TEXT,
       observed_at TEXT, created_at TEXT NOT NULL, source_type TEXT, source_ref TEXT,

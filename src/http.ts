@@ -10,6 +10,8 @@ import { closeAuthDb } from "./auth/tokens.js";
 import { closeDatabase, sdeExists } from "./database.js";
 import { downloadSde } from "./downloader.js";
 import { createMcpServer, SERVER_INFO } from "./server.js";
+import { beginForeground } from "./work-priority.js";
+import { startKeepWarm,stopKeepWarm } from "./keep-warm.js";
 
 const host = process.env.HOST || "127.0.0.1";
 const port = parsePort(process.env.PORT);
@@ -24,6 +26,10 @@ function parsePort(value: string | undefined): number {
 
 export const app = express();
 app.disable("x-powered-by");
+app.use((_req,res,next)=>{
+  const done=beginForeground();
+  res.once("finish",done);res.once("close",done);next();
+});
 app.use(express.json({ limit: "2mb" }));
 
 app.use((req, res, next) => {
@@ -111,6 +117,7 @@ async function prepareData(): Promise<void> {
 export async function startHttpServer() {
   await prepareData();
   return app.listen(port, host, () => {
+    startKeepWarm();
     console.log(`EVE SDE MCP listening on http://${host}:${port}`);
   });
 }
@@ -121,6 +128,7 @@ const isMainModule =
 if (isMainModule) {
   const httpServer = await startHttpServer();
   const shutdown = (signal: string) => {
+    stopKeepWarm();
     console.log(`Received ${signal}; shutting down.`);
     httpServer.close(() => {
       closeDatabase();

@@ -6,6 +6,7 @@ import { getCurrentCharacter, updateTokens, getTokens } from "./tokens.js";
 import type { StoredCharacter } from "./tokens.js";
 import { createHash } from "crypto";
 import { cachedEsiGet, disciplinedFetch, type CacheMetadata } from "../esi-cache.js";
+import { isBackground, WarmDeferred } from "../work-priority.js";
 
 const ESI_BASE = "https://esi.evetech.net/latest";
 const tokenRefreshes = new Map<number, Promise<StoredCharacter>>();
@@ -122,16 +123,28 @@ async function buildHeaders(opts?: EsiRequestOptions): Promise<Record<string, st
   return headers;
 }
 
-/** Cache only for the freshness lifetime supplied by ESI, never a fixed local TTL. */
-export async function esiGetWithMetadata<T>(esiPath: string, opts?: EsiRequestOptions): Promise<{ data: T; metadata: CacheMetadata }> {
-  const headers = await buildHeaders(opts); // Authenticate even when serving a cached response.
+/** Local identity construction shared by read-through and keep-warm inspection. No SSO/ESI calls. */
+export function esiCacheIdentity(esiPath: string, opts?: EsiRequestOptions): { key: string; url: string } {
   // Public callers share one key. Private keys contain no bearer/refresh tokens.
   const character = opts?.public ? null : opts?.characterId ? getTokens(opts.characterId) : getCurrentCharacter();
   const identity = opts?.public ? "public" : `${character?.characterId}:${character?.scopes.split(" ").sort().join(" ")}`;
   const url = new URL(`${ESI_BASE}${esiPath}`);
   url.searchParams.sort();
   const key = createHash("sha256").update(`${identity}:${url}`).digest("hex");
-  return cachedEsiGet<T>(key, esiPath, conditional => fetchWithRetry(`${ESI_BASE}${esiPath}`, { headers: { ...headers, ...conditional } }, esiPath), opts);
+  return { key, url: `${ESI_BASE}${esiPath}` };
+}
+
+/** Cache only for the freshness lifetime supplied by ESI, never a fixed local TTL. */
+export async function esiGetWithMetadata<T>(esiPath: string, opts?: EsiRequestOptions): Promise<{ data: T; metadata: CacheMetadata }> {
+  const headers = await buildHeaders(opts); // Authenticate even when serving a cached response.
+  const {key,url} = esiCacheIdentity(esiPath,opts);
+  const read=()=>cachedEsiGet<T>(key, esiPath, conditional => fetchWithRetry(url, { headers: { ...headers, ...conditional } }, esiPath), opts);
+  try {return await read();}
+  catch(error) {
+    // A foreground caller that joined queued (not dispatched) warm work takes over.
+    if(error instanceof WarmDeferred && !isBackground()) return read();
+    throw error;
+  }
 }
 
 export async function esiGet<T>(
@@ -151,12 +164,11 @@ export async function esiGetAll<T>(
   const allData = [...first.data];
   // Each page has its own upstream expiry; never assign a new aggregate TTL.
   // Bound concurrency to avoid flooding ESI for large corporate inventories.
-  for (let start = 2; start <= first.metadata.esiPages; start += 5) {
+  const concurrency = isBackground() ? 1 : 5;
+  for (let start = 2; start <= first.metadata.esiPages; start += concurrency) {
     const pages: Promise<T[]>[] = [];
-    for (let page = start; page < start + 5 && page <= first.metadata.esiPages; page++) {
-      const url = new URL(`${ESI_BASE}${esiPath}`);
-      url.searchParams.set("page", String(page));
-      pages.push(esiGet<T[]>(url.pathname.replace(/^\/latest/, "") + url.search, opts));
+    for (let page = start; page < start + concurrency && page <= first.metadata.esiPages; page++) {
+      pages.push(esiGet<T[]>(esiPagePath(esiPath,page), opts));
     }
     allData.push(...(await Promise.all(pages)).flat());
   }
@@ -180,6 +192,13 @@ export async function esiCalculateRoute(
     body: JSON.stringify(body),
   }, esiPath);
   return handleResponse<{ route: number[] }>(response, esiPath);
+}
+
+export function esiPagePath(esiPath: string, page: number): string {
+  if (page === 1) return esiPath;
+  const url = new URL(`${ESI_BASE}${esiPath}`);
+  url.searchParams.set("page",String(page));
+  return url.pathname.replace(/^\/latest/, "") + url.search;
 }
 
 export async function esiPost<T>(

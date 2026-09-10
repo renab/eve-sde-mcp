@@ -5,8 +5,10 @@ import { sdeExists, closeDatabase } from "./database.js";
 import { closeAuthDb } from "./auth/tokens.js";
 import { downloadSde } from "./downloader.js";
 import { createMcpServer } from "./server.js";
+import { startKeepWarm,stopKeepWarm } from "./keep-warm.js";
 
 function shutdown(): void {
+  stopKeepWarm();
   closeDatabase();
   closeAuthDb();
 }
@@ -36,6 +38,7 @@ async function main(): Promise<void> {
   const server = createMcpServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  startKeepWarm();
 }
 
 main().catch((err) => {
