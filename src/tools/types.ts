@@ -2,6 +2,8 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getDatabase } from "../database.js";
 import { likeContains, jsonResult } from "../utils.js";
+import { EntityIndex, endpointDiscoveryShape } from "../entities.js";
+import { getStateDatabase } from "../persistence.js";
 
 export function registerTypeTools(server: McpServer): void {
   server.tool(
@@ -58,9 +60,10 @@ export function registerTypeTools(server: McpServer): void {
     "get_type",
     "Get full details for an Eve Online type by ID, including all dogma attributes (CPU, powergrid, damage, resistances, etc.), effects, traits, and meta info.",
     {
+      ...endpointDiscoveryShape,
       type_id: z.number().describe("The typeID to look up"),
     },
-    async ({ type_id }) => {
+    async ({ type_id, include_related, record_namespace, related_limit }) => {
       const db = getDatabase();
 
       const typeInfo = db
@@ -112,7 +115,8 @@ export function registerTypeTools(server: McpServer): void {
         .get(type_id);
 
       const result = { type: typeInfo, attributes, effects, traits, meta: metaInfo || null };
-      return jsonResult(result);
+      return jsonResult({ ...result, ...(include_related ? new EntityIndex(getStateDatabase()).related({ namespace: record_namespace,
+        entity_refs: [{ type: "type", id: String(type_id) }], limit: related_limit }) : {}) });
     }
   );
 

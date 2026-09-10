@@ -4,6 +4,8 @@ import { esiGet, esiGetAll, esiPost, getActiveCharacter } from "../auth/esi-clie
 import { enrichDailyData } from "./daily.js";
 import { resolveStructure,structureIdSchema } from "../structures.js";
 import { jsonResult } from "../utils.js";
+import { EntityIndex, endpointDiscoveryShape } from "../entities.js";
+import { getStateDatabase } from "../persistence.js";
 
 const id = z.number().int().positive();
 const paging = { limit: id.max(1000).default(100), offset: z.number().int().min(0).default(0) };
@@ -83,10 +85,13 @@ export function registerOperationTools(server: McpServer): void {
     }
   }
   server.tool("get_structure", "Resolve cached player-structure metadata with freshness and actual auth-character provenance. Names are mutable; ESI access requires esi-universe.read_structures.v1. Refresh failures may return explicitly stale last-known metadata. Pass large IDs as exact decimal strings.", {
+    ...endpointDiscoveryShape,
     character_id: id.optional(), structure_id: structureIdSchema,
-  }, async ({ character_id, structure_id }) => {
+  }, async ({ character_id, structure_id, include_related, record_namespace, related_limit }) => {
     const resolved=await resolveStructure(structure_id,character_id);
-    return jsonResult(resolved ?? {structure_id,resolution_warning:"Structure metadata unavailable for this character; raw ID retained. Access/auth/backoff may prevent resolution."});
+    return jsonResult({ ...(resolved ?? {structure_id,resolution_warning:"Structure metadata unavailable for this character; raw ID retained. Access/auth/backoff may prevent resolution."}),
+      ...(include_related ? new EntityIndex(getStateDatabase()).related({ namespace: record_namespace,
+        entity_refs: [{ type: "structure", id: String(structure_id) }], limit: related_limit }) : {}) });
   });
   for (const [name, route, description] of [
     ["get_system_jumps", "universe/system_jumps", "System jump counts from ESI's recent reporting window; historical activity, not live safety."],

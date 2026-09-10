@@ -38,6 +38,15 @@ export function openStateDatabase(filename: string): Database.Database {
     );
     CREATE INDEX IF NOT EXISTS records_lookup ON records(namespace,kind,key);
     CREATE INDEX IF NOT EXISTS records_observed ON records(observed_at);
+    CREATE TABLE IF NOT EXISTS record_entity_refs (
+      record_id TEXT NOT NULL REFERENCES records(id), entity_type TEXT NOT NULL,
+      entity_id TEXT NOT NULL, name TEXT, PRIMARY KEY(record_id,entity_type,entity_id)
+    );
+    CREATE INDEX IF NOT EXISTS entity_records_lookup ON record_entity_refs(entity_type,entity_id,record_id);
+    CREATE TABLE IF NOT EXISTS record_entity_metadata (
+      record_id TEXT PRIMARY KEY REFERENCES records(id),
+      related_galaxy TEXT NOT NULL CHECK(json_valid(related_galaxy))
+    );
     CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(id UNINDEXED, text, tokenize='porter unicode61');
     CREATE TABLE IF NOT EXISTS relationships (
       id TEXT PRIMARY KEY, namespace TEXT NOT NULL, from_key TEXT NOT NULL,

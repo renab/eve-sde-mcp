@@ -7,3 +7,4 @@ dist/
 *.gz
 .env
 galaxy-secret.key
+artifacts/entity-backfill-*

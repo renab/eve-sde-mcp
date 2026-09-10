@@ -18,6 +18,7 @@ import { registerOperationTools } from "./tools/operations.js";
 import { registerPersistenceTools } from "./tools/persistence.js";
 import { registerKeepWarmTools } from "./tools/keep-warm.js";
 import { registerNexumTools } from "./tools/nexum.js";
+import { registerEntityContextTools } from "./tools/entity-context.js";
 import { beginForeground } from "./work-priority.js";
 import { enrichStructureToolResult } from "./structures.js";
 
@@ -64,6 +65,7 @@ export function createMcpServer(): McpServer {
   registerOperationTools(server);
   enrichEsiResults=false;
   registerPersistenceTools(server);
+  registerEntityContextTools(server);
   registerKeepWarmTools(server);
   registerNexumTools(server);
 

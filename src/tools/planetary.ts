@@ -3,6 +3,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getDatabase } from "../database.js";
 import { esiGet, esiGetWithMetadata, getActiveCharacter } from "../auth/esi-client.js";
 import { enrichSystemName, enrichTypeName, jsonResult, likeContains } from "../utils.js";
+import { EntityIndex, endpointDiscoveryShape } from "../entities.js";
+import { getStateDatabase } from "../persistence.js";
 
 const PLANETARY_SCOPE = "esi-planets.manage_planets.v1";
 
@@ -116,10 +118,11 @@ export function registerPlanetaryTools(server: McpServer): void {
     "get_planetary_colonies",
     "List the authenticated character's planetary-industry colonies with planet and system names. Requires esi-planets.manage_planets.v1. ESI colony data may remain stale until the colony is viewed in the EVE client.",
     {
+      ...endpointDiscoveryShape,
       character_id: z.number().optional().describe("Character ID (uses active character if omitted)"),
       force_refresh: z.boolean().default(false).describe("Request refresh when upstream freshness permits; never bypass ESI expiry or backoff"),
     },
-    async ({ character_id, force_refresh }) => {
+    async ({ character_id, force_refresh, include_related, record_namespace, related_limit }) => {
       const char = await getActiveCharacter(character_id);
       requirePlanetaryScope(char.scopes);
       const snapshot = await esiGetWithMetadata<EsiColony[]>(`/characters/${char.characterId}/planets/`, {
@@ -134,6 +137,8 @@ export function registerPlanetaryTools(server: McpServer): void {
             public: true,
           }).catch(() => null);
           return {
+            ...(include_related ? new EntityIndex(getStateDatabase()).related({ namespace: record_namespace,
+              entity_refs: [{ type: "planet", id: String(colony.planet_id) }], limit: related_limit }) : {}),
             planetId: colony.planet_id,
             planetName: planet?.name ?? `Planet ${colony.planet_id}`,
             planetType: colony.planet_type,
@@ -163,11 +168,12 @@ export function registerPlanetaryTools(server: McpServer): void {
     "get_planetary_colony",
     "Get a planetary colony's complete layout: enriched pins, stored materials, extractor programs, factory schematics, links, and routes. Requires esi-planets.manage_planets.v1.",
     {
+      ...endpointDiscoveryShape,
       planet_id: z.number().int().positive().describe("Planet ID from get_planetary_colonies"),
       character_id: z.number().optional().describe("Character ID (uses active character if omitted)"),
       force_refresh: z.boolean().default(false).describe("Request refresh when upstream freshness permits; never bypass ESI expiry or backoff"),
     },
-    async ({ planet_id, character_id, force_refresh }) => {
+    async ({ planet_id, character_id, force_refresh, include_related, record_namespace, related_limit }) => {
       const char = await getActiveCharacter(character_id);
       requirePlanetaryScope(char.scopes);
       const [snapshot, planet, colonyList] = await Promise.all([
@@ -227,6 +233,8 @@ export function registerPlanetaryTools(server: McpServer): void {
       }));
 
       return jsonResult({
+        ...(include_related ? new EntityIndex(getStateDatabase()).related({ namespace: record_namespace,
+          entity_refs: [{ type: "planet", id: String(planet_id) }], limit: related_limit }) : {}),
         characterName: char.characterName,
         planetId: planet_id,
         ...snapshot.metadata,

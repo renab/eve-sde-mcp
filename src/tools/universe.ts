@@ -2,6 +2,8 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getDatabase } from "../database.js";
 import { likeContains, jsonResult } from "../utils.js";
+import { EntityIndex, endpointDiscoveryShape } from "../entities.js";
+import { getStateDatabase } from "../persistence.js";
 
 export function registerUniverseTools(server: McpServer): void {
   server.tool(
@@ -33,10 +35,11 @@ export function registerUniverseTools(server: McpServer): void {
     "get_system",
     "Get details for an Eve Online solar system — security status, constellation, region, and connected stargates.",
     {
+      ...endpointDiscoveryShape,
       system_id: z.number().optional().describe("solarSystemID"),
       name: z.string().optional().describe("System name (if system_id not provided)"),
     },
-    async ({ system_id, name }) => {
+    async ({ system_id, name, include_related, record_namespace, related_limit }) => {
       const db = getDatabase();
 
       let system: unknown;
@@ -87,7 +90,9 @@ export function registerUniverseTools(server: McpServer): void {
         )
         .all((system as any).solarSystemID);
 
-      return jsonResult({ system, connectedSystems: jumps, stations });
+      return jsonResult({ system, connectedSystems: jumps, stations,
+        ...(include_related ? new EntityIndex(getStateDatabase()).related({ namespace: record_namespace,
+          entity_refs: [{ type: "solar_system", id: String((system as any).solarSystemID) }], limit: related_limit }) : {}) });
     }
   );
 

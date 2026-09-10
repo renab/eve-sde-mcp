@@ -1,10 +1,12 @@
 import { randomUUID } from "crypto";
 import type Database from "better-sqlite3";
 import { z } from "zod";
+import { EntityIndex, extractEntityRefs, relationshipInputShape, discoveryShape, discoverSources, explicitSources, type EntityRef } from "./entities.js";
 
 const label = z.string().trim().min(1).max(200);
 const timestamp = z.iso.datetime({ offset: true }).transform(value => new Date(value).toISOString());
 export const recordShape = {
+  ...relationshipInputShape,
   namespace: label, kind: label, key: label.optional(), observed_at: timestamp.optional(),
   source_type: label.optional(), source_ref: z.string().max(4000).optional(), status: label.optional(),
   tags: z.array(label).max(100).default([]), payload: z.record(z.string(), z.unknown()),
@@ -18,6 +20,7 @@ export const filterSchema = z.object({
   value: z.union([scalar, z.array(scalar).max(100)]).optional(),
 });
 export const searchShape = {
+  ...discoveryShape,
   namespace: label, kind: label.optional(), key: label.optional(), tags: z.array(label).max(100).default([]),
   observed_from: timestamp.optional(), observed_to: timestamp.optional(), current_only: z.boolean().default(true),
   filters: z.array(filterSchema).max(20).default([]), text: z.string().max(2000).optional(),
@@ -27,6 +30,7 @@ export type LedgerRecord = {
   id: string; namespace: string; kind: string; key: string | null; observed_at: string | null;
   created_at: string; source_type: string | null; source_ref: string | null; supersedes_id: string | null;
   status: string | null; tags: string[]; payload: Record<string, unknown>;
+  entity_refs?: EntityRef[];
 };
 function json(value: unknown): string {
   const walk = (v: unknown, depth: number): void => {
@@ -47,15 +51,40 @@ const current = "NOT EXISTS (SELECT 1 FROM records newer WHERE newer.supersedes_
 
 export class Ledger {
   constructor(public db: Database.Database) {}
+  decorate(record: LedgerRecord | null): LedgerRecord | null {
+    return record ? { ...record, ...new EntityIndex(this.db).metadata(record.id) } : null;
+  }
+  discover(record: LedgerRecord, input: unknown) {
+    const options = z.object(discoveryShape).parse(input);
+    if (!options.include_related || options.relation_depth === 0) return record;
+    const index = new EntityIndex(this.db), metadata = index.metadata(record.id);
+    const related = metadata.entity_refs.length ? index.related({ namespace: record.namespace, entity_refs: metadata.entity_refs,
+      limit: options.related_limit, exclude_id: record.id }) : { related_records: [], nextOffset: null };
+    const typed = [];
+    // Typed targets are independently bounded; never recurse through returned records.
+    for (const relation of metadata.related_galaxy.slice(0, options.related_limit)) {
+      if (!("namespace" in relation)) continue;
+      // Discovery is namespace scoped; cross-namespace pointers remain visible but unresolved.
+      if (relation.namespace !== record.namespace) continue;
+      typed.push({ ...relation, ...index.related({ namespace: record.namespace, kind: relation.kind,
+        entity_refs: relation.entity_refs, match: "all", exclude_id: record.id, limit: 1 }) });
+    }
+    const sources = [...explicitSources(metadata.related_galaxy), ...discoverSources(metadata.entity_refs, options.related_limit)];
+    const uniqueSources = [...new Map(sources.map(source => [JSON.stringify([source.subsystem, source.arguments]), source])).values()].slice(0, options.related_limit);
+    return { ...record, ...related, related_targets: typed,
+      ...(options.include_live_sources ? { available_sources: uniqueSources } : {}) };
+  }
   get(input: unknown): LedgerRecord | null {
     const s = z.object(selectorShape).parse(input);
-    if (s.id) return decode(this.db.prepare("SELECT * FROM records WHERE namespace = ? AND id = ?").get(s.namespace, s.id));
+    if (s.id) return this.decorate(decode(this.db.prepare("SELECT * FROM records WHERE namespace = ? AND id = ?").get(s.namespace, s.id)));
     if (!s.kind || !s.key) throw new Error("Provide id, or kind and key");
-    return decode(this.db.prepare(`SELECT r.* FROM records r WHERE namespace = ? AND kind = ? AND key = ? AND ${current}`).get(s.namespace, s.kind, s.key));
+    return this.decorate(decode(this.db.prepare(`SELECT r.* FROM records r WHERE namespace = ? AND kind = ? AND key = ? AND ${current}`).get(s.namespace, s.kind, s.key)));
   }
   store(input: unknown, supersedesId?: string): LedgerRecord {
     const r = recordInput.parse(input);
     const payload = json(r.payload);
+    const refs = extractEntityRefs(r.payload, r.entity_refs);
+    json(r.related_galaxy);
     return this.db.transaction(() => {
       if (supersedesId) {
         const previous = this.get({ namespace: r.namespace, id: supersedesId });
@@ -70,7 +99,8 @@ export class Ledger {
       this.db.prepare(`INSERT INTO records VALUES (@id,@namespace,@kind,@key,@observed_at,@created_at,@source_type,@source_ref,@supersedes_id,@status,@tags,@payload)`)
         .run({ ...value, tags: JSON.stringify(value.tags), payload });
       this.db.prepare("INSERT INTO records_fts (id,text) VALUES (?,?)").run(value.id, JSON.stringify(value));
-      return value;
+      new EntityIndex(this.db).write(value.id, refs, r.related_galaxy);
+      return this.decorate(value)!;
     }).immediate();
   }
   history(input: unknown) {
@@ -84,7 +114,7 @@ export class Ledger {
       SELECT id FROM ancestors WHERE supersedes_id IS NULL
       UNION ALL SELECT r.id FROM records r JOIN descendants d ON r.supersedes_id=d.id
     ) SELECT r.* FROM records r JOIN descendants d ON r.id=d.id ORDER BY r.rowid`).all(selected.id);
-    return rows.map(decode);
+    return rows.map(row => this.decorate(decode(row)));
   }
   search(input: unknown) {
     const s = z.object(searchShape).parse(input);
@@ -131,7 +161,7 @@ export class Ledger {
     const total = (this.db.prepare(`SELECT count(*) AS n FROM records r WHERE ${where}`).get(...args) as { n: number }).n;
     const records = this.db.prepare(`SELECT r.* FROM records r WHERE ${where} ORDER BY r.observed_at DESC,r.rowid DESC LIMIT ? OFFSET ?`).all(...args, s.limit, s.offset).map(decode);
     if (s.kind) this.db.prepare(`INSERT INTO query_usage VALUES (?,?,1,?) ON CONFLICT(namespace,kind) DO UPDATE SET count=count+1,elapsed_ms=elapsed_ms+excluded.elapsed_ms`).run(s.namespace,s.kind,performance.now()-start);
-    return { records: records as LedgerRecord[], total, nextOffset: s.offset + records.length < total ? s.offset + records.length : null };
+    return { records: (records as LedgerRecord[]).map(record => this.discover(this.decorate(record)!, s)), total, nextOffset: s.offset + records.length < total ? s.offset + records.length : null };
   }
   link(input: unknown) {
     const r = z.object({ namespace: label, from_key: label, relation: label, to_key: label, observed_at: timestamp.optional(), payload: z.record(z.string(),z.unknown()).default({}) }).parse(input);

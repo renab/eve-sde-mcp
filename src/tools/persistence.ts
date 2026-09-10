@@ -4,11 +4,15 @@ import { getStateDatabase } from "../persistence.js";
 import { Ledger, recordShape, selectorShape, searchShape } from "../ledger.js";
 import { renderRecap } from "../recaps.js";
 import { jsonResult } from "../utils.js";
+import { discoveryShape } from "../entities.js";
 
 export function registerPersistenceTools(server: McpServer): void {
   const ledger = () => new Ledger(getStateDatabase());
   server.tool("store_record", "Append a structured fact with provenance. Kinds/payload fields are open-ended JSON. Existing keys require explicit supersession; never silently overwrite facts.", recordShape, async args=>jsonResult(ledger().store(args)));
-  server.tool("get_record", "Get an exact record by namespace/id, or the current authoritative record by namespace/kind/key. An explicit historical id returns that historical record.", selectorShape, async args=>jsonResult({record:ledger().get(args)}));
+  server.tool("get_record", "Get an exact record by namespace/id, or current namespace/kind/key. Historical ids stay historical. include_related discovers current entity matches and unresolved Galaxy sources.", { ...selectorShape, ...discoveryShape }, async args=>{
+    const store = ledger(), record = store.get(args);
+    return jsonResult({record: record ? store.discover(record, args) : null});
+  });
   server.tool("search_records", "Search namespace-scoped records with all-tag matching, inclusive observed_from/exclusive observed_to, safe $.payload paths, and lexical FTS OR-term retrieval. Current-only by default; explicit pagination. No raw SQL. Missing values are not fabricated.", searchShape, async args=>jsonResult(ledger().search(args)));
   server.tool("get_record_history", "Return the complete append-first supersession chain for a record id or namespace/kind/key.", selectorShape, async args=>jsonResult({records:ledger().history(args)}));
   server.tool("supersede_record", "Append a full replacement payload correcting a current record. Preserve namespace/kind/key; no deletion or branching. Supply the full corrected record and its new provenance.", {...recordShape,supersedes_id:z.string().min(1)}, async args=>jsonResult(ledger().store(args,args.supersedes_id)));
