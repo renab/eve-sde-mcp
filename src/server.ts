@@ -17,6 +17,7 @@ import { registerDailyTools } from "./tools/daily.js";
 import { registerOperationTools } from "./tools/operations.js";
 import { registerPersistenceTools } from "./tools/persistence.js";
 import { registerKeepWarmTools } from "./tools/keep-warm.js";
+import { registerNexumTools } from "./tools/nexum.js";
 import { beginForeground } from "./work-priority.js";
 import { enrichStructureToolResult } from "./structures.js";
 
@@ -64,6 +65,7 @@ export function createMcpServer(): McpServer {
   enrichEsiResults=false;
   registerPersistenceTools(server);
   registerKeepWarmTools(server);
+  registerNexumTools(server);
 
   return server;
 }

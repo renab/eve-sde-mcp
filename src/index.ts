@@ -6,19 +6,21 @@ import { closeAuthDb } from "./auth/tokens.js";
 import { downloadSde } from "./downloader.js";
 import { createMcpServer } from "./server.js";
 import { startKeepWarm,stopKeepWarm } from "./keep-warm.js";
+import { startNexum,stopNexum } from "./nexum.js";
 
-function shutdown(): void {
+async function shutdown(): Promise<void> {
   stopKeepWarm();
+  await stopNexum();
   closeDatabase();
   closeAuthDb();
 }
 
-process.on("SIGINT", () => {
-  shutdown();
+process.on("SIGINT", async () => {
+  await shutdown();
   process.exit(0);
 });
-process.on("SIGTERM", () => {
-  shutdown();
+process.on("SIGTERM", async () => {
+  await shutdown();
   process.exit(0);
 });
 
@@ -39,10 +41,11 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   startKeepWarm();
+  startNexum();
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   process.stderr.write(`Fatal error: ${err}\n`);
-  shutdown();
+  await shutdown();
   process.exit(1);
 });

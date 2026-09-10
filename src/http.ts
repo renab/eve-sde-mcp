@@ -12,6 +12,8 @@ import { downloadSde } from "./downloader.js";
 import { createMcpServer, SERVER_INFO } from "./server.js";
 import { beginForeground } from "./work-priority.js";
 import { startKeepWarm,stopKeepWarm } from "./keep-warm.js";
+import { startNexum,stopNexum } from "./nexum.js";
+import { redactSecrets } from "./secrets.js";
 
 const host = process.env.HOST || "127.0.0.1";
 const port = parsePort(process.env.PORT);
@@ -37,7 +39,7 @@ app.use((req, res, next) => {
   const startedAt = Date.now();
 
   console.log(
-    JSON.stringify({
+    JSON.stringify(redactSecrets({
       event: "http_request",
       requestId,
       timestamp: new Date().toISOString(),
@@ -47,7 +49,7 @@ app.use((req, res, next) => {
       cfRay: req.get("cf-ray") ?? null,
       userAgent: req.get("user-agent") ?? null,
       rpc: req.path === "/mcp" ? req.body : undefined,
-    })
+    }))
   );
 
   res.on("finish", () => {
@@ -80,7 +82,7 @@ app.post("/mcp", async (req, res) => {
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   } catch (error) {
-    console.error("MCP request failed", error);
+    console.error("MCP request failed");
     if (!res.headersSent) {
       res.status(500).json({
         jsonrpc: "2.0",
@@ -100,7 +102,7 @@ app.all("/mcp", (_req, res) => {
 
 app.use((error: unknown, req: Request, res: Response, next: NextFunction) => {
   if (res.headersSent) return next(error);
-  console.error("Unhandled HTTP error", error);
+  console.error("Unhandled HTTP error");
   res.status(500).json({
     jsonrpc: "2.0",
     error: { code: -32603, message: "Internal MCP server error" },
@@ -118,6 +120,7 @@ export async function startHttpServer() {
   await prepareData();
   return app.listen(port, host, () => {
     startKeepWarm();
+    startNexum();
     console.log(`EVE SDE MCP listening on http://${host}:${port}`);
   });
 }
@@ -127,8 +130,9 @@ const isMainModule =
   (process.argv[1] && path.resolve(fileURLToPath(import.meta.url)) === path.resolve(process.argv[1]));
 if (isMainModule) {
   const httpServer = await startHttpServer();
-  const shutdown = (signal: string) => {
+  const shutdown = async (signal: string) => {
     stopKeepWarm();
+    await stopNexum();
     console.log(`Received ${signal}; shutting down.`);
     httpServer.close(() => {
       closeDatabase();

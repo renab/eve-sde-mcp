@@ -296,6 +296,18 @@ To use the live character data tools, you need an EVE SSO application:
 
 Tokens are encrypted at rest (AES-256-GCM) and stored in `~/.eve-sde/auth.db`. Scopes include skill reading, wallet, market, industry, planetary industry, character and corporation assets, contracts, fittings (read+write), and autopilot waypoint updates. Corporation assets require the authenticated character to have the Director role. ESI exposes planetary industry and skill queues as read-only, so neither can be modified through this MCP. Multi-character support is built in.
 
+## Nexum live wormhole maps
+
+Galaxy supports remote enrollment of Nexum **Read + live events** keys through
+`nexum_add_credential`, including non-expiring keys. Characters with access to the
+same map share one canonical cache and one managed SSE stream. Ordinary MCP
+reads use the cache; complete events apply directly and identifier-only intel
+events trigger coalesced per-system reads. Presence has a rolling 48-hour local
+history and never automatically enters the Wormlife ledger.
+
+See [Nexum architecture, tools, security and the complete audited event matrix](docs/nexum.md)
+for enrollment, capabilities, recovery and upstream API limitations.
+
 ## Development
 
 ```bash

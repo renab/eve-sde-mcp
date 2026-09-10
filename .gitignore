@@ -6,3 +6,4 @@ dist/
 *.db.gz
 *.gz
 .env
+galaxy-secret.key
