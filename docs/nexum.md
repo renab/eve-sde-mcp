@@ -58,6 +58,23 @@ Galaxy stores current presence and transitions (including departures inferred fr
 
 All presence output has `provenance: nexum_presence`. A downstream inference must separately label `nexum_presence_inference` with its confidence. It must never become `explicit_user_report` without an actual report. McGreggor, Minner and Renab can share one canonical operating map regardless of which credential supplies its stream.
 
+### Occupancy badge versus streamed viewer presence
+
+The frontend has distinct indicators in `web/src/components/map/SystemNode.tsx`:
+
+* The current-character dot represents the acting character.
+* The numbered **alt badge** and its tooltip use `accountHere`, populated by `useAccountLocations`. It excludes the acting character and can include offline characters' last-known positions.
+* The numbered **fleet badge** uses `fleetHere`, populated by `useFleet`, excluding the logged-in character. `useFleet` polls browser-session-only `GET /api/character/fleet` every 20 seconds. Its response is `{inFleet,members:[{character_id,solar_system_id,character_name,solar_system_name}]}`. This route is also absent from the versioned key API and has no SSE equivalent. The screenshot was described rather than attached to this investigation, so its badge styling cannot be used to disambiguate alt versus fleet; neither comes from `presence.*`.
+* The viewer-presence dot/tooltip uses `presenceHere`, populated by the SSE presence store. It excludes the UI's own viewer when rendering; Galaxy performs no such exclusion.
+
+`web/src/hooks/useAccountLocations.ts` polls `GET /api/character/account-locations` every ten seconds. Its response is `{characters:[{charId,characterId,characterName,online,eveSystemId,systemName,systemClass}]}`. `charId` is Nexum's internal user ID; `characterId` is the EVE ID. `server/src/routes/character.ts` protects this route with `requireAuth` (a browser session), not API-key authentication. There is no equivalent in `apiV1.ts` and no account-location SSE event. More API-key streams cannot recover this missing source.
+
+`useMapPresence` sends `presentSystemIds` for online account characters, but `maps.ts` uses them only to update system activity timestamps. It does not broadcast the alt character identities or their individual locations. Do not infer pilot identity from `system.update.lastActivityAt`.
+
+On 2026-09-10, a bounded direct SSE diagnostic of Cervantes using Minner's key returned a `presence.snapshot` with exactly one viewer (McGreggor, EVE ID `641570826`, system `31000398`), followed by a `presence.update` for the same viewer. Galaxy's live cache matched it. This verified an upstream **API exposure** gap rather than dropped snapshot entries or filtering to the credential's bound character. No alt locations were added to production from screenshot interpretation.
+
+Presence, system-state and presence-enabled chain results expose `presence_coverage: {scope: "map_viewers", includes_account_character_locations: false, includes_fleet_locations: false, limitation: ...}`. Missing roster entries are not proof of absence from the system; `presence.leave` means leaving the roster, not a confirmed system departure. A regression test verifies all three entries of a supplied multi-viewer snapshot survive, individual updates/departures affect only that viewer, history retains the transitions, and no REST calls occur. Complete account-location coverage requires a supported Nexum API extension or a separately authorized, distinctly labeled source such as ESI; it cannot be obtained by changing the current SSE normalization.
+
 ## Authoritative public-source audit
 
 Audited upstream commit: [`7155444eb20348e05f0ff571364f3fecd67409ce`](https://github.com/GQuantrill/eve-nexum/tree/7155444eb20348e05f0ff571364f3fecd67409ce).

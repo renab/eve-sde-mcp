@@ -23,7 +23,7 @@ export function registerNexumTools(server:McpServer, getService:()=>NexumService
   tool("nexum_get_map_state","Read local Nexum map metadata, systems, connections and freshness. Zero upstream calls.",{map_id:id},(s,a)=>s.mapState(a.map_id));
   tool("nexum_get_system_state","Read cached system, signatures, anomalies, structures, connections and viewer presence.",
     {map_id:id,system_id_or_name:id},(s,a)=>s.systemState(a.map_id,a.system_id_or_name));
-  tool("nexum_get_presence","Read current or retained 48h viewer presence telemetry. Historical results include a pre-since baseline when retained. Never treat inferred location as an explicit user report.",
+  tool("nexum_get_presence","Read current or retained 48h map-viewer presence telemetry, preserving every received viewer. Does not include Nexum's account-alt or fleet occupancy badges: those use browser-session-only APIs unavailable to these keys. Missing presence is not evidence of absence from a system. Historical results include a retained pre-since baseline. Never treat inferred location as an explicit user report.",
     {map_id:id,character:id.optional(),system:id.optional(),current_only:z.boolean().optional(),since:z.iso.datetime().optional()},
     (s,a)=>s.presence(a.map_id,{...a,since:a.since?Date.parse(a.since):undefined}));
   tool("get_wormhole_chain_state","Compact canonical Nexum chain from local cache. Accepts map ID or unique map name. Unknown fields are omitted; includes freshness.",

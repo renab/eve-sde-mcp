@@ -10,6 +10,12 @@ const prefix=(m:Json)=>`/api/v1/maps/${encodeURIComponent(m.nexum_map_id)}`;
 const object=(v:any):v is Json=>!!v && typeof v==="object" && !Array.isArray(v);
 const idValid=(v:any)=>typeof v==="string" || (typeof v==="number" && Number.isSafeInteger(v));
 const safeError=(e:unknown)=>e instanceof NexumError ? e.message : "Nexum synchronization failed";
+const presenceCoverage=()=>({
+  scope:"map_viewers",
+  includes_account_character_locations:false,
+  includes_fleet_locations:false,
+  limitation:"Nexum's numbered alt and fleet badges use browser-session-only /api/character/account-locations and /api/character/fleet endpoints. Those locations are not included in API-key presence events. A missing viewer does not mean a character is absent from the system.",
+});
 type Worker={controller:AbortController; task:Promise<void>; credential?:string; stream?:NexumStream};
 export interface NexumOptions { debounceMs?:number; staleMs?:number; retentionMs?:number; retryMs?:number; accessRefreshMs?:number; random?:()=>number; }
 
@@ -327,14 +333,14 @@ export class NexumService {
     const m=this.store.map(map),state=this.store.state(m.id),s=state.systems.filter((s:Json)=>String(s.id)===system||s.name===system||String(s.eveSystemId)===system);
     if(s.length!==1)throw new Error("System not found or ambiguous");
     return {system:s[0],...this.store.resources(m.id,String(s[0].id)),connections:state.connections.filter((c:Json)=>c.sourceId===s[0].id||c.targetId===s[0].id),
-      presence:this.store.currentPresence(m.id).filter(p=>p.eveSystemId!=null&&String(p.eveSystemId)===String(s[0].eveSystemId)),freshness:this.freshness(m.id)};
+      presence:this.store.currentPresence(m.id).filter(p=>p.eveSystemId!=null&&String(p.eveSystemId)===String(s[0].eveSystemId)),presence_coverage:presenceCoverage(),freshness:this.freshness(m.id)};
   }
   presence(map:string,options:{character?:string;system?:string;current_only?:boolean;since?:number}={}):Json{
     const m=this.store.map(map);this.store.prune(this.options.retentionMs);
     const rows=options.current_only===false?this.store.history(m.id,options.since):this.store.currentPresence(m.id);
     return {presence:rows.filter(p=>(!options.character||String(p.characterId)===options.character||p.characterName===options.character)&&
       (!options.system||String(p.eveSystemId)===options.system)&& (options.current_only===false||options.since===undefined||p.observed_at>=options.since)),
-      provenance:"nexum_presence",interpretation:"Map viewers, not all online pilots; location is telemetry, not an explicit user report.",freshness:this.freshness(m.id)};
+      provenance:"nexum_presence",presence_coverage:presenceCoverage(),interpretation:"Map viewers, not all online pilots or all account characters; location is telemetry, not an explicit user report. Leaving the viewer roster is not proof of leaving the system.",freshness:this.freshness(m.id)};
   }
   chain(map:string,options:{root?:string;depth?:number;include_presence?:boolean;include_sites?:boolean}={}):Json{
     const m=this.store.map(map),state=this.store.state(m.id);let selected=new Set(state.systems.map((s:Json)=>s.id));
@@ -350,7 +356,7 @@ export class NexumService {
         id:c.id,source:systems.find((s:Json)=>s.id===c.sourceId)?.name??c.sourceId,destination:systems.find((s:Json)=>s.id===c.targetId)?.name??c.targetId,
         wormhole_type:c.type,connection_type:c.connectionType,source_signature_id:c.sourceSignatureId,target_signature_id:c.targetSignatureId,
         lifetime_state:c.timeStatus,mass_state:c.massStatus,mass_used:c.massUsed,created_at:c.createdAt,eol_at:c.eolAt,lifetime_expires_at:c.lifetimeExpiresAt,broken:c.broken,notes:c.flagNote})),
-      ...(options.include_presence?{presence:this.store.currentPresence(m.id).filter(p=>p.eveSystemId!=null&&systems.some((s:Json)=>String(s.eveSystemId)===String(p.eveSystemId)))}:{}),freshness:this.freshness(m.id)};
+      ...(options.include_presence?{presence:this.store.currentPresence(m.id).filter(p=>p.eveSystemId!=null&&systems.some((s:Json)=>String(s.eveSystemId)===String(p.eveSystemId))),presence_coverage:presenceCoverage()}:{}),freshness:this.freshness(m.id)};
   }
   diagnostics():Json{return {credential_count:this.store.credentials().length,credentials:this.listCredentials(),maps:this.listMaps(),
     presence_history_rows:(this.store.db.prepare("SELECT count(*) n FROM nexum_presence_events").get() as any).n};}

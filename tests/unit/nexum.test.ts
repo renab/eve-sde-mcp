@@ -189,6 +189,29 @@ describe("audited event traffic",()=>{
 });
 
 describe("presence and freshness",()=>{
+  it("keeps every snapshot viewer and subsequent character update, regardless of the stream credential",async()=>{
+    const c=await enroll("Naffin Minner");await service.updateCredential(c.id,{character_id:"1320166902"});
+    up.calls=[];const feed=up.live()[0];
+    const viewers=[
+      {characterId:"641570826",characterName:"Naffin McGreggor",eveSystemId:31000398,shipTypeId:null,ts:Date.now()},
+      {characterId:"1320166902",characterName:"Naffin Minner",eveSystemId:31000398,shipTypeId:null,ts:Date.now()},
+      {characterId:"2124658640",characterName:"Renab Naf",eveSystemId:31000398,shipTypeId:null,ts:Date.now()},
+    ];
+    feed.push({type:"presence.snapshot",viewers});
+    await until(()=>service.presence(mapId).presence.length===3);
+    expect(service.presence(mapId,{system:"31000398"}).presence.map((p:Json)=>p.characterId).sort()).toEqual(viewers.map(p=>p.characterId).sort());
+    expect(service.presence(mapId).presence_coverage).toMatchObject({scope:"map_viewers",includes_account_character_locations:false});
+    expect(service.systemState(mapId,"s1").presence_coverage).toEqual(service.presence(mapId).presence_coverage);
+    expect(service.chain(mapId,{include_presence:true}).presence_coverage).toEqual(service.presence(mapId).presence_coverage);
+    feed.push({type:"presence.update",actor:"another-browser",...viewers[2],eveSystemId:31000002});
+    await until(()=>service.presence(mapId,{character:"2124658640"}).presence[0]?.eveSystemId===31000002);
+    expect(service.presence(mapId).presence).toHaveLength(3);
+    expect(service.presence(mapId,{current_only:false,character:"2124658640"}).presence.map((p:Json)=>p.eveSystemId)).toEqual([31000398,31000002]);
+    feed.push({type:"presence.leave",characterId:"641570826"});
+    await until(()=>service.presence(mapId).presence.length===2);
+    expect(service.presence(mapId).presence.map((p:Json)=>p.characterId).sort()).toEqual(["1320166902","2124658640"]);
+    expect(up.calls).toEqual([]);
+  });
   it("records transitions, suppresses heartbeat snapshots, retains baseline and prunes beyond 48h",async()=>{
     await enroll();let time=Date.now();const clockStore=new NexumStore(store.db,()=>time);
     const viewer={characterId:"9007199254740993",characterName:"McGreggor",eveSystemId:31000001,shipTypeId:1,ts:time};
