@@ -171,8 +171,35 @@ Present the audit and obtain approval before historical indexing. An approved
 migration should revalidate fingerprints and identities, append only side-table
 metadata, preserve all payload/provenance/history fields, record skipped rows,
 and report before/after counts. New records arriving after the audit require a
-fresh audit or must be excluded from its approved scope. There is deliberately no
-automatic production backfill command.
+fresh audit or must be excluded from its approved scope. Backfill is never run
+automatically by schema initialization, ingestion, or an ESI read.
+
+After explicit approval of a saved manifest, the operator can verify it against
+ESI and apply exactly its eligible revisions:
+
+```powershell
+node scripts/verify-backfill-identities.mjs artifacts/entity-backfill-audit.json artifacts/entity-backfill-esi-verification.json
+node scripts/apply-entity-backfill.mjs --apply-approved C:\path\galaxy-state.db artifacts/entity-backfill-audit.json artifacts/entity-backfill-esi-verification.json artifacts/entity-backfill-run APPROVED_COUNT SKIP_COUNT
+```
+
+The verifier checks SDE system/planet/type/station identities against ESI, validates
+character/corporation identities and accessible structures, and checks recorded
+PI character/planet pairs against current colonies. It uses normal Galaxy
+authentication/cache/backoff rules, binds evidence to the exact manifest hash,
+and reports conflicts. This does not validate historical survey measurements or
+infer past ownership from today's state. Structure verification uses McGreggor's
+existing authentication for this Wormlife migration.
+
+The application command requires successful evidence no older than 24 hours and
+the approved eligible/skip counts. It rechecks record fingerprints, namespace,
+kind and key inside an immediate transaction, saves original ledger/index rows
+before insertion, and appends only entity-reference/metadata side-table rows.
+Current/superseded status is calculated from the live chain. Skipped and newer
+records' indexes are compared before/after, and original record fields must stay
+identical or the transaction rolls back. Conflicting existing indexes abort;
+matching indexes are idempotently retained. Use a fresh output prefix on a retry
+so the earlier backup/report cannot be overwritten. No runtime restart is needed
+for these index additions.
 
 The motivating spec's sample system ID `31002238` is J115405 in the SDE.
 J154212 is `31000398`; its planet VIII is `40371521`. Do not propagate the sample
