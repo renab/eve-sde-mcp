@@ -41,9 +41,13 @@ explicit refs and ignored during automatic extraction. Use strings for large IDs
 Names are display metadata; ingestion never guesses identity from names.
 
 Recognized payload fields include snake/camel-case character, solar-system, planet,
-structure, corporation, location, type, station, region, constellation and alliance
-IDs. Typed snake-case suffixes such as `observer_character_id`,
-`blueprint_type_id`, and `fortizar_location_id` also work. Nested objects and arrays
+structure, corporation, location, type, station, region, constellation, alliance,
+item, contract, killmail, moon and faction IDs. Typed snake/camel-case suffixes such
+as `observer_character_id`, `blueprintTypeId`, and `fortizar_location_id` also work.
+`systemId` maps to solar system, `skillId` to type, and `facilityId` to location.
+Typed ID arrays, implants and infested solar systems are recognized. Explicit
+`context_id_type`, `location_type`, and standings `from_type` discriminators resolve
+otherwise ambiguous fields; an untyped party/owner ID is never guessed. Nested objects and arrays
 are inspected. Bare `id`, `owner_id`, signatures and arbitrary numbers are ignored.
 There is a 1000-ref ceiling per record; duplicate `(type,id)` pairs are collapsed.
 Explicit refs take precedence over extracted duplicates. Supersession is a full
@@ -63,10 +67,54 @@ provenance, and explicit supersession chains retain their existing semantics.
 - `get_record` / `search_records`: `include_related=true` adds entity matches,
   bounded typed targets, and `available_sources`. `include_live_sources=false`
   suppresses source discovery. `relation_depth` is 0 or 1.
-- `get_planetary_colonies`, `get_planetary_colony`, `get_system`, `get_type`, and
-  `get_structure` advertise current record pointers by default. Set
+- All ESI read tools advertise current record pointers by default, including
+  skills, wallets, market, industry, assets, contracts, fittings, killmails, LP,
+  navigation, PI, character state, corporation operations, and universe activity.
+  The SDE `get_system` and `get_type` integrations also remain available. Set
   `include_related=false` to omit them or `record_namespace` to select a namespace.
   Existing response fields are preserved.
+
+## Shared ESI response layer
+
+The server registration boundary adds the same discovery controls and response
+enrichment to every `get_*` tool in its ESI tool families, plus
+`check_skill_requirements`. This currently covers 57 read tools, including the
+SDE schematic and locally tracked LP reads in those families. Save/delete,
+autopilot writes, authentication, keep-warm management, and ledger mutations do
+not participate. New read tools in these families inherit coverage automatically.
+
+Request identity is captured using `AsyncLocalStorage`, from the selected
+character and successful ESI resource paths. This makes scalar wallet balances,
+empty collections, corporation operations, and responses containing only names
+discoverable without fetching identity again. Concurrent calls retain separate
+identity sets. Path strings, tokens and raw ESI payloads are not retained in this
+context. Final output is inspected **after filtering/pagination**; discarded
+upstream rows do not become response matches. Explicit request filters remain
+available as clearly labeled request context.
+
+Object responses gain a response-wide `related_records` list. Each pointer has
+`matched_entity_refs` (at most 10) and `match_scope` distinguishing
+`response_entity` from `request_context`. Returned-entity matches are prioritized
+before broader request context. `related_record_context` reports namespace,
+limits, `has_more`, and whether scanning was truncated. Follow a matched entity
+through `get_entity_context` for more records. Existing business-data pagination
+fields such as `nextOffset` are never overwritten.
+
+Existing PI per-colony pointers and PI/structure top-level pointer contracts stay
+intact. When a top-level pointer list already exists, extra response-wide matches
+are in `related_record_context.additional_related_records`. Array/scalar first
+content blocks retain their original shape and receive a second JSON text block
+containing the discovery summary. Human-readable failures and MCP errors remain
+unchanged. An unavailable index is explicitly labeled `status: unavailable` and
+does not discard a successful ESI response or claim there are no matches.
+
+The common summary defaults to 10 unique records (maximum 50), in addition to
+existing bounded per-colony lists. Scanning has a 20,000-visit / 1000-entity budget
+per response and excludes previously generated relationship metadata. Discovery
+uses at most two batched indexed queries plus metadata reads for selected
+pointers. It performs no ESI calls and never writes its annotations into ESI cache
+entries: newly stored records appear even on otherwise unchanged fresh cache
+hits. Existing structure-name enrichment retains its separate behavior.
 
 Default pointers contain IDs/keys, relation, source, original provenance/status,
 observation timestamps, and `is_current`. They omit payloads. Lists default to 10

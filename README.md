@@ -311,8 +311,8 @@ for enrollment, capabilities, recovery and upstream API limitations.
 ## Development
 
 Galaxy's durable records support normalized entity references, typed subsystem
-relationships, and bounded reverse discovery from PI, system, type, and structure
-tools. See [entity relationships and the approval-gated historical audit workflow](docs/entity-relationships.md).
+relationships, and bounded reverse discovery across all ESI read tools, plus
+system and type lookups. See [entity relationships and the approval-gated historical audit workflow](docs/entity-relationships.md).
 
 ```bash
 npm run dev          # Run with tsx (no build needed)

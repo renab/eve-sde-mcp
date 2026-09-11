@@ -29,9 +29,39 @@ export const endpointDiscoveryShape = {
 };
 
 const fields = new Map<string, string>();
-for (const type of ["character", "solar_system", "planet", "structure", "corporation", "location", "type", "station", "region", "constellation", "alliance"]) {
+for (const type of ["character", "solar_system", "planet", "structure", "corporation", "location", "type", "station", "region", "constellation", "alliance", "item", "contract", "killmail", "moon", "faction"]) {
   const camel = type.replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase());
   for (const field of [`${type}_id`, `${camel}Id`, `${camel}ID`]) fields.set(field, type);
+}
+// ESI and Galaxy's presentation layer use these unambiguous aliases.
+for (const field of ["system_id", "systemId", "systemID"]) fields.set(field, "solar_system");
+for (const field of ["skill_id", "skillId", "skillID"]) fields.set(field, "type");
+for (const field of ["facility_id", "facilityId", "facilityID"]) fields.set(field, "location");
+
+export function entityFieldType(key: string): string | undefined {
+  return fields.get(key) ?? [...fields].find(([field]) => field.endsWith("_id")
+    ? key.endsWith(`_${field}`)
+    : key.endsWith(field[0].toUpperCase() + field.slice(1)))?.[1];
+}
+export function entityArrayFieldType(key: string): string | undefined {
+  if (key === "implants") return "type";
+  if (key === "infested_solar_systems") return "solar_system";
+  return /(?:_ids|Ids|IDs)$/.test(key) ? entityFieldType(key.slice(0, -1)) : undefined;
+}
+
+/** Only explicit type discriminators can resolve otherwise ambiguous ESI IDs. */
+export function discriminatedEntityRefs(row: Record<string, unknown>): EntityRef[] {
+  const refs: EntityRef[] = [];
+  const append = (type: string | undefined, value: unknown) => {
+    const id = entityId.safeParse(value);
+    if (type && id.success) refs.push({ type, id: id.data });
+  };
+  if (typeof row.context_id_type === "string") append(entityFieldType(row.context_id_type), row.context_id);
+  const locationType = row.location_type ?? row.locationType;
+  if (locationType === "station" || locationType === "structure") append(locationType, row.location_id ?? row.locationId);
+  if (row.from_type === "npc_corp") append("corporation", row.from_id);
+  if (row.from_type === "faction") append("faction", row.from_id);
+  return refs;
 }
 
 /** Only explicitly typed ID fields are promoted. Bare id, owner_id and names are ambiguous. */
@@ -44,11 +74,17 @@ export function extractEntityRefs(payload: unknown, explicit: EntityRef[] = []):
   for (const ref of explicit) add(entityRef.parse(ref));
   const walk = (value: unknown, depth: number) => {
     if (depth > 32 || !value || typeof value !== "object") return;
+    if (!Array.isArray(value)) for (const ref of discriminatedEntityRefs(value as Record<string, unknown>)) add(ref);
     for (const [key, child] of Object.entries(value)) {
-      const type = fields.get(key) ?? [...fields].find(([field]) => field.endsWith("_id") && key.endsWith(`_${field}`))?.[1];
+      const type = entityFieldType(key);
       if (type) {
         const parsed = entityId.safeParse(child);
         if (parsed.success) add({ type, id: parsed.data });
+      }
+      const arrayType = entityArrayFieldType(key);
+      if (arrayType && Array.isArray(child)) for (const item of child) {
+        const parsed = entityId.safeParse(item);
+        if (parsed.success) add({ type: arrayType, id: parsed.data });
       }
       if (child && typeof child === "object") walk(child, depth + 1);
     }

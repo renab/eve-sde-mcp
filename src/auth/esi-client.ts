@@ -8,6 +8,7 @@ import type { StoredCharacter } from "./tokens.js";
 import { createHash } from "crypto";
 import { cachedEsiGet, disciplinedFetch, type CacheMetadata } from "../esi-cache.js";
 import { isBackground, WarmDeferred } from "../work-priority.js";
+import { observeEsiRead, observeReadCharacter } from "../esi-related.js";
 
 const ESI_BASE = "https://esi.evetech.net/latest";
 const tokenRefreshes = new Map<number, Promise<StoredCharacter>>();
@@ -140,10 +141,10 @@ export async function esiGetWithMetadata<T>(esiPath: string, opts?: EsiRequestOp
   const headers = await buildHeaders(opts); // Authenticate even when serving a cached response.
   const {key,url} = esiCacheIdentity(esiPath,opts);
   const read=()=>cachedEsiGet<T>(key, esiPath, conditional => fetchWithRetry(url, { headers: { ...headers, ...conditional } }, esiPath), opts);
-  try {return await read();}
+  try {const result = await read(); observeEsiRead(esiPath); return result;}
   catch(error) {
     // A foreground caller that joined queued (not dispatched) warm work takes over.
-    if(error instanceof WarmDeferred && !isBackground()) return read();
+    if(error instanceof WarmDeferred && !isBackground()) { const result = await read(); observeEsiRead(esiPath); return result; }
     throw error;
   }
 }
@@ -192,7 +193,9 @@ export async function esiCalculateRoute(
     },
     body: JSON.stringify(body),
   }, esiPath);
-  return handleResponse<{ route: number[] }>(response, esiPath);
+  const result = await handleResponse<{ route: number[] }>(response, esiPath);
+  observeEsiRead(esiPath);
+  return result;
 }
 
 export function esiPagePath(esiPath: string, page: number): string {
@@ -221,6 +224,7 @@ export async function esiPost<T>(
   }, esiPath);
 
   const result = await handleResponse<T>(response, esiPath);
+  observeEsiRead(esiPath);
   // Successful writes can change a previously cached representation.
   // Writes do not bypass an upstream cache's still-valid freshness window.
   return result;
@@ -248,5 +252,6 @@ export async function getActiveCharacter(
   characterId?: number
 ): Promise<StoredCharacter> {
   const { character } = await getValidToken(characterId);
+  observeReadCharacter(character.characterId);
   return character;
 }
