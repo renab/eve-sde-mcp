@@ -1,3 +1,4 @@
+import { CORPORATION_SCOPES } from "../corporation-endpoints.js";
 import crypto from "crypto";
 import http from "http";
 import { URL } from "url";
@@ -12,6 +13,7 @@ const CALLBACK_PATH = "/callback";
 const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 
 const DEFAULT_SCOPES = [
+  ...CORPORATION_SCOPES,
   "esi-skills.read_skills.v1",
   "esi-skills.read_skillqueue.v1",
   "esi-wallet.read_character_wallet.v1",
@@ -94,7 +96,7 @@ export function startLoginFlow(clientId: string, scopes?: string[]): { authUrl: 
   const { verifier, challenge } = generatePKCE();
   const state = crypto.randomBytes(16).toString("hex");
   const redirectUri = `http://localhost:${CALLBACK_PORT}${CALLBACK_PATH}`;
-  const selectedScopes = scopes ?? DEFAULT_SCOPES;
+  const selectedScopes = [...new Set(scopes ?? DEFAULT_SCOPES)];
 
   const params = new URLSearchParams({
     response_type: "code",

@@ -21,6 +21,12 @@ it("rejects missing scope before reading corporation information", async () => {
   await expect(handlers.get_corporation_structures({})).rejects.toThrow("esi_login");
   expect(esiGet).not.toHaveBeenCalled();
 });
+it("uses the wallet transaction cursor without page pagination", async () => {
+  vi.mocked(esiGet).mockResolvedValue([]);
+  await handlers.get_corporation_wallet_transactions({ corporation_id: 88, division: 2, from_id: 123, limit: 10, offset: 0 });
+  expect(esiGet).toHaveBeenCalledWith("/corporations/88/wallets/2/transactions/?from_id=123", { characterId: 42 });
+  expect(esiGetAll).not.toHaveBeenCalled();
+});
 it("does not require authentication for LP offers and filters before pagination", async () => {
   vi.mocked(esiGetAll).mockResolvedValue([{ type_id: 1 }, { type_id: 2 }, { type_id: 2 }]);
   const result = await handlers.get_loyalty_store_offers({ corporation_id: 88, type_id: 2, limit: 1, offset: 0 });

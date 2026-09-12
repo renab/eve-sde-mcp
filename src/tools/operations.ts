@@ -55,6 +55,7 @@ export function registerOperationTools(server: McpServer): void {
       character_id: id.optional(), corporation_id: id.optional(),
       ...(route.includes("{division}") ? { division: id.max(7) } : {}),
       ...(route === "industry/jobs" ? { include_completed: z.boolean().default(false) } : {}),
+      ...(route.endsWith("/transactions") ? { from_id: id.max(Number.MAX_SAFE_INTEGER).optional() } : {}),
       type_id: id.optional(), ...paging,
     }, async (args) => {
       const char = await authenticated(args.character_id, scope);
@@ -62,7 +63,11 @@ export function registerOperationTools(server: McpServer): void {
       let suffix = route.replace("{division}", String(args.division));
       if (route === "industry/jobs") suffix += `/?include_completed=${args.include_completed ?? false}`;
       else suffix += "/";
-      const rows = await esiGetAll<Record<string, unknown>>(`/corporations/${corp}/${suffix}`, { characterId: char.characterId });
+      if (args.from_id !== undefined) suffix += `?from_id=${args.from_id}`;
+      const path = `/corporations/${corp}/${suffix}`;
+      const rows = route.endsWith("/transactions")
+        ? await esiGet<Record<string, unknown>[]>(path, { characterId: char.characterId })
+        : await esiGetAll<Record<string, unknown>>(path, { characterId: char.characterId });
       return page(args.type_id === undefined ? rows : rows.filter(row => row.type_id === args.type_id || row.blueprint_type_id === args.type_id || row.product_type_id === args.type_id), args.limit, args.offset);
     });
   }

@@ -1,3 +1,4 @@
+import { registerCorporationTools } from "./tools/corporations.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerTypeTools } from "./tools/types.js";
 import { registerGroupTools } from "./tools/groups.js";
@@ -75,6 +76,7 @@ export function createMcpServer(): McpServer {
   registerPlanetaryTools(server);
   registerDailyTools(server);
   registerOperationTools(server);
+  registerCorporationTools(server);
   enrichEsiResults=false;
   relatedEsiReads=false;
   registerPersistenceTools(server);
