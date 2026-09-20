@@ -59,7 +59,9 @@ export function planChain(state:Json, resources:(systemId:string)=>Json):ChainPl
   for(const connection of (state.connections??[]) as Json[]) {
     if(!standard(connection))continue;
     for(const [from,to,signatureId] of [[String(connection.sourceId),String(connection.targetId),connection.sourceSignatureId],[String(connection.targetId),String(connection.sourceId),connection.targetSignatureId]] as const) {
-      const destination=identifiers.get(to);
+      // Home deliberately has no visible system label, but a signature that
+      // leads back to it needs the literal operational bookmark destination.
+      const destination=identifiers.get(to) ?? (to===root ? "H" : undefined);
       if(!destination||!signatureId)continue;
       const signatures=resources(from).signatures?.items??[];
       if(signatures.some((s:Json)=>String(s.id)===String(signatureId)))notes.push({systemId:from,signatureId:String(signatureId),notes:destination,connectionId:String(connection.id)});
