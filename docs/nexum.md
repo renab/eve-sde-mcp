@@ -1,6 +1,14 @@
 # Nexum integration and source audit
 
-Galaxy treats Nexum as the authoritative source for live wormhole map state. It maintains a local replicated cache, separate from the Wormlife knowledge ledger. No Nexum event writes a ledger record, edits Obsidian, changes topology, or performs a content write.
+Galaxy treats Nexum as the authoritative source for live wormhole map state. It maintains a local replicated cache, separate from the Wormlife knowledge ledger. No Nexum event writes a ledger record, edits Obsidian, or changes topology.
+
+## Chain identifier reconciliation
+
+Galaxy derives a rooted operational identifier plan from the one `isHome` system and live, non-broken standard wormhole connections. Existing valid custom labels (`t:B.1`) are preserved as durable assignments; unlabelled direct branches allocate `A`, `B`, … and descendants allocate `.1`, `.2`, …. Known-space terminals use `.HS`, `.LS`, or `.NS`. The planner is deterministic, never renumbers surviving valid identifiers, and defers when there is no unique Home or insufficient connected topology.
+
+For each backed directional signature Galaxy plans the literal destination identifier as its `notes` value. With a **Read + write content** Nexum key it PATCHes only changed notes through `PATCH /api/v1/maps/:mapId/systems/:systemId/signatures/:sigId` with `{ "notes": "B.1" }`; successful writes are updated optimistically in the local signature cache, so echoed `sig.changed` events do not loop.
+
+Nexum's public API intentionally does **not** permit API keys to PATCH map systems or `customLabels`; system/topology writes require a browser session. Galaxy therefore reports each desired `t:<identifier>` custom label in `nexum_chain_identifier_diagnostics`, but does not fabricate a system-label mutation or break normal read/live synchronization. A 401/403 on the first needed signature-note write marks that credential's chain write-back unavailable while reads and events continue normally. Generate/re-enroll a **Read + write content** key to enable note write-back.
 
 ## Remote enrollment
 

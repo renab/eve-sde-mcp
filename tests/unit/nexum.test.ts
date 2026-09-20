@@ -28,6 +28,9 @@ class Upstream {
     if(url===endpoint)return full();
     return [{id:"item-1",name:url.split("/").at(-1),eveId:"9007199254740993"}];
   });
+  patch=vi.fn(async(_base:string,key:string,_url:string,_body:Record<string,unknown>)=>{
+    if(this.bad.has(key))throw new NexumError(403);return {ok:true};
+  });
   stream=vi.fn(async(_base:string,key:string,_url:string,signal?:AbortSignal)=>{
     if(this.bad.has(key))throw new NexumError(401);
     const f=new Feed();this.feeds.push(f);signal?.addEventListener("abort",()=>f.close(),{once:true});return f;
@@ -185,6 +188,30 @@ describe("audited event traffic",()=>{
     for(const e of [null,{}, {type:"system.add"},{type:"presence.snapshot",viewers:[null]},{type:"sig.changed"},{type:"route.reorder"}])
       await service.handleEvent(mapId,e as any,store.credential(c.id));
     expect(up.calls).toEqual([]);expect(store.state(mapId).systems).toHaveLength(1);
+  });
+});
+
+describe("chain identifier reconciliation",()=>{
+  it("writes only a changed directional signature note and updates the local cache before its echo",async()=>{
+    const c=await enroll();up.calls=[];
+    await service.handleEvent(mapId,{type:"system.update",id:"s1",updates:{isHome:true}},store.credential(c.id));
+    await service.handleEvent(mapId,{type:"system.add",system:{id:"s2",name:"J223207",eveSystemId:31000002,systemClass:"C2",customLabels:[]}},store.credential(c.id));
+    store.saveResource(mapId,"s1","signatures",[{id:"h1",notes:"wrong"}]);store.saveResource(mapId,"s2","signatures",[{id:"b1",notes:""}]);
+    await service.handleEvent(mapId,{type:"connection.add",connection:{id:"c1",sourceId:"s1",targetId:"s2",connectionType:"standard",sourceSignatureId:"h1",targetSignatureId:"b1",broken:false}},store.credential(c.id));
+    await until(()=>up.patch.mock.calls.length===1);
+    expect(up.patch).toHaveBeenCalledWith(base,key,`${endpoint}/systems/s1/signatures/h1`,{notes:"A"},expect.anything());
+    expect(store.resources(mapId,"s1").signatures.items[0].notes).toBe("A");
+    await new Promise(r=>setTimeout(r,30));expect(up.patch).toHaveBeenCalledTimes(1);
+    expect(service.chainDiagnostics(mapId).custom_label_write).toMatch(/unavailable_by_external_api/);
+  });
+  it("keeps reads/live state healthy when a content-write key is refused",async()=>{
+    const c=await enroll();up.bad.add(key);
+    await service.handleEvent(mapId,{type:"system.update",id:"s1",updates:{isHome:true}},store.credential(c.id));
+    await service.handleEvent(mapId,{type:"system.add",system:{id:"s2",name:"J223207",eveSystemId:31000002,systemClass:"C2"}},store.credential(c.id));
+    store.saveResource(mapId,"s1","signatures",[{id:"h1",notes:""}]);
+    await service.handleEvent(mapId,{type:"connection.add",connection:{id:"c1",sourceId:"s1",targetId:"s2",connectionType:"standard",sourceSignatureId:"h1",broken:false}},store.credential(c.id));
+    await until(()=>store.credential(c.id).chain_write_status==="unavailable");
+    expect(store.credential(c.id).health).toBe("healthy");expect(service.mapState(mapId).map.systems).toHaveLength(2);
   });
 });
 

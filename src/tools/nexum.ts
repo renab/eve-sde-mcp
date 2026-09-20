@@ -29,4 +29,5 @@ export function registerNexumTools(server:McpServer, getService:()=>NexumService
   tool("get_wormhole_chain_state","Compact canonical Nexum chain from local cache. Accepts map ID or unique map name. Unknown fields are omitted; includes freshness.",
     {map_id:id,root:id.optional(),depth:z.number().int().min(0).max(30).optional(),include_presence:z.boolean().optional(),include_sites:z.boolean().optional()},(s,a)=>s.chain(a.map_id,a));
   tool("nexum_status","Safe Nexum diagnostics: credentials, access, streams, reconnects, freshness and presence history count.",{},s=>s.diagnostics());
+  tool("nexum_chain_identifier_diagnostics","Read-only chain-identifier reconciliation plan: effective labels, required directional signature notes, write capability, and custom-label API limitations. Does not mutate Nexum.",{map_id:id},(s,a)=>s.chainDiagnostics(a.map_id));
 }
