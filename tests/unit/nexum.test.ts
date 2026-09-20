@@ -213,6 +213,16 @@ describe("chain identifier reconciliation",()=>{
     await until(()=>store.credential(c.id).chain_write_status==="unavailable");
     expect(store.credential(c.id).health).toBe("healthy");expect(service.mapState(mapId).map.systems).toHaveLength(2);
   });
+  it("falls back from a known-unwritable stream key to another authorized writer",async()=>{
+    const read=await enroll();const writer=await enroll("Writer",crypto.randomBytes(32).toString("base64url"));
+    store.patchCredential(read.id,{chain_write_status:"unavailable"});
+    await service.handleEvent(mapId,{type:"system.update",id:"s1",updates:{isHome:true}},store.credential(read.id));
+    await service.handleEvent(mapId,{type:"system.add",system:{id:"s2",name:"J223207",eveSystemId:31000002,systemClass:"C2"}},store.credential(read.id));
+    store.saveResource(mapId,"s1","signatures",[{id:"h1",notes:""}]);
+    await service.handleEvent(mapId,{type:"connection.add",connection:{id:"c1",sourceId:"s1",targetId:"s2",connectionType:"standard",sourceSignatureId:"h1",broken:false}},store.credential(read.id));
+    await until(()=>up.patch.mock.calls.length===1);
+    expect(up.patch.mock.calls[0][1]).toBe(secrets.get(writer.id));expect(store.credential(writer.id).chain_write_status).toBe("available");
+  });
 });
 
 describe("presence and freshness",()=>{

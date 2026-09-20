@@ -260,7 +260,13 @@ export class NexumService {
   }
   private async reconcileChain(id:string,c:Json):Promise<void> {
     const m=this.store.map(id), plan=planChain(this.store.state(id),systemId=>this.store.resources(id,systemId));
-    const current=this.store.credential(c.id), status=current.chain_write_status??"unknown";
+    // The stream credential can be read/events-only. Prefer any other healthy
+    // credential with map access that has not already proven unable to write.
+    const current=this.store.credential(c.id);
+    const writer=(current.chain_write_status??"unknown")==="unavailable"
+      ? this.candidates(id).find(candidate=>(candidate.chain_write_status??"unknown")!=="unavailable")??current
+      : current;
+    const status=writer.chain_write_status??"unknown";
     const changes=plan.notes.filter(change=>{
       const signatures=this.store.resources(id,change.systemId).signatures.items as Json[];
       return signatures.find(s=>String(s.id)===change.signatureId)?.notes!==change.notes;
@@ -269,16 +275,16 @@ export class NexumService {
     this.store.patchMap(id,{chain_sync:{at:this.now(),identifier_count:plan.identifiers.size,desired_note_changes:changes.length,
       desired_label_changes:labelChanges.length,label_write_status:"unavailable_by_external_api",warnings:plan.warnings}});
     if(!changes.length||status==="unavailable")return;
-    if(!this.transport.patch){this.store.patchCredential(c.id,{chain_write_status:"unavailable",chain_write_error:"Configured Nexum transport has no PATCH support"});return;}
+    if(!this.transport.patch){this.store.patchCredential(writer.id,{chain_write_status:"unavailable",chain_write_error:"Configured Nexum transport has no PATCH support"});return;}
     for(const change of changes) {
       try {
-        await this.transport.patch(c.base_url,this.secrets.get(c.secret_ref),`${prefix(m)}/systems/${encodeURIComponent(change.systemId)}/signatures/${encodeURIComponent(change.signatureId)}`,{notes:change.notes},this.lifetime.signal);
+        await this.transport.patch(writer.base_url,this.secrets.get(writer.secret_ref),`${prefix(m)}/systems/${encodeURIComponent(change.systemId)}/signatures/${encodeURIComponent(change.signatureId)}`,{notes:change.notes},this.lifetime.signal);
         const resource=this.store.resources(id,change.systemId), rows=(resource.signatures.items as Json[]).map(s=>String(s.id)===change.signatureId?{...s,notes:change.notes}:s);
         this.store.saveResource(id,change.systemId,"signatures",rows);
-        this.store.patchCredential(c.id,{chain_write_status:"available",chain_write_error:null,last_chain_write_at:this.now()});
+        this.store.patchCredential(writer.id,{chain_write_status:"available",chain_write_error:null,last_chain_write_at:this.now()});
       } catch(e) {
-        if(e instanceof NexumError&&[401,403].includes(e.status))this.store.patchCredential(c.id,{chain_write_status:"unavailable",chain_write_error:safeError(e),chain_write_error_at:this.now()});
-        else this.store.patchCredential(c.id,{chain_write_status:"degraded",chain_write_error:safeError(e),chain_write_error_at:this.now()});
+        if(e instanceof NexumError&&[401,403].includes(e.status))this.store.patchCredential(writer.id,{chain_write_status:"unavailable",chain_write_error:safeError(e),chain_write_error_at:this.now()});
+        else this.store.patchCredential(writer.id,{chain_write_status:"degraded",chain_write_error:safeError(e),chain_write_error_at:this.now()});
         this.store.patchMap(id,{chain_sync:{...(this.store.map(id).chain_sync??{}),last_error:safeError(e),at:this.now()}});return;
       }
     }
