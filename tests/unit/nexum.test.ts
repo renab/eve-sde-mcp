@@ -8,6 +8,7 @@ import { openStateDatabase } from "../../src/persistence.js";
 import { NexumStore, canonicalMapId, type Json } from "../../src/nexum-store.js";
 import { SecretStore, redactSecrets } from "../../src/secrets.js";
 import { NexumService } from "../../src/nexum.js";
+import { Ledger } from "../../src/ledger.js";
 import { decodeSse, HttpNexumTransport, NexumError, normalizeBaseUrl, type NexumStream } from "../../src/nexum-client.js";
 import { registerNexumTools } from "../../src/tools/nexum.js";
 
@@ -192,6 +193,11 @@ describe("audited event traffic",()=>{
 });
 
 describe("chain identifier reconciliation",()=>{
+  it("takes its note template from the current append-first ledger record",async()=>{
+    await enroll();const record=new Ledger(store.db).store({namespace:"nexum",kind:"chain_note_format",key:mapId,status:"active",source_type:"user_configuration",tags:["nexum"],payload:{format:"WH | {chain} | {sig} | {dest_type}"}});
+    const diagnostic=service.chainDiagnostics(mapId);
+    expect(diagnostic.note_format).toBe("WH | {chain} | {sig} | {dest_type}");expect(diagnostic.note_format_record).toMatchObject({id:record.id,key:mapId});
+  });
   it("writes only a changed directional signature note and updates the local cache before its echo",async()=>{
     const c=await enroll();up.calls=[];
     await service.handleEvent(mapId,{type:"system.update",id:"s1",updates:{isHome:true}},store.credential(c.id));

@@ -8,6 +8,20 @@ export type ChainPlan = {
   warnings: string[];
 };
 
+/** Galaxy's format for the value it writes into a signature note. */
+export const defaultChainNoteFormat="{chain}";
+const noteTokens=new Set<string>(["{chain}","{sig}","{dest_type}"]);
+export function validateChainNoteFormat(format:unknown):string {
+  if(typeof format!=="string"||format.length<1||format.length>240)throw new Error("Chain note format must be 1–240 characters");
+  const tokens=(format.match(/\{[^}]+\}/g)??[]) as string[];
+  if(tokens.some(token=>!noteTokens.has(token)))throw new Error("Chain note format supports only {chain}, {sig}, and {dest_type}");
+  if(!tokens.includes("{chain}"))throw new Error("Chain note format must include {chain}");
+  return format;
+}
+export function formatChainNote(format:string, values:{chain:string;sig:string;destType:string}):string {
+  return format.replace(/\{chain\}|\{sig\}|\{dest_type\}/g,token=>token==="{chain}"?values.chain:token==="{sig}"?values.sig:values.destType).trim().replace(/\s+/g," ");
+}
+
 const identifier=/^[A-Z](?:\.\d+)*(?:\.(?:HS|LS|NS))?$/;
 export const validChainIdentifier=(value:unknown):value is string=>typeof value==="string"&&identifier.test(value);
 export function customLabelText(value:unknown):string|undefined {
@@ -28,7 +42,8 @@ const children=(state:Json,id:string)=>((state.connections??[]) as Json[]).filte
 const nextDirect=(used:Set<string>)=>{for(let i=0;i<26;i++){const value=alpha(i);if(!used.has(value))return value;}return undefined;};
 const nextChild=(parent:string,used:Set<string>)=>{for(let i=1;i<10000;i++){const value=`${parent}.${i}`;if(!used.has(value))return value;}return undefined;};
 
-export function planChain(state:Json, resources:(systemId:string)=>Json):ChainPlan {
+export function planChain(state:Json, resources:(systemId:string)=>Json, noteFormat=defaultChainNoteFormat):ChainPlan {
+  validateChainNoteFormat(noteFormat);
   const systems=(state.systems??[]) as Json[];
   const byId=new Map(systems.map(s=>[String(s.id),s]));
   const roots=systems.filter(s=>s.isHome);
@@ -64,7 +79,8 @@ export function planChain(state:Json, resources:(systemId:string)=>Json):ChainPl
       const destination=identifiers.get(to) ?? (to===root ? "H" : undefined);
       if(!destination||!signatureId)continue;
       const signatures=resources(from).signatures?.items??[];
-      if(signatures.some((s:Json)=>String(s.id)===String(signatureId)))notes.push({systemId:from,signatureId:String(signatureId),notes:destination,connectionId:String(connection.id)});
+      const signature=signatures.find((s:Json)=>String(s.id)===String(signatureId));
+      if(signature)notes.push({systemId:from,signatureId:String(signatureId),notes:formatChainNote(noteFormat,{chain:destination,sig:String(signature.sigId??""),destType:String(byId.get(to)?.systemClass??"")}),connectionId:String(connection.id)});
     }
   }
   return {identifiers,notes,labels,warnings};

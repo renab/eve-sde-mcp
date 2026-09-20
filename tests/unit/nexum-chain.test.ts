@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { planChain, systemIdentifier, validChainIdentifier } from "../../src/nexum-chain.js";
+import { formatChainNote, planChain, systemIdentifier, validateChainNoteFormat, validChainIdentifier } from "../../src/nexum-chain.js";
 
 const resources=(items:Record<string,any[]>)=>(id:string)=>({signatures:{items:items[id]??[]}});
 const systems=[
-  {id:"home",name:"Home",isHome:true,customLabels:[]},
+  {id:"home",name:"Home",isHome:true,systemClass:"C2",customLabels:[]},
   {id:"b",name:"J223207",systemClass:"C2",customLabels:["t:B"]},
   {id:"deep",name:"J132009",systemClass:"C3",customLabels:[]},
   {id:"exit",name:"Erstur",systemClass:"HS",customLabels:[]},
@@ -33,5 +33,12 @@ describe("Nexum chain identifier planner",()=>{
     expect(systemIdentifier({customLabels:["t:B.2.LS"]})).toBe("B.2.LS");
     expect(systemIdentifier({customLabels:["t:Scanner"]})).toBeUndefined();
     expect(validChainIdentifier("B.0")).toBe(true);expect(validChainIdentifier("B.HS.1")).toBe(false);
+  });
+  it("renders complete Galaxy-owned bookmark notes from the mapped destination class",()=>{
+    const plan=planChain({systems,connections},resources({home:[{id:"h1",sigId:"AAA-001"}],b:[{id:"b1",sigId:"BBB-002"},{id:"b2",sigId:"BBB-003"}],deep:[{id:"d1",sigId:"DDD-004"},{id:"d2",sigId:"DDD-005"}],exit:[{id:"e1",sigId:"EEE-006"}]}),"WH | {chain} | {sig} | {dest_type}");
+    expect(plan.notes.find(n=>n.signatureId==="b1")?.notes).toBe("WH | H | BBB-002 | C2");
+    expect(plan.notes.find(n=>n.signatureId==="d2")?.notes).toBe("WH | B.1.HS | DDD-005 | HS");
+    expect(formatChainNote("{chain} {sig}",{chain:"H",sig:"ABC-123",destType:"C2"})).toBe("H ABC-123");
+    expect(()=>validateChainNoteFormat("{notes}")).toThrow(/supports only/);
   });
 });

@@ -30,4 +30,5 @@ export function registerNexumTools(server:McpServer, getService:()=>NexumService
     {map_id:id,root:id.optional(),depth:z.number().int().min(0).max(30).optional(),include_presence:z.boolean().optional(),include_sites:z.boolean().optional()},(s,a)=>s.chain(a.map_id,a));
   tool("nexum_status","Safe Nexum diagnostics: credentials, access, streams, reconnects, freshness and presence history count.",{},s=>s.diagnostics());
   tool("nexum_chain_identifier_diagnostics","Read-only chain-identifier reconciliation plan: effective labels, required directional signature notes, write capability, and custom-label API limitations. Does not mutate Nexum.",{map_id:id},(s,a)=>s.chainDiagnostics(a.map_id));
+  tool("nexum_reconcile_chain_notes","Reconcile cached directional signature notes using the current append-first nexum/chain_note_format record for this map. Use store_record or supersede_record to manage that format record. The default is {chain}. Does not change Nexum's bookmarkFormat; set it to {notes} in Nexum's UI.",{map_id:id},(s,a)=>s.reconcileChainNotes(a.map_id));
 }

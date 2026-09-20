@@ -3,10 +3,11 @@ import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { getStateDatabase } from "./persistence.js";
+import { Ledger } from "./ledger.js";
 import { SecretStore } from "./secrets.js";
 import { NexumStore, resourceKinds, type Json, type ResourceKind } from "./nexum-store.js";
 import { HttpNexumTransport, NexumError, normalizeBaseUrl, type NexumStream, type NexumTransport } from "./nexum-client.js";
-import { planChain } from "./nexum-chain.js";
+import { defaultChainNoteFormat, planChain, validateChainNoteFormat } from "./nexum-chain.js";
 
 const prefix=(m:Json)=>`/api/v1/maps/${encodeURIComponent(m.nexum_map_id)}`;
 const object=(v:any):v is Json=>!!v && typeof v==="object" && !Array.isArray(v);
@@ -259,7 +260,7 @@ export class NexumService {
     timer.unref();this.chainPending.set(id,timer);
   }
   private async reconcileChain(id:string,c:Json):Promise<void> {
-    const m=this.store.map(id), plan=planChain(this.store.state(id),systemId=>this.store.resources(id,systemId));
+    const m=this.store.map(id), noteFormat=this.chainNoteFormat(id).format, plan=planChain(this.store.state(id),systemId=>this.store.resources(id,systemId),noteFormat);
     // The stream credential can be read/events-only. Prefer any other healthy
     // credential with map access that has not already proven unable to write.
     const current=this.store.credential(c.id);
@@ -272,7 +273,7 @@ export class NexumService {
       return signatures.find(s=>String(s.id)===change.signatureId)?.notes!==change.notes;
     });
     const labelChanges=plan.labels.filter(label=>!label.actual.includes(label.serialized));
-    this.store.patchMap(id,{chain_sync:{at:this.now(),identifier_count:plan.identifiers.size,desired_note_changes:changes.length,
+    this.store.patchMap(id,{chain_sync:{at:this.now(),note_format:noteFormat,identifier_count:plan.identifiers.size,desired_note_changes:changes.length,
       desired_label_changes:labelChanges.length,label_write_status:"unavailable_by_external_api",warnings:plan.warnings}});
     if(!changes.length||status==="unavailable")return;
     if(!this.transport.patch){this.store.patchCredential(writer.id,{chain_write_status:"unavailable",chain_write_error:"Configured Nexum transport has no PATCH support"});return;}
@@ -418,11 +419,22 @@ export class NexumService {
         lifetime_state:c.timeStatus,mass_state:c.massStatus,mass_used:c.massUsed,created_at:c.createdAt,eol_at:c.eolAt,lifetime_expires_at:c.lifetimeExpiresAt,broken:c.broken,notes:c.flagNote})),
       ...(options.include_presence?{presence:this.mergedPresence(m.id).filter(p=>p.eveSystemId!=null&&systems.some((s:Json)=>String(s.eveSystemId)===String(p.eveSystemId))),presence_coverage:this.coverage(m.id)}:{}),freshness:this.freshness(m.id)};
   }
+  private chainNoteFormat(mapId:string):{format:string;record:Json|null;error:string|null}{
+    const record=new Ledger(this.store.db).get({namespace:"nexum",kind:"chain_note_format",key:mapId});
+    if(!record)return {format:defaultChainNoteFormat,record:null,error:null};
+    try{return {format:validateChainNoteFormat(record.payload.format),record,error:null};}
+    catch(e){return {format:defaultChainNoteFormat,record,error:e instanceof Error?e.message:"Invalid chain note format record"};}
+  }
+  reconcileChainNotes(map:string):Promise<Json>{return this.serialize(async()=>{
+    const m=this.store.map(map),credential=this.candidates(m.id)[0];
+    if(credential)await this.reconcileChain(m.id,credential);
+    return this.chainDiagnostics(m.id);
+  });}
   chainDiagnostics(map:string):Json {
-    const m=this.store.map(map),state=this.store.state(m.id),plan=planChain(state,systemId=>this.store.resources(m.id,systemId));
+    const m=this.store.map(map),state=this.store.state(m.id),config=this.chainNoteFormat(m.id),noteFormat=config.format,plan=planChain(state,systemId=>this.store.resources(m.id,systemId),noteFormat);
     const systems=(state.systems??[]) as Json[];
     return {map_id:m.id,map_name:state.name,write_capability:this.candidates(m.id).map(c=>({credential_id:c.id,status:c.chain_write_status??"unknown",error:c.chain_write_error??null})),
-      custom_label_write:"unavailable_by_external_api: Nexum API keys cannot PATCH systems/customLabels; browser-session system editing is required upstream.",
+      note_format:noteFormat,note_format_record:config.record?{id:config.record.id,namespace:config.record.namespace,kind:config.record.kind,key:config.record.key,status:config.record.status,source_type:config.record.source_type,payload:config.record.payload}:null,note_format_error:config.error,nexum_bookmark_format_required:"{notes}",custom_label_write:"unavailable_by_external_api: Nexum API keys cannot PATCH systems/customLabels; browser-session system editing is required upstream.",
       systems:systems.map(s=>({system_id:s.id,name:s.name,is_home:!!s.isHome,actual_custom_labels:s.customLabels??[],effective_identifier:plan.identifiers.get(String(s.id))??null,desired_custom_label:plan.identifiers.has(String(s.id))?`t:${plan.identifiers.get(String(s.id))}`:null})),
       signature_notes:plan.notes.map(n=>({connection_id:n.connectionId,system_id:n.systemId,signature_id:n.signatureId,desired_note:n.notes,actual_note:(this.store.resources(m.id,n.systemId).signatures.items as Json[]).find(s=>String(s.id)===n.signatureId)?.notes??null})),warnings:plan.warnings,freshness:this.freshness(m.id)};
   }
