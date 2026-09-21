@@ -231,7 +231,7 @@ describe("chain identifier reconciliation",()=>{
     await service.handleEvent(mapId,{type:"connection.add",connection:{id:"c1",sourceId:"s1",targetId:"s2",connectionType:"standard",sourceSignatureId:"h1",targetSignatureId:"b1",broken:false}},store.credential(c.id));
     await until(()=>up.patch.mock.calls.length===2);
     expect(up.patch).toHaveBeenCalledWith(base,key,`${endpoint}/systems/s1/signatures/h1`,{notes:"A"},expect.anything());
-    expect(up.patch).toHaveBeenCalledWith(base,key,`${endpoint}/systems/s2/signatures/b1`,{notes:"H"},expect.anything());
+    expect(up.patch).toHaveBeenCalledWith(base,key,`${endpoint}/systems/s2/signatures/b1`,{notes:"* H"},expect.anything());
     expect(store.resources(mapId,"s1").signatures.items[0].notes).toBe("A");
     await new Promise(r=>setTimeout(r,30));expect(up.patch).toHaveBeenCalledTimes(2);
     expect(service.chainDiagnostics(mapId).custom_label_write).toMatch(/unavailable_by_external_api/);

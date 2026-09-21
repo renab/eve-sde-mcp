@@ -92,7 +92,7 @@ export function planChain(state:Json, resources:(systemId:string)=>Json, noteFor
         else if(parentIdentifier)value=nextChild(parentIdentifier,used);
       }
       if(!value){warnings.push(`Cannot allocate an identifier for ${other}: its parent has no identifier`);continue;}
-      if(used.has(value)&&identifiers.get(other)!==value){warnings.push(`Duplicate chain identifier ${value}; leaving ${other} unresolved`);continue;}
+      if(used.has(value)&&identifiers.get(other)!==value&&reservation?.identifier!==value){warnings.push(`Duplicate chain identifier ${value}; leaving ${other} unresolved`);continue;}
       identifiers.set(other,value);used.add(value);visited.add(other);queue.push(other);
     }
   }
@@ -101,9 +101,9 @@ export function planChain(state:Json, resources:(systemId:string)=>Json, noteFor
   for(const connection of (state.connections??[]) as Json[]) {
     if(!standard(connection))continue;
     for(const [from,to,signatureId] of [[String(connection.sourceId),String(connection.targetId),connection.sourceSignatureId],[String(connection.targetId),String(connection.sourceId),connection.targetSignatureId]] as const) {
-      // Home deliberately has no visible system label, but a signature that
-      // leads back to it needs the literal operational bookmark destination.
-      const destination=identifiers.get(to) ?? (to===root ? "H" : undefined);
+      // Home deliberately has no visible system label.  Its inbound bookmarks
+      // sort first in EVE while retaining the literal Home destination marker.
+      const destination=identifiers.get(to) ?? (to===root ? "* H" : undefined);
       const signature=matchingScannerSignature(from,to,signatureId);
       if(!destination||!signature)continue;
       if(signature)notes.push({systemId:from,signatureId:String(signature.id),notes:formatChainNote(noteFormat,{chain:destination,sig:String(signature.sigId??""),destType:String(byId.get(to)?.systemClass??"")}),connectionId:String(connection.id)});

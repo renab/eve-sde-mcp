@@ -18,7 +18,7 @@ describe("Nexum chain identifier planner",()=>{
   it("preserves established labels, allocates descendants and writes directional destination notes",()=>{
     const plan=planChain({systems,connections},resources({home:[{id:"h1",notes:"old"}],b:[{id:"b1",notes:""},{id:"b2",notes:""}],deep:[{id:"d1",notes:""},{id:"d2",notes:""}],exit:[{id:"e1",notes:""}]}));
     expect([...plan.identifiers]).toEqual([["b","B"],["deep","B.1"],["exit","B.1.HS"]]);
-    expect(plan.notes.map(n=>[n.signatureId,n.notes])).toEqual([["h1","B"],["b1","H"],["b2","B.1"],["d1","B"],["d2","B.1.HS"],["e1","B.1"]]);
+    expect(plan.notes.map(n=>[n.signatureId,n.notes])).toEqual([["h1","B"],["b1","* H"],["b2","B.1"],["d1","B"],["d2","B.1.HS"],["e1","B.1"]]);
     expect(plan.labels.find(l=>l.systemId==="deep")).toMatchObject({serialized:"t:B.1"});
   });
   it("does not renumber a surviving branch when a sibling disappears",()=>{
@@ -46,6 +46,12 @@ describe("Nexum chain identifier planner",()=>{
     expect(plan.reservations).toEqual([{systemId:"home",signatureId:"c",identifier:"C",destinationClass:"LS"}]);
     expect(plan.notes.find(note=>note.signatureId==="c")?.notes).toBe("C");
   });
+  it("adopts a scanner-side reservation when its destination becomes a mapped connection",()=>{
+    const plan=planChain({systems:[systems[0],{...systems[1],customLabels:[]}],connections:[{id:"c1",sourceId:"home",targetId:"b",connectionType:"standard",sourceSignatureId:"scan"}]},resources({home:[{id:"scan",sigId:"AAA-001",sigType:"wormhole",whLeadsTo:"J223207"}]}),defaultChainNoteFormat,[{systemId:"home",signatureId:"scan",identifier:"A",destinationClass:"C2"}]);
+    expect(plan.identifiers.get("b")).toBe("A");
+    expect(plan.adoptions).toEqual([{systemId:"home",signatureId:"scan",targetSystemId:"b"}]);
+    expect(plan.warnings).toEqual([]);
+  });
   it("defers an ambiguous root and ignores broken/non-wormhole links",()=>{
     expect(planChain({systems:[{id:"a",isHome:true},{id:"b",isHome:true}],connections:[]},resources({})).warnings[0]).toMatch(/Multiple Home/);
     const plan=planChain({systems:[systems[0],systems[1]],connections:[{...connections[0],broken:true}]},resources({home:[{id:"h1"}],b:[{id:"b1"}]}));expect(plan.notes).toEqual([]);
@@ -57,7 +63,7 @@ describe("Nexum chain identifier planner",()=>{
   });
   it("renders complete Galaxy-owned bookmark notes from the mapped destination class",()=>{
     const plan=planChain({systems,connections},resources({home:[{id:"h1",sigId:"AAA-001"}],b:[{id:"b1",sigId:"BBB-002"},{id:"b2",sigId:"BBB-003"}],deep:[{id:"d1",sigId:"DDD-004"},{id:"d2",sigId:"DDD-005"}],exit:[{id:"e1",sigId:"EEE-006"}]}),"WH | {chain} | {sig} | {dest_type}");
-    expect(plan.notes.find(n=>n.signatureId==="b1")?.notes).toBe("WH | H | BBB-002 | C2");
+    expect(plan.notes.find(n=>n.signatureId==="b1")?.notes).toBe("WH | * H | BBB-002 | C2");
     expect(plan.notes.find(n=>n.signatureId==="d2")?.notes).toBe("WH | B.1.HS | DDD-005 | HS");
     expect(formatChainNote("{chain} {sig}",{chain:"H",sig:"ABC-123",destType:"C2"})).toBe("H ABC-123");
     expect(()=>validateChainNoteFormat("{notes}")).toThrow(/supports only/);
