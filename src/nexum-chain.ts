@@ -103,10 +103,13 @@ export function planChain(state:Json, resources:(systemId:string)=>Json, noteFor
     for(const [from,to,signatureId] of [[String(connection.sourceId),String(connection.targetId),connection.sourceSignatureId],[String(connection.targetId),String(connection.sourceId),connection.targetSignatureId]] as const) {
       // Home deliberately has no visible system label.  Its inbound bookmarks
       // sort first in EVE while retaining the literal Home destination marker.
-      const destination=identifiers.get(to) ?? (to===root ? "* H" : undefined);
+      const destination=identifiers.get(to) ?? (to===root ? "H" : undefined);
       const signature=matchingScannerSignature(from,to,signatureId);
       if(!destination||!signature)continue;
-      if(signature)notes.push({systemId:from,signatureId:String(signature.id),notes:formatChainNote(noteFormat,{chain:destination,sig:String(signature.sigId??""),destType:String(byId.get(to)?.systemClass??"")}),connectionId:String(connection.id)});
+      if(signature){
+        const formatted=formatChainNote(noteFormat,{chain:destination,sig:String(signature.sigId??""),destType:String(byId.get(to)?.systemClass??"")});
+        notes.push({systemId:from,signatureId:String(signature.id),notes:to===root?`* ${formatted}`:formatted,connectionId:String(connection.id)});
+      }
     }
   }
   const reservations:ChainPlan["reservations"]=[];

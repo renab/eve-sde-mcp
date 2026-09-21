@@ -63,7 +63,7 @@ describe("Nexum chain identifier planner",()=>{
   });
   it("renders complete Galaxy-owned bookmark notes from the mapped destination class",()=>{
     const plan=planChain({systems,connections},resources({home:[{id:"h1",sigId:"AAA-001"}],b:[{id:"b1",sigId:"BBB-002"},{id:"b2",sigId:"BBB-003"}],deep:[{id:"d1",sigId:"DDD-004"},{id:"d2",sigId:"DDD-005"}],exit:[{id:"e1",sigId:"EEE-006"}]}),"WH | {chain} | {sig} | {dest_type}");
-    expect(plan.notes.find(n=>n.signatureId==="b1")?.notes).toBe("WH | * H | BBB-002 | C2");
+    expect(plan.notes.find(n=>n.signatureId==="b1")?.notes).toBe("* WH | H | BBB-002 | C2");
     expect(plan.notes.find(n=>n.signatureId==="d2")?.notes).toBe("WH | B.1.HS | DDD-005 | HS");
     expect(formatChainNote("{chain} {sig}",{chain:"H",sig:"ABC-123",destType:"C2"})).toBe("H ABC-123");
     expect(()=>validateChainNoteFormat("{notes}")).toThrow(/supports only/);
