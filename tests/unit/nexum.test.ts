@@ -193,6 +193,23 @@ describe("audited event traffic",()=>{
 });
 
 describe("chain identifier reconciliation",()=>{
+  it("releases an unconnected reservation only after a signature refresh confirms it is gone",async()=>{
+    await enroll();
+    store.saveChainReservations(mapId,[{systemId:"s1",signatureId:"rolled",identifier:"A",destinationClass:"C3"}]);
+    store.retireAbsentChainReservations(mapId,"s1",[],store.state(mapId));
+    expect(store.chainReservations(mapId)).toEqual([]);
+  });
+  it("retains an adopted reservation while its mapped connection remains live",async()=>{
+    await enroll();
+    const state={...store.state(mapId),systems:[...store.state(mapId).systems,{id:"s2",name:"J123456"}],connections:[{id:"c1",sourceId:"s1",targetId:"s2",connectionType:"standard"}]};
+    store.saveState(mapId,state);
+    store.saveChainReservations(mapId,[{systemId:"s1",signatureId:"mapped",identifier:"A",destinationClass:"C3"}]);
+    store.adoptChainReservations(mapId,[{systemId:"s1",signatureId:"mapped",targetSystemId:"s2"}]);
+    store.retireAbsentChainReservations(mapId,"s1",[],state);
+    expect(store.chainReservations(mapId)).toMatchObject([{signatureId:"mapped",targetSystemId:"s2"}]);
+    store.retireAbsentChainReservations(mapId,"s1",[],{...state,connections:[]});
+    expect(store.chainReservations(mapId)).toEqual([]);
+  });
   it("writes a scanner-side bookmark note before Nexum maps the destination",async()=>{
     await enroll();up.calls=[];
     await service.handleEvent(mapId,{type:"system.update",id:"s1",updates:{isHome:true}},store.credential(store.credentials()[0].id));

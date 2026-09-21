@@ -249,7 +249,10 @@ export class NexumService {
         for(const r of old)if(!ids.has(r.system_id))this.store.db.prepare("DELETE FROM nexum_resources WHERE map_id=? AND system_id=?").run(id,r.system_id);
         for(const s of full.systems)if(this.store.resources(id,String(s.id)).anomalies.status==="uninitialized")this.store.saveResource(id,String(s.id),"anomalies",[]);
       }else this.store.db.prepare("DELETE FROM nexum_resources WHERE map_id=?").run(id);
-      for(const r of resources)this.store.saveResource(id,r.system,r.kind,r.data);
+      for(const r of resources){
+        this.store.saveResource(id,r.system,r.kind,r.data);
+        if(r.kind==="signatures")this.store.retireAbsentChainReservations(id,r.system,r.data,full);
+      }
       this.store.patchMap(id,{name:full.name,hydrated_at:this.now(),last_rest_success_at:this.now(),last_resync_at:m.hydrated_at?this.now():null});
     })();
     this.scheduleChain(id,c);
@@ -263,6 +266,7 @@ export class NexumService {
     const m=this.store.map(id), noteFormat=this.chainNoteFormat(id).format;
     let plan=planChain(this.store.state(id),systemId=>this.store.resources(id,systemId),noteFormat,this.store.chainReservations(id));
     if(plan.reservations.length){this.store.saveChainReservations(id,plan.reservations);plan=planChain(this.store.state(id),systemId=>this.store.resources(id,systemId),noteFormat,this.store.chainReservations(id));}
+    if(plan.adoptions.length)this.store.adoptChainReservations(id,plan.adoptions);
     // The stream credential can be read/events-only. Prefer any other healthy
     // credential with map access that has not already proven unable to write.
     const current=this.store.credential(c.id);
@@ -320,7 +324,11 @@ export class NexumService {
         if(signal?.aborted||!this.store.state(id).systems.some((s:Json)=>String(s.id)===String(e.systemId)))return;
         const data=await this.get(c,`${prefix(this.store.map(id))}/systems/${encodeURIComponent(String(e.systemId))}/${kind}`,signal);
         if(!Array.isArray(data))throw new NexumError(0,0,"Malformed Nexum resource");
-        if(!signal?.aborted){this.store.saveResource(id,String(e.systemId),kind,data);this.store.patchMap(id,{last_rest_success_at:this.now()});this.scheduleChain(id,c);}
+        if(!signal?.aborted){
+          this.store.saveResource(id,String(e.systemId),kind,data);
+          if(kind==="signatures")this.store.retireAbsentChainReservations(id,String(e.systemId),data,this.store.state(id));
+          this.store.patchMap(id,{last_rest_success_at:this.now()});this.scheduleChain(id,c);
+        }
       });return;
     }
     if(e.type==="map.resync"){

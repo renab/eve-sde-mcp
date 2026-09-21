@@ -6,6 +6,7 @@ export type ChainPlan = {
   notes: Array<{systemId:string; signatureId:string; notes:string; connectionId:string}>;
   labels: Array<{systemId:string; identifier:string; serialized:string; actual:string[]}>;
   reservations: Array<{systemId:string; signatureId:string; identifier:string; destinationClass:string}>;
+  adoptions: Array<{systemId:string; signatureId:string; targetSystemId:string}>;
   warnings: string[];
 };
 
@@ -44,13 +45,13 @@ const nextDirect=(used:Set<string>)=>{for(let i=0;i<26;i++){const value=alpha(i)
 const nextChild=(parent:string,used:Set<string>)=>{for(let i=1;i<10000;i++){const value=`${parent}.${i}`;if(!used.has(value))return value;}return undefined;};
 
 export function planChain(state:Json, resources:(systemId:string)=>Json, noteFormat=defaultChainNoteFormat,
-  persistedReservations:Array<{systemId:string;signatureId:string;identifier:string;destinationClass:string}>=[]):ChainPlan {
+  persistedReservations:Array<{systemId:string;signatureId:string;identifier:string;destinationClass:string;targetSystemId?:string}>=[]):ChainPlan {
   validateChainNoteFormat(noteFormat);
   const systems=(state.systems??[]) as Json[];
   const byId=new Map(systems.map(s=>[String(s.id),s]));
   const roots=systems.filter(s=>s.isHome);
   const warnings:string[]=[];
-  if(roots.length!==1)return {identifiers:new Map(),notes:[],labels:[],reservations:[],warnings:[roots.length?"Multiple Home systems; chain reconciliation deferred":"No Home system; chain reconciliation deferred"]};
+  if(roots.length!==1)return {identifiers:new Map(),notes:[],labels:[],reservations:[],adoptions:[],warnings:[roots.length?"Multiple Home systems; chain reconciliation deferred":"No Home system; chain reconciliation deferred"]};
   const root=String(roots[0].id), identifiers=new Map<string,string>(), used=new Set<string>();
   for(const s of systems) { const value=systemIdentifier(s); if(value&&String(s.id)!==root&&!used.has(value)){identifiers.set(String(s.id),value);used.add(value);} }
   const reservationBySignature=new Map(persistedReservations.map(row=>[`${row.systemId}\0${row.signatureId}`,row]));
@@ -73,6 +74,7 @@ export function planChain(state:Json, resources:(systemId:string)=>Json, noteFor
     const signature=matchingScannerSignature(from,to,reference);
     return signature?reservationBySignature.get(`${from}\0${String(signature.id)}`):undefined;
   };
+  const adoptions:ChainPlan["adoptions"]=[];
   const queue=[root], visited=new Set<string>([root]);
   while(queue.length) {
     const parent=queue.shift()!, parentIdentifier=identifiers.get(parent);
@@ -80,7 +82,9 @@ export function planChain(state:Json, resources:(systemId:string)=>Json, noteFor
       if(visited.has(other))continue;
       const destination=byId.get(other);if(!destination)continue;
       const reference=String(connection.sourceId)===parent?connection.sourceSignatureId:connection.targetSignatureId;
-      let value=identifiers.get(other)??reservationFor(parent,other,reference)?.identifier;
+      const reservation=reservationFor(parent,other,reference);
+      if(reservation&&!reservation.targetSystemId)adoptions.push({systemId:reservation.systemId,signatureId:reservation.signatureId,targetSystemId:other});
+      let value=identifiers.get(other)??reservation?.identifier;
       if(!value) {
         const terminal=knownSpace(destination);
         if(terminal&&parentIdentifier)value=`${parentIdentifier}.${terminal}`;
@@ -129,5 +133,5 @@ export function planChain(state:Json, resources:(systemId:string)=>Json, noteFor
       notes.push({systemId:source,signatureId:String(signature.id),notes:formatChainNote(noteFormat,{chain:reservation.identifier,sig:String(signature.sigId??""),destType:reservation.destinationClass}),connectionId:`provisional:${String(signature.id)}`});
     }
   }
-  return {identifiers,notes,labels,reservations,warnings};
+  return {identifiers,notes,labels,reservations,adoptions,warnings};
 }

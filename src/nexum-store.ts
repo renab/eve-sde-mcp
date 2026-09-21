@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import type Database from "better-sqlite3";
 
 export type Json = Record<string, any>;
-export type ChainReservation = {systemId:string;signatureId:string;identifier:string;destinationClass:string};
+export type ChainReservation = {systemId:string;signatureId:string;identifier:string;destinationClass:string;targetSystemId?:string};
 export const resourceKinds = ["signatures", "anomalies", "structures"] as const;
 export type ResourceKind = typeof resourceKinds[number];
 export function canonicalMapId(base: string, id: string): string {
@@ -35,6 +35,8 @@ export class NexumStore {
         character_id TEXT NOT NULL, event TEXT NOT NULL, payload TEXT NOT NULL, observed_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS nexum_presence_time ON nexum_presence_events(map_id,observed_at);
     `);
+    if(!(db.prepare("PRAGMA table_info(nexum_chain_reservations)").all() as any[]).some(column=>column.name==="target_system_id"))
+      db.exec("ALTER TABLE nexum_chain_reservations ADD COLUMN target_system_id TEXT");
   }
   credentials(): Json[] { return (this.db.prepare("SELECT metadata FROM nexum_credentials").all() as any[]).map(r=>JSON.parse(r.metadata)); }
   credential(id: string): Json {
@@ -83,13 +85,27 @@ export class NexumStore {
   }
   chainReservations(map: string): ChainReservation[] {
     return (this.db.prepare("SELECT * FROM nexum_chain_reservations WHERE map_id=? ORDER BY created_at, signature_id").all(map) as any[])
-      .map(row=>({systemId:row.system_id,signatureId:row.signature_id,identifier:row.identifier,destinationClass:row.destination_class}));
+      .map(row=>({systemId:row.system_id,signatureId:row.signature_id,identifier:row.identifier,destinationClass:row.destination_class,...(row.target_system_id?{targetSystemId:row.target_system_id}:{})}));
   }
   saveChainReservations(map: string, rows: ChainReservation[]): void {
     const insert=this.db.prepare(`INSERT OR IGNORE INTO nexum_chain_reservations
       (map_id,system_id,signature_id,identifier,destination_class,created_at,updated_at) VALUES (?,?,?,?,?,?,?)`);
     const now=this.now();
     this.db.transaction(()=>{for(const row of rows)insert.run(map,row.systemId,row.signatureId,row.identifier,row.destinationClass,now,now);})();
+  }
+  adoptChainReservations(map:string, rows:Array<{systemId:string;signatureId:string;targetSystemId:string}>):void {
+    const update=this.db.prepare("UPDATE nexum_chain_reservations SET target_system_id=COALESCE(target_system_id,?), updated_at=? WHERE map_id=? AND system_id=? AND signature_id=?");
+    const now=this.now();this.db.transaction(()=>{for(const row of rows)update.run(row.targetSystemId,now,map,row.systemId,row.signatureId);})();
+  }
+  retireAbsentChainReservations(map:string, system:string, signatures:Json[], state:Json):void {
+    const live=new Set(signatures.map(signature=>String(signature.id)));
+    const rows=this.db.prepare("SELECT signature_id,target_system_id FROM nexum_chain_reservations WHERE map_id=? AND system_id=?").all(map,system) as any[];
+    const systems=new Set(((state.systems??[]) as Json[]).map(row=>String(row.id)));
+    const connected=(target:string)=>((state.connections??[]) as Json[]).some(connection=>
+      (String(connection.sourceId)===system&&String(connection.targetId)===target)||
+      (String(connection.targetId)===system&&String(connection.sourceId)===target));
+    const remove=this.db.prepare("DELETE FROM nexum_chain_reservations WHERE map_id=? AND system_id=? AND signature_id=?");
+    this.db.transaction(()=>{for(const row of rows)if(!live.has(String(row.signature_id))&&(!row.target_system_id||!systems.has(String(row.target_system_id))||!connected(String(row.target_system_id))))remove.run(map,system,row.signature_id);})();
   }
   presence(mapId: string, event: Json): void {
     const current=this.currentPresence(mapId);
