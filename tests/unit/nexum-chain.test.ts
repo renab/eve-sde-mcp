@@ -52,6 +52,26 @@ describe("Nexum chain identifier planner",()=>{
     expect(plan.adoptions).toEqual([{systemId:"home",signatureId:"scan",targetSystemId:"b"}]);
     expect(plan.warnings).toEqual([]);
   });
+  it("distinguishes concurrent known-space exits without renumbering the first",()=>{
+    const parent={id:"a",name:"J123456",systemClass:"C3",customLabels:["t:A"]};
+    const exits=[{id:"ls1",name:"Lowsec one",systemClass:"LS",customLabels:[]},{id:"ls2",name:"Lowsec two",systemClass:"LS",customLabels:[]}];
+    const plan=planChain({systems:[systems[0],parent,...exits],connections:[
+      {id:"root",sourceId:"home",targetId:"a",connectionType:"standard",sourceSignatureId:"to-a"},
+      {id:"one",sourceId:"a",targetId:"ls1",connectionType:"standard",sourceSignatureId:"one"},
+      {id:"two",sourceId:"a",targetId:"ls2",connectionType:"standard",sourceSignatureId:"two"},
+    ]},resources({home:[{id:"to-a"}],a:[{id:"one"},{id:"two"}]}));
+    expect(plan.identifiers.get("ls1")).toBe("A.LS");
+    expect(plan.identifiers.get("ls2")).toBe("A.LS.1");
+    expect(validChainIdentifier("A.LS.1")).toBe(true);
+  });
+  it("allocates distinct scanner-side known-space reservations",()=>{
+    const parent={id:"a",name:"J123456",systemClass:"C3",customLabels:["t:A"]};
+    const plan=planChain({systems:[systems[0],parent],connections:[]},resources({a:[
+      {id:"ls1",sigType:"wormhole",sigId:"AAA-001",whLeadsTo:"LS"},
+      {id:"ls2",sigType:"wormhole",sigId:"BBB-002",whLeadsTo:"LS"},
+    ]}));
+    expect(plan.reservations.map(row=>row.identifier)).toEqual(["A.LS","A.LS.1"]);
+  });
   it("defers an ambiguous root and ignores broken/non-wormhole links",()=>{
     expect(planChain({systems:[{id:"a",isHome:true},{id:"b",isHome:true}],connections:[]},resources({})).warnings[0]).toMatch(/Multiple Home/);
     const plan=planChain({systems:[systems[0],systems[1]],connections:[{...connections[0],broken:true}]},resources({home:[{id:"h1"}],b:[{id:"b1"}]}));expect(plan.notes).toEqual([]);
@@ -59,7 +79,7 @@ describe("Nexum chain identifier planner",()=>{
   it("accepts text custom labels but never treats arbitrary labels as identifiers",()=>{
     expect(systemIdentifier({customLabels:["t:B.2.LS"]})).toBe("B.2.LS");
     expect(systemIdentifier({customLabels:["t:Scanner"]})).toBeUndefined();
-    expect(validChainIdentifier("B.0")).toBe(true);expect(validChainIdentifier("B.HS.1")).toBe(false);
+    expect(validChainIdentifier("B.0")).toBe(true);expect(validChainIdentifier("B.HS.1")).toBe(true);
   });
   it("renders complete Galaxy-owned bookmark notes from the mapped destination class",()=>{
     const plan=planChain({systems,connections},resources({home:[{id:"h1",sigId:"AAA-001"}],b:[{id:"b1",sigId:"BBB-002"},{id:"b2",sigId:"BBB-003"}],deep:[{id:"d1",sigId:"DDD-004"},{id:"d2",sigId:"DDD-005"}],exit:[{id:"e1",sigId:"EEE-006"}]}),"WH | {chain} | {sig} | {dest_type}");

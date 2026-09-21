@@ -24,7 +24,7 @@ export function formatChainNote(format:string, values:{chain:string;sig:string;d
   return format.replace(/\{chain\}|\{sig\}|\{dest_type\}/g,token=>token==="{chain}"?values.chain:token==="{sig}"?values.sig:values.destType).trim().replace(/\s+/g," ");
 }
 
-const identifier=/^[A-Z](?:\.\d+)*(?:\.(?:HS|LS|NS))?$/;
+const identifier=/^[A-Z](?:\.\d+)*(?:\.(?:HS|LS|NS)(?:\.\d+)?)?$/;
 export const validChainIdentifier=(value:unknown):value is string=>typeof value==="string"&&identifier.test(value);
 export function customLabelText(value:unknown):string|undefined {
   if(typeof value!=="string")return undefined;
@@ -43,6 +43,11 @@ const children=(state:Json,id:string)=>((state.connections??[]) as Json[]).filte
   .sort((a,b)=>String(a.connection.id).localeCompare(String(b.connection.id)));
 const nextDirect=(used:Set<string>)=>{for(let i=0;i<26;i++){const value=alpha(i);if(!used.has(value))return value;}return undefined;};
 const nextChild=(parent:string,used:Set<string>)=>{for(let i=1;i<10000;i++){const value=`${parent}.${i}`;if(!used.has(value))return value;}return undefined;};
+const nextKnownSpace=(parent:string,kind:string,used:Set<string>)=>{
+  const first=`${parent}.${kind}`;if(!used.has(first))return first;
+  for(let i=1;i<10000;i++){const value=`${first}.${i}`;if(!used.has(value))return value;}
+  return undefined;
+};
 
 export function planChain(state:Json, resources:(systemId:string)=>Json, noteFormat=defaultChainNoteFormat,
   persistedReservations:Array<{systemId:string;signatureId:string;identifier:string;destinationClass:string;targetSystemId?:string}>=[]):ChainPlan {
@@ -87,7 +92,7 @@ export function planChain(state:Json, resources:(systemId:string)=>Json, noteFor
       let value=identifiers.get(other)??reservation?.identifier;
       if(!value) {
         const terminal=knownSpace(destination);
-        if(terminal&&parentIdentifier)value=`${parentIdentifier}.${terminal}`;
+        if(terminal&&parentIdentifier)value=nextKnownSpace(parentIdentifier,terminal,used);
         else if(parent===root)value=nextDirect(used);
         else if(parentIdentifier)value=nextChild(parentIdentifier,used);
       }
@@ -128,7 +133,7 @@ export function planChain(state:Json, resources:(systemId:string)=>Json, noteFor
       let reservation=reservationBySignature.get(key);
       if(!reservation) {
         const destinationClass=String(signature.whLeadsTo).trim().toUpperCase();
-        const value=source===root?nextDirect(used):(knownSpace({systemClass:destinationClass})&&parentIdentifier?`${parentIdentifier}.${destinationClass}`:parentIdentifier?nextChild(parentIdentifier,used):undefined);
+        const value=source===root?nextDirect(used):(knownSpace({systemClass:destinationClass})&&parentIdentifier?nextKnownSpace(parentIdentifier,destinationClass,used):parentIdentifier?nextChild(parentIdentifier,used):undefined);
         if(!value){warnings.push(`Cannot reserve an identifier for scanner-side signature ${String(signature.sigId??signature.id)}: its source has no identifier`);continue;}
         reservation={systemId:source,signatureId:String(signature.id),identifier:value,destinationClass};
         reservationBySignature.set(key,reservation);reservations.push(reservation);used.add(value);
