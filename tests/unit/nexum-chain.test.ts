@@ -25,6 +25,10 @@ describe("Nexum chain identifier planner",()=>{
     const state={systems:[systems[0],systems[1],{id:"c",name:"Jx",systemClass:"C2",customLabels:["t:C"]}],connections:[connections[0],{id:"c1",sourceId:"home",targetId:"c",connectionType:"standard",sourceSignatureId:null,targetSignatureId:null}]};
     const plan=planChain(state,resources({}));expect(plan.identifiers.get("b")).toBe("B");expect(plan.identifiers.get("c")).toBe("C");
   });
+  it("uses one exact scanner-side destination match before Nexum links the signature to the connection",()=>{
+    const plan=planChain({systems:[systems[0],systems[1]],connections:[{id:"unlinked",sourceId:"home",targetId:"b",connectionType:"standard",sourceSignatureId:null,targetSignatureId:null}]},resources({home:[{id:"scan-side",sigType:"wormhole",sigId:"ABC-123",whLeadsTo:"J223207",notes:""}]}),"WH | {chain} | {sig} | {dest_type}");
+    expect(plan.notes).toEqual([{systemId:"home",signatureId:"scan-side",notes:"WH | B | ABC-123 | C2",connectionId:"unlinked"}]);
+  });
   it("defers an ambiguous root and ignores broken/non-wormhole links",()=>{
     expect(planChain({systems:[{id:"a",isHome:true},{id:"b",isHome:true}],connections:[]},resources({})).warnings[0]).toMatch(/Multiple Home/);
     const plan=planChain({systems:[systems[0],systems[1]],connections:[{...connections[0],broken:true}]},resources({home:[{id:"h1"}],b:[{id:"b1"}]}));expect(plan.notes).toEqual([]);

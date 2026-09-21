@@ -70,6 +70,18 @@ export function planChain(state:Json, resources:(systemId:string)=>Json, noteFor
     }
   }
   const labels=[...identifiers].map(([systemId,value])=>({systemId,identifier:value,serialized:`t:${value}`,actual:(byId.get(systemId)?.customLabels??[]).map(String)}));
+  const matchingScannerSignature=(from:string,to:string,reference:unknown):Json|undefined=>{
+    const signatures=resources(from).signatures?.items??[];
+    const linked=reference&&signatures.find((s:Json)=>String(s.id)===String(reference));
+    if(linked)return linked;
+    // Nexum can publish the scanner-side signature before it fills the
+    // connection's backing-signature ID. A single exact named destination is
+    // enough to attach the operational note; generic class matches are not.
+    const target=byId.get(to), targetName=typeof target?.name==="string"?target.name.trim().toLowerCase():"";
+    if(!targetName)return undefined;
+    const matches=signatures.filter((s:Json)=>s.sigType==="wormhole"&&typeof s.whLeadsTo==="string"&&s.whLeadsTo.trim().toLowerCase()===targetName);
+    return matches.length===1?matches[0]:undefined;
+  };
   const notes:ChainPlan["notes"]=[];
   for(const connection of (state.connections??[]) as Json[]) {
     if(!standard(connection))continue;
@@ -77,10 +89,9 @@ export function planChain(state:Json, resources:(systemId:string)=>Json, noteFor
       // Home deliberately has no visible system label, but a signature that
       // leads back to it needs the literal operational bookmark destination.
       const destination=identifiers.get(to) ?? (to===root ? "H" : undefined);
-      if(!destination||!signatureId)continue;
-      const signatures=resources(from).signatures?.items??[];
-      const signature=signatures.find((s:Json)=>String(s.id)===String(signatureId));
-      if(signature)notes.push({systemId:from,signatureId:String(signatureId),notes:formatChainNote(noteFormat,{chain:destination,sig:String(signature.sigId??""),destType:String(byId.get(to)?.systemClass??"")}),connectionId:String(connection.id)});
+      const signature=matchingScannerSignature(from,to,signatureId);
+      if(!destination||!signature)continue;
+      if(signature)notes.push({systemId:from,signatureId:String(signature.id),notes:formatChainNote(noteFormat,{chain:destination,sig:String(signature.sigId??""),destType:String(byId.get(to)?.systemClass??"")}),connectionId:String(connection.id)});
     }
   }
   return {identifiers,notes,labels,warnings};
