@@ -5,6 +5,7 @@ export type ChainPlan = {
   identifiers: Map<string,string>;
   notes: Array<{systemId:string; signatureId:string; notes:string; connectionId:string}>;
   labels: Array<{systemId:string; identifier:string; serialized:string; actual:string[]}>;
+  reservations: Array<{systemId:string; signatureId:string; identifier:string; destinationClass:string}>;
   warnings: string[];
 };
 
@@ -42,34 +43,17 @@ const children=(state:Json,id:string)=>((state.connections??[]) as Json[]).filte
 const nextDirect=(used:Set<string>)=>{for(let i=0;i<26;i++){const value=alpha(i);if(!used.has(value))return value;}return undefined;};
 const nextChild=(parent:string,used:Set<string>)=>{for(let i=1;i<10000;i++){const value=`${parent}.${i}`;if(!used.has(value))return value;}return undefined;};
 
-export function planChain(state:Json, resources:(systemId:string)=>Json, noteFormat=defaultChainNoteFormat):ChainPlan {
+export function planChain(state:Json, resources:(systemId:string)=>Json, noteFormat=defaultChainNoteFormat,
+  persistedReservations:Array<{systemId:string;signatureId:string;identifier:string;destinationClass:string}>=[]):ChainPlan {
   validateChainNoteFormat(noteFormat);
   const systems=(state.systems??[]) as Json[];
   const byId=new Map(systems.map(s=>[String(s.id),s]));
   const roots=systems.filter(s=>s.isHome);
   const warnings:string[]=[];
-  if(roots.length!==1)return {identifiers:new Map(),notes:[],labels:[],warnings:[roots.length?"Multiple Home systems; chain reconciliation deferred":"No Home system; chain reconciliation deferred"]};
+  if(roots.length!==1)return {identifiers:new Map(),notes:[],labels:[],reservations:[],warnings:[roots.length?"Multiple Home systems; chain reconciliation deferred":"No Home system; chain reconciliation deferred"]};
   const root=String(roots[0].id), identifiers=new Map<string,string>(), used=new Set<string>();
   for(const s of systems) { const value=systemIdentifier(s); if(value&&String(s.id)!==root&&!used.has(value)){identifiers.set(String(s.id),value);used.add(value);} }
-  const queue=[root], visited=new Set<string>([root]);
-  while(queue.length) {
-    const parent=queue.shift()!, parentIdentifier=identifiers.get(parent);
-    for(const {other} of children(state,parent)) {
-      if(visited.has(other))continue;
-      const destination=byId.get(other);if(!destination)continue;
-      let value=identifiers.get(other);
-      if(!value) {
-        const terminal=knownSpace(destination);
-        if(terminal&&parentIdentifier)value=`${parentIdentifier}.${terminal}`;
-        else if(parent===root)value=nextDirect(used);
-        else if(parentIdentifier)value=nextChild(parentIdentifier,used);
-      }
-      if(!value){warnings.push(`Cannot allocate an identifier for ${other}: its parent has no identifier`);continue;}
-      if(used.has(value)&&identifiers.get(other)!==value){warnings.push(`Duplicate chain identifier ${value}; leaving ${other} unresolved`);continue;}
-      identifiers.set(other,value);used.add(value);visited.add(other);queue.push(other);
-    }
-  }
-  const labels=[...identifiers].map(([systemId,value])=>({systemId,identifier:value,serialized:`t:${value}`,actual:(byId.get(systemId)?.customLabels??[]).map(String)}));
+  const reservationBySignature=new Map(persistedReservations.map(row=>[`${row.systemId}\0${row.signatureId}`,row]));
   const matchingScannerSignature=(from:string,to:string,reference:unknown):Json|undefined=>{
     const signatures=resources(from).signatures?.items??[];
     const linked=reference&&signatures.find((s:Json)=>String(s.id)===String(reference));
@@ -82,6 +66,30 @@ export function planChain(state:Json, resources:(systemId:string)=>Json, noteFor
     const matches=signatures.filter((s:Json)=>s.sigType==="wormhole"&&typeof s.whLeadsTo==="string"&&s.whLeadsTo.trim().toLowerCase()===targetName);
     return matches.length===1?matches[0]:undefined;
   };
+  const reservationFor=(from:string,to:string,reference:unknown)=>{
+    const signature=matchingScannerSignature(from,to,reference);
+    return signature?reservationBySignature.get(`${from}\0${String(signature.id)}`):undefined;
+  };
+  const queue=[root], visited=new Set<string>([root]);
+  while(queue.length) {
+    const parent=queue.shift()!, parentIdentifier=identifiers.get(parent);
+    for(const {other,connection} of children(state,parent)) {
+      if(visited.has(other))continue;
+      const destination=byId.get(other);if(!destination)continue;
+      const reference=String(connection.sourceId)===parent?connection.sourceSignatureId:connection.targetSignatureId;
+      let value=identifiers.get(other)??reservationFor(parent,other,reference)?.identifier;
+      if(!value) {
+        const terminal=knownSpace(destination);
+        if(terminal&&parentIdentifier)value=`${parentIdentifier}.${terminal}`;
+        else if(parent===root)value=nextDirect(used);
+        else if(parentIdentifier)value=nextChild(parentIdentifier,used);
+      }
+      if(!value){warnings.push(`Cannot allocate an identifier for ${other}: its parent has no identifier`);continue;}
+      if(used.has(value)&&identifiers.get(other)!==value){warnings.push(`Duplicate chain identifier ${value}; leaving ${other} unresolved`);continue;}
+      identifiers.set(other,value);used.add(value);visited.add(other);queue.push(other);
+    }
+  }
+  const labels=[...identifiers].map(([systemId,value])=>({systemId,identifier:value,serialized:`t:${value}`,actual:(byId.get(systemId)?.customLabels??[]).map(String)}));
   const notes:ChainPlan["notes"]=[];
   for(const connection of (state.connections??[]) as Json[]) {
     if(!standard(connection))continue;
@@ -94,5 +102,29 @@ export function planChain(state:Json, resources:(systemId:string)=>Json, noteFor
       if(signature)notes.push({systemId:from,signatureId:String(signature.id),notes:formatChainNote(noteFormat,{chain:destination,sig:String(signature.sigId??""),destType:String(byId.get(to)?.systemClass??"")}),connectionId:String(connection.id)});
     }
   }
-  return {identifiers,notes,labels,warnings};
+  const reservations:ChainPlan["reservations"]=[];
+  // Give scanners a usable bookmark before they jump or Nexum has created a
+  // target node.  The reservation is deliberately keyed by Nexum's stable
+  // signature ID, then consumed by the connection pass above when it appears.
+  for(const source of [root,...identifiers.keys()]) {
+    const parentIdentifier=identifiers.get(source);
+    const signatures=[...(resources(source).signatures?.items??[])].filter((s:Json)=>s.sigType==="wormhole"&&typeof s.whLeadsTo==="string"&&s.whLeadsTo.trim());
+    for(const signature of signatures.sort((a:Json,b:Json)=>String(a.createdAt??"").localeCompare(String(b.createdAt??""))||String(a.id).localeCompare(String(b.id)))) {
+      const key=`${source}\0${String(signature.id)}`;
+      // A mapped directional connection already has a more authoritative plan.
+      if((state.connections??[]).some((connection:Json)=>standard(connection)&&(
+        (String(connection.sourceId)===source&&matchingScannerSignature(source,String(connection.targetId),connection.sourceSignatureId)?.id===signature.id)||
+        (String(connection.targetId)===source&&matchingScannerSignature(source,String(connection.sourceId),connection.targetSignatureId)?.id===signature.id)))) continue;
+      let reservation=reservationBySignature.get(key);
+      if(!reservation) {
+        const destinationClass=String(signature.whLeadsTo).trim().toUpperCase();
+        const value=source===root?nextDirect(used):(knownSpace({systemClass:destinationClass})&&parentIdentifier?`${parentIdentifier}.${destinationClass}`:parentIdentifier?nextChild(parentIdentifier,used):undefined);
+        if(!value){warnings.push(`Cannot reserve an identifier for scanner-side signature ${String(signature.sigId??signature.id)}: its source has no identifier`);continue;}
+        reservation={systemId:source,signatureId:String(signature.id),identifier:value,destinationClass};
+        reservationBySignature.set(key,reservation);reservations.push(reservation);used.add(value);
+      }
+      notes.push({systemId:source,signatureId:String(signature.id),notes:formatChainNote(noteFormat,{chain:reservation.identifier,sig:String(signature.sigId??""),destType:reservation.destinationClass}),connectionId:`provisional:${String(signature.id)}`});
+    }
+  }
+  return {identifiers,notes,labels,reservations,warnings};
 }

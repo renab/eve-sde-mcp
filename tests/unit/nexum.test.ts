@@ -193,6 +193,14 @@ describe("audited event traffic",()=>{
 });
 
 describe("chain identifier reconciliation",()=>{
+  it("writes a scanner-side bookmark note before Nexum maps the destination",async()=>{
+    await enroll();up.calls=[];
+    await service.handleEvent(mapId,{type:"system.update",id:"s1",updates:{isHome:true}},store.credential(store.credentials()[0].id));
+    store.saveResource(mapId,"s1","signatures",[{id:"luh",sigId:"LUH-164",sigType:"wormhole",whLeadsTo:"C3",notes:""}]);
+    await service.reconcileChainNotes(mapId);
+    expect(up.patch).toHaveBeenCalledWith(base,key,`${endpoint}/systems/s1/signatures/luh`,{notes:"A"},expect.anything());
+    expect(store.chainReservations(mapId)).toEqual([{systemId:"s1",signatureId:"luh",identifier:"A",destinationClass:"C3"}]);
+  });
   it("takes its note template from the current append-first ledger record",async()=>{
     await enroll();const record=new Ledger(store.db).store({namespace:"nexum",kind:"chain_note_format",key:mapId,status:"active",source_type:"user_configuration",tags:["nexum"],payload:{format:"WH | {chain} | {sig} | {dest_type}"}});
     const diagnostic=service.chainDiagnostics(mapId);

@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import type Database from "better-sqlite3";
 
 export type Json = Record<string, any>;
+export type ChainReservation = {systemId:string;signatureId:string;identifier:string;destinationClass:string};
 export const resourceKinds = ["signatures", "anomalies", "structures"] as const;
 export type ResourceKind = typeof resourceKinds[number];
 export function canonicalMapId(base: string, id: string): string {
@@ -21,6 +22,13 @@ export class NexumStore {
       CREATE TABLE IF NOT EXISTS nexum_resources (map_id TEXT NOT NULL REFERENCES nexum_maps(id) ON DELETE CASCADE,
         system_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, fetched_at INTEGER NOT NULL,
         PRIMARY KEY(map_id,system_id,kind));
+      -- A scanner-side wormhole can exist before Nexum has created the target
+      -- system/connection.  Reserve its operational identifier so its bookmark
+      -- is useful immediately and the eventual mapped destination inherits it.
+      CREATE TABLE IF NOT EXISTS nexum_chain_reservations (map_id TEXT NOT NULL REFERENCES nexum_maps(id) ON DELETE CASCADE,
+        system_id TEXT NOT NULL, signature_id TEXT NOT NULL, identifier TEXT NOT NULL,
+        destination_class TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        PRIMARY KEY(map_id,system_id,signature_id), UNIQUE(map_id,identifier));
       CREATE TABLE IF NOT EXISTS nexum_presence (map_id TEXT NOT NULL, character_id TEXT NOT NULL,
         payload TEXT NOT NULL, observed_at INTEGER NOT NULL, PRIMARY KEY(map_id,character_id));
       CREATE TABLE IF NOT EXISTS nexum_presence_events (id INTEGER PRIMARY KEY, map_id TEXT NOT NULL,
@@ -72,6 +80,16 @@ export class NexumStore {
   }
   saveResource(map: string, system: string, kind: ResourceKind, data: Json[]): void {
     this.db.prepare("INSERT OR REPLACE INTO nexum_resources VALUES (?,?,?,?,?)").run(map,system,kind,JSON.stringify(data),this.now());
+  }
+  chainReservations(map: string): ChainReservation[] {
+    return (this.db.prepare("SELECT * FROM nexum_chain_reservations WHERE map_id=? ORDER BY created_at, signature_id").all(map) as any[])
+      .map(row=>({systemId:row.system_id,signatureId:row.signature_id,identifier:row.identifier,destinationClass:row.destination_class}));
+  }
+  saveChainReservations(map: string, rows: ChainReservation[]): void {
+    const insert=this.db.prepare(`INSERT OR IGNORE INTO nexum_chain_reservations
+      (map_id,system_id,signature_id,identifier,destination_class,created_at,updated_at) VALUES (?,?,?,?,?,?,?)`);
+    const now=this.now();
+    this.db.transaction(()=>{for(const row of rows)insert.run(map,row.systemId,row.signatureId,row.identifier,row.destinationClass,now,now);})();
   }
   presence(mapId: string, event: Json): void {
     const current=this.currentPresence(mapId);

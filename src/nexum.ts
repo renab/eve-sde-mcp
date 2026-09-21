@@ -260,7 +260,9 @@ export class NexumService {
     timer.unref();this.chainPending.set(id,timer);
   }
   private async reconcileChain(id:string,c:Json):Promise<void> {
-    const m=this.store.map(id), noteFormat=this.chainNoteFormat(id).format, plan=planChain(this.store.state(id),systemId=>this.store.resources(id,systemId),noteFormat);
+    const m=this.store.map(id), noteFormat=this.chainNoteFormat(id).format;
+    let plan=planChain(this.store.state(id),systemId=>this.store.resources(id,systemId),noteFormat,this.store.chainReservations(id));
+    if(plan.reservations.length){this.store.saveChainReservations(id,plan.reservations);plan=planChain(this.store.state(id),systemId=>this.store.resources(id,systemId),noteFormat,this.store.chainReservations(id));}
     // The stream credential can be read/events-only. Prefer any other healthy
     // credential with map access that has not already proven unable to write.
     const current=this.store.credential(c.id);
@@ -431,12 +433,13 @@ export class NexumService {
     return this.chainDiagnostics(m.id);
   });}
   chainDiagnostics(map:string):Json {
-    const m=this.store.map(map),state=this.store.state(m.id),config=this.chainNoteFormat(m.id),noteFormat=config.format,plan=planChain(state,systemId=>this.store.resources(m.id,systemId),noteFormat);
+    const m=this.store.map(map),state=this.store.state(m.id),config=this.chainNoteFormat(m.id),noteFormat=config.format,plan=planChain(state,systemId=>this.store.resources(m.id,systemId),noteFormat,this.store.chainReservations(m.id));
     const systems=(state.systems??[]) as Json[];
     return {map_id:m.id,map_name:state.name,write_capability:this.candidates(m.id).map(c=>({credential_id:c.id,status:c.chain_write_status??"unknown",error:c.chain_write_error??null})),
       note_format:noteFormat,note_format_record:config.record?{id:config.record.id,namespace:config.record.namespace,kind:config.record.kind,key:config.record.key,status:config.record.status,source_type:config.record.source_type,payload:config.record.payload}:null,note_format_error:config.error,nexum_bookmark_format_required:"{notes}",custom_label_write:"unavailable_by_external_api: Nexum API keys cannot PATCH systems/customLabels; browser-session system editing is required upstream.",
       systems:systems.map(s=>({system_id:s.id,name:s.name,is_home:!!s.isHome,actual_custom_labels:s.customLabels??[],effective_identifier:plan.identifiers.get(String(s.id))??null,desired_custom_label:plan.identifiers.has(String(s.id))?`t:${plan.identifiers.get(String(s.id))}`:null})),
-      signature_notes:plan.notes.map(n=>({connection_id:n.connectionId,system_id:n.systemId,signature_id:n.signatureId,desired_note:n.notes,actual_note:(this.store.resources(m.id,n.systemId).signatures.items as Json[]).find(s=>String(s.id)===n.signatureId)?.notes??null})),warnings:plan.warnings,freshness:this.freshness(m.id)};
+      signature_notes:plan.notes.map(n=>({connection_id:n.connectionId,system_id:n.systemId,signature_id:n.signatureId,desired_note:n.notes,actual_note:(this.store.resources(m.id,n.systemId).signatures.items as Json[]).find(s=>String(s.id)===n.signatureId)?.notes??null})),
+      provisional_reservations:[...this.store.chainReservations(m.id),...plan.reservations],warnings:plan.warnings,freshness:this.freshness(m.id)};
   }
   diagnostics():Json{return {credential_count:this.store.credentials().length,credentials:this.listCredentials(),maps:this.listMaps(),
     presence_history_rows:(this.store.db.prepare("SELECT count(*) n FROM nexum_presence_events").get() as any).n};}
