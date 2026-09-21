@@ -80,6 +80,7 @@ export function planChain(state:Json, resources:(systemId:string)=>Json, noteFor
     return signature?reservationBySignature.get(`${from}\0${String(signature.id)}`):undefined;
   };
   const adoptions:ChainPlan["adoptions"]=[];
+  const parents=new Map<string,string>();
   const queue=[root], visited=new Set<string>([root]);
   while(queue.length) {
     const parent=queue.shift()!, parentIdentifier=identifiers.get(parent);
@@ -98,7 +99,7 @@ export function planChain(state:Json, resources:(systemId:string)=>Json, noteFor
       }
       if(!value){warnings.push(`Cannot allocate an identifier for ${other}: its parent has no identifier`);continue;}
       if(used.has(value)&&identifiers.get(other)!==value&&reservation?.identifier!==value){warnings.push(`Duplicate chain identifier ${value}; leaving ${other} unresolved`);continue;}
-      identifiers.set(other,value);used.add(value);visited.add(other);queue.push(other);
+      identifiers.set(other,value);used.add(value);parents.set(other,parent);visited.add(other);queue.push(other);
     }
   }
   const labels=[...identifiers].map(([systemId,value])=>({systemId,identifier:value,serialized:`t:${value}`,actual:(byId.get(systemId)?.customLabels??[]).map(String)}));
@@ -106,14 +107,14 @@ export function planChain(state:Json, resources:(systemId:string)=>Json, noteFor
   for(const connection of (state.connections??[]) as Json[]) {
     if(!standard(connection))continue;
     for(const [from,to,signatureId] of [[String(connection.sourceId),String(connection.targetId),connection.sourceSignatureId],[String(connection.targetId),String(connection.sourceId),connection.targetSignatureId]] as const) {
-      // Home deliberately has no visible system label.  Its inbound bookmarks
-      // sort first in EVE while retaining the literal Home destination marker.
+      // A direction that moves toward Home in the rooted chain sorts first in
+      // EVE, while retaining the literal destination chain marker.
       const destination=identifiers.get(to) ?? (to===root ? "H" : undefined);
       const signature=matchingScannerSignature(from,to,signatureId);
       if(!destination||!signature)continue;
       if(signature){
         const formatted=formatChainNote(noteFormat,{chain:destination,sig:String(signature.sigId??""),destType:String(byId.get(to)?.systemClass??"")});
-        notes.push({systemId:from,signatureId:String(signature.id),notes:to===root?`* ${formatted}`:formatted,connectionId:String(connection.id)});
+        notes.push({systemId:from,signatureId:String(signature.id),notes:parents.get(from)===to?`* ${formatted}`:formatted,connectionId:String(connection.id)});
       }
     }
   }
