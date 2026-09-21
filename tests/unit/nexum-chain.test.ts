@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatChainNote, planChain, systemIdentifier, validateChainNoteFormat, validChainIdentifier } from "../../src/nexum-chain.js";
+import { defaultChainNoteFormat, formatChainNote, planChain, systemIdentifier, validateChainNoteFormat, validChainIdentifier } from "../../src/nexum-chain.js";
 
 const resources=(items:Record<string,any[]>)=>(id:string)=>({signatures:{items:items[id]??[]}});
 const systems=[
@@ -33,6 +33,18 @@ describe("Nexum chain identifier planner",()=>{
     const plan=planChain({systems:[systems[0]],connections:[]},resources({home:[{id:"luh",sigId:"LUH-164",sigType:"wormhole",whLeadsTo:"C3",notes:""}]}),"WH | {chain} | {sig} | {dest_type}");
     expect(plan.reservations).toEqual([{systemId:"home",signatureId:"luh",identifier:"A",destinationClass:"C3"}]);
     expect(plan.notes).toEqual([{systemId:"home",signatureId:"luh",notes:"WH | A | LUH-164 | C3",connectionId:"provisional:luh"}]);
+  });
+  it("does not reuse an identifier already reserved by another scanner-side wormhole",()=>{
+    const plan=planChain({systems:[systems[0]],connections:[]},resources({home:[
+      {id:"a",sigId:"AAA-001",sigType:"wormhole",whLeadsTo:"C3"},
+      {id:"b",sigId:"BBB-002",sigType:"wormhole",whLeadsTo:"C1-C3"},
+      {id:"c",sigId:"CCC-003",sigType:"wormhole",whLeadsTo:"LS"},
+    ]}),defaultChainNoteFormat,[
+      {systemId:"home",signatureId:"a",identifier:"A",destinationClass:"C3"},
+      {systemId:"home",signatureId:"b",identifier:"B",destinationClass:"C1-C3"},
+    ]);
+    expect(plan.reservations).toEqual([{systemId:"home",signatureId:"c",identifier:"C",destinationClass:"LS"}]);
+    expect(plan.notes.find(note=>note.signatureId==="c")?.notes).toBe("C");
   });
   it("defers an ambiguous root and ignores broken/non-wormhole links",()=>{
     expect(planChain({systems:[{id:"a",isHome:true},{id:"b",isHome:true}],connections:[]},resources({})).warnings[0]).toMatch(/Multiple Home/);

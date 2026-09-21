@@ -54,6 +54,9 @@ export function planChain(state:Json, resources:(systemId:string)=>Json, noteFor
   const root=String(roots[0].id), identifiers=new Map<string,string>(), used=new Set<string>();
   for(const s of systems) { const value=systemIdentifier(s); if(value&&String(s.id)!==root&&!used.has(value)){identifiers.set(String(s.id),value);used.add(value);} }
   const reservationBySignature=new Map(persistedReservations.map(row=>[`${row.systemId}\0${row.signatureId}`,row]));
+  // Reservations are already-visible branch identities.  They must consume
+  // allocator space even before their destination system exists.
+  for(const reservation of persistedReservations)used.add(reservation.identifier);
   const matchingScannerSignature=(from:string,to:string,reference:unknown):Json|undefined=>{
     const signatures=resources(from).signatures?.items??[];
     const linked=reference&&signatures.find((s:Json)=>String(s.id)===String(reference));
