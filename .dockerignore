@@ -1,0 +1,17 @@
+.git
+.github
+node_modules
+dist
+.env
+.env.*
+*.db
+*.db-wal
+*.db-shm
+*.gz
+galaxy-secret.key
+artifacts
+deploy
+docs
+scripts
+tests
+*.md

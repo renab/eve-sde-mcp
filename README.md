@@ -281,6 +281,15 @@ Git. Leave the origin bound to `127.0.0.1`; Cloudflare Tunnel does not require a
 public firewall port. Do not publish the origin directly: Cloudflare Access is
 the authentication boundary for this deployment.
 
+## Container deployment
+
+GitHub Actions builds the HTTP bridge into a **private** container image and
+publishes it as `ghcr.io/renab/galaxy:<full commit SHA>` (plus a human-friendly
+`main` pointer). The image and GHCR package must remain private; k3s pulls the
+image through an `imagePullSecret`, and the Kubernetes manifests live in
+`homelab-infra`. See
+[container build, publishing, runtime and k3s notes](docs/container-deployment.md).
+
 ## ESI Authentication
 
 To use the live character data tools, you need an EVE SSO application:
