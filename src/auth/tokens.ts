@@ -1,14 +1,8 @@
-import crypto from "crypto";
-import os from "os";
 import path from "path";
 import Database from "better-sqlite3";
 import { getSdeDir } from "../database.js";
 import type { OAuthTokens, CharacterInfo } from "./oauth.js";
-
-const ALGORITHM = "aes-256-gcm";
-const KEY_LENGTH = 32;
-const IV_LENGTH = 16;
-const SALT_LENGTH = 32;
+import { AUTH_KEY_FILE_NAME, decryptValue, encryptValue, resolveAuthEncryptionKey } from "./auth-key.js";
 
 export interface StoredCharacter {
   characterId: number;
@@ -26,74 +20,70 @@ function getAuthDb(): Database.Database {
   if (authDb) return authDb;
 
   const dbPath = path.join(getSdeDir(), "auth.db");
-  authDb = new Database(dbPath);
-  authDb.pragma("journal_mode = WAL");
 
-  authDb.exec(`
-    CREATE TABLE IF NOT EXISTS auth_tokens (
-      character_id INTEGER PRIMARY KEY,
-      character_name TEXT NOT NULL,
-      access_token TEXT NOT NULL,
-      refresh_token TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      scopes TEXT NOT NULL,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS config (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS loyalty_point_balances (
-      character_id INTEGER NOT NULL,
-      corporation_id INTEGER NOT NULL,
-      loyalty_points INTEGER NOT NULL,
-      observed_at TEXT NOT NULL,
-      PRIMARY KEY (character_id, corporation_id)
-    );
-    CREATE TABLE IF NOT EXISTS loyalty_point_snapshots (
-      character_id INTEGER PRIMARY KEY,
-      observed_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS loyalty_point_activity (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      character_id INTEGER NOT NULL,
-      corporation_id INTEGER NOT NULL,
-      delta INTEGER NOT NULL,
-      previous_balance INTEGER NOT NULL,
-      current_balance INTEGER NOT NULL,
-      observed_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_loyalty_activity_character_time
-      ON loyalty_point_activity (character_id, observed_at DESC);
-  `);
-
+  // Resolve (and, for legacy installs, migrate to) the persistent auth key
+  // before the database handle is considered usable. If resolution fails the
+  // freshly opened handle is closed so the next call re-runs the protocol.
+  let db = new Database(dbPath);
+  try {
+    db.pragma("journal_mode = WAL");
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS auth_tokens (
+        character_id INTEGER PRIMARY KEY,
+        character_name TEXT NOT NULL,
+        access_token TEXT NOT NULL,
+        refresh_token TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        scopes TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS config (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS loyalty_point_balances (
+        character_id INTEGER NOT NULL,
+        corporation_id INTEGER NOT NULL,
+        loyalty_points INTEGER NOT NULL,
+        observed_at TEXT NOT NULL,
+        PRIMARY KEY (character_id, corporation_id)
+      );
+      CREATE TABLE IF NOT EXISTS loyalty_point_snapshots (
+        character_id INTEGER PRIMARY KEY,
+        observed_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS loyalty_point_activity (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        character_id INTEGER NOT NULL,
+        corporation_id INTEGER NOT NULL,
+        delta INTEGER NOT NULL,
+        previous_balance INTEGER NOT NULL,
+        current_balance INTEGER NOT NULL,
+        observed_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_loyalty_activity_character_time
+        ON loyalty_point_activity (character_id, observed_at DESC);
+    `);
+    encryptionKey = resolveAuthEncryptionKey(db, path.join(getSdeDir(), AUTH_KEY_FILE_NAME));
+  } catch (err) {
+    db.close();
+    throw err;
+  }
+  authDb = db;
   return authDb;
 }
 
 function getKey(): Buffer {
-  if (encryptionKey) return encryptionKey;
-  const passphrase = `${os.hostname()}-${os.platform()}-${os.arch()}`;
-  const salt = crypto.createHash("sha256").update(os.hostname()).digest().subarray(0, SALT_LENGTH);
-  encryptionKey = crypto.pbkdf2Sync(passphrase, salt, 100000, KEY_LENGTH, "sha256");
+  if (!encryptionKey) throw new Error("Auth encryption key not initialized; open the auth database first");
   return encryptionKey;
 }
 
 function encrypt(plaintext: string): string {
-  const iv = crypto.randomBytes(IV_LENGTH);
-  const cipher = crypto.createCipheriv(ALGORITHM, getKey(), iv);
-  const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
-  const authTag = cipher.getAuthTag();
-  return `${iv.toString("base64")}:${authTag.toString("base64")}:${encrypted.toString("base64")}`;
+  return encryptValue(getKey(), plaintext);
 }
 
 function decrypt(ciphertext: string): string {
-  const [ivB64, tagB64, encB64] = ciphertext.split(":");
-  const iv = Buffer.from(ivB64, "base64");
-  const authTag = Buffer.from(tagB64, "base64");
-  const encrypted = Buffer.from(encB64, "base64");
-  const decipher = crypto.createDecipheriv(ALGORITHM, getKey(), iv);
-  decipher.setAuthTag(authTag);
-  return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
+  return decryptValue(getKey(), ciphertext);
 }
 
 export function storeTokens(tokens: OAuthTokens, character: CharacterInfo): void {
@@ -315,4 +305,7 @@ export function closeAuthDb(): void {
     authDb.close();
     authDb = null;
   }
+  // Clear the cached key so a re-open re-resolves it (and re-runs any pending
+  // migration) against whatever is currently on disk.
+  encryptionKey = null;
 }

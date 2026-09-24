@@ -306,7 +306,7 @@ To use the live character data tools, you need an EVE SSO application:
 4. Open that URL on the Windows machine running the MCP within five minutes, approve the scopes, and select a character. EVE redirects the local browser to `http://localhost:8085/callback` and the MCP stores the tokens in the background.
 5. Use `esi_status` to confirm that authentication succeeded.
 
-Tokens are encrypted at rest (AES-256-GCM) and stored in `~/.eve-sde/auth.db`. Scopes include skill reading, wallet, market, industry, planetary industry, character and corporation assets, contracts, fittings (read+write), and autopilot waypoint updates. Corporation assets require the authenticated character to have the Director role. ESI exposes planetary industry and skill queues as read-only, so neither can be modified through this MCP. Multi-character support is built in.
+Tokens are encrypted at rest (AES-256-GCM, key in `~/.eve-sde/auth-secret.key`) and stored in `~/.eve-sde/auth.db`. Scopes include skill reading, wallet, market, industry, planetary industry, character and corporation assets, contracts, fittings (read+write), and autopilot waypoint updates. Corporation assets require the authenticated character to have the Director role. ESI exposes planetary industry and skill queues as read-only, so neither can be modified through this MCP. Multi-character support is built in.
 
 ## Nexum live wormhole maps
 

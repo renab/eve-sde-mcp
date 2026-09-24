@@ -95,14 +95,18 @@ Kubernetes set `fsGroup: 1000` on the pod):
 |------|---------|-------|
 | `eve.db` | SDE static data (~476 MB) | Replaceable; auto-downloaded from Fuzzwork on first start if missing — the first container start blocks on this download until `/health` responds |
 | `metadata.json` | SDE download metadata | Written by the downloader |
-| `auth.db` | Encrypted EVE SSO tokens | Sensitive. Encryption key is derived from the pod **hostname** (`src/auth/tokens.ts`), so tokens only decrypt under a stable pod identity — deploy a single-replica StatefulSet (see below); after any hostname change the tokens no longer decrypt and characters must be re-enrolled via `esi_login` |
+| `auth.db` | Encrypted EVE SSO tokens | Sensitive. Encrypted with the persistent random key in `auth-secret.key` on this volume (a legacy hostname-derived install is migrated to it automatically on first start), so tokens decrypt on any host as long as the volume — key file included — is preserved |
 | `config.json` | EVE SSO `clientId` | Sensitive; create it or enroll via `esi_login` |
 | `galaxy-state.db` | Permanent ledger, ESI cache, keep-warm subscriptions, Nexum data | Sensitive; back this up |
 | `galaxy-secret.key` | Random key encrypting stored Nexum credentials | Sensitive; lives next to the state DB |
+| `auth-secret.key` | Random 32-byte key encrypting the EVE SSO tokens in `auth.db` | Sensitive; lives next to `auth.db`; losing it makes stored characters undecryptable until they are re-enrolled via `esi_login` |
 
 ### Secrets
 
 - EVE SSO `clientId` (in `config.json`, or supplied per `esi_login` call).
+- The auth encryption key in `auth-secret.key` (random 32 bytes on the state
+  volume; required to decrypt `auth.db`; created automatically on first use —
+  legacy hostname-derived installs are migrated to it on first start).
 - Character tokens in `auth.db` (encrypted at rest); `esi_login` requires a
   human to open the returned URL, and the OAuth callback listens on
   `http://localhost:8085` *inside the container* — use `kubectl port-forward`
@@ -140,25 +144,24 @@ Kubernetes set `fsGroup: 1000` on the pod):
 
 ### Why a StatefulSet, not a Deployment
 
-The character tokens in `auth.db` are encrypted with a key derived from
-`os.hostname()` (see `src/auth/tokens.ts` — platform and arch are constants on
-the image, so the hostname is the only variable). A Deployment does not
-preserve pod identity: every recreation — node drain, `kubectl rollout`, crash,
-eviction — produces a new pod name and therefore a new hostname, which changes
-the encryption key and makes every stored character undecryptable until it is
-re-enrolled via `esi_login`.
+The character tokens in `auth.db` are encrypted with a persistent random key
+stored in `auth-secret.key` on the state volume (see `src/auth/auth-key.ts`;
+legacy hostname-derived installs are migrated to this key automatically on
+first start). Token decryption therefore no longer depends on the pod hostname
+— what matters is that the volume, key file included, stays attached to the
+pod and is never re-provisioned.
 
-A single-replica StatefulSet keeps the ordinal pod name (`<name>-0`) — and thus
-the hostname — stable across recreation, without any change to the Galaxy
-application. Keep the StatefulSet's resource name stable for the same reason:
-renaming it recreates the pod names and invalidates the tokens. A Deployment
-with a pinned `spec.hostname` would also pin the hostname but is not
-recommended: with a single `ReadWriteOnce` volume, a rolling update's surge pod
-cannot attach the volume while the old pod still runs.
+A single-replica StatefulSet gives stable pod identity and a stable
+`ReadWriteOnce` attachment for that volume. A Deployment with a pinned
+`spec.hostname` is not recommended: with a single `ReadWriteOnce` volume, a
+rolling update's surge pod cannot attach the volume while the old pod still
+runs. If the volume is lost or replaced, `auth.db` and `galaxy-secret.key`/
+`auth-secret.key` are lost with it — tokens and Nexum credentials become
+undecryptable until characters are re-enrolled via `esi_login`.
 
-Do not scale beyond one replica: each pod derives a different key (different
-hostnames), the `auth.db` and `galaxy-state.db` SQLite files are single-writer,
-and the `ReadWriteOnce` volume attaches to one pod only.
+Do not scale beyond one replica: the `auth.db` and `galaxy-state.db` SQLite
+files are single-writer, and the `ReadWriteOnce` volume attaches to one pod
+only.
 
 ### k3s pull (public image)
 
