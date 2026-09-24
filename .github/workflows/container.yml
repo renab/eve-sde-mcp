@@ -1,10 +1,14 @@
-# Builds and publishes the private Galaxy container image to GHCR.
+# Builds and publishes the Galaxy container image to GHCR.
 #
-# Privacy: the image is published to the private GHCR package
-# ghcr.io/renab/galaxy. This workflow never changes package visibility and
-# never publishes anything public. The package must remain Private on the
-# renab account (GitHub > your profile > Packages > galaxy > Visibility:
-# Private); a GITHUB_TOKEN push does not modify that setting.
+# Visibility: the repository is public and the ghcr.io/renab/galaxy package
+# is public — anyone can pull the image without authentication. That is safe
+# by construction: the image contains only the base image, the compiled
+# dist/, production node_modules, and an empty /home/node/.eve-sde state
+# directory. No secrets, no PII, no data (verified by pulling the published
+# image and scanning its full filesystem). All sensitive state — SDE
+# database, auth tokens, ledger, Nexum keys — lives on the mounted state
+# volume, never in the image. Keep it that way: do not add secrets,
+# credentials, or personal data to the Dockerfile or to any path it copies.
 #
 # Deployment identifier: the immutable full commit SHA tag. The additional
 # `main` tag is a human-friendly pointer only and must not be used as the

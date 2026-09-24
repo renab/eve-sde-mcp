@@ -283,11 +283,14 @@ the authentication boundary for this deployment.
 
 ## Container deployment
 
-GitHub Actions builds the HTTP bridge into a **private** container image and
-publishes it as `ghcr.io/renab/galaxy:<full commit SHA>` (plus a human-friendly
-`main` pointer). The image and GHCR package must remain private; k3s pulls the
-image through an `imagePullSecret`, and the Kubernetes manifests live in
-`homelab-infra`. See
+GitHub Actions builds the HTTP bridge into a container image and publishes it
+as `ghcr.io/renab/galaxy:<full commit SHA>` (plus a human-friendly `main`
+pointer). The repository — and therefore the image — is **public**: anyone
+can pull it without authentication. That is safe by construction: the image
+contains only the compiled app and production dependencies, no secrets and no
+data; all runtime state (SDE database, auth tokens, ledger) comes from the
+mounted volume. k3s pulls the image anonymously, and the Kubernetes manifests
+live in `homelab-infra`. See
 [container build, publishing, runtime and k3s notes](docs/container-deployment.md).
 
 ## ESI Authentication

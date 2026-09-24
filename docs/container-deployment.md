@@ -1,12 +1,13 @@
 # Container deployment (GHCR → k3s)
 
-Galaxy is built as a private container image by GitHub Actions and published to
-the private GHCR package `ghcr.io/renab/galaxy`. Kubernetes deployment
+Galaxy is built as a container image by GitHub Actions and published to the
+public GHCR package `ghcr.io/renab/galaxy` (the repository is public and
+anyone can pull the image without authentication). Kubernetes deployment
 configuration is owned by the `homelab-infra` repository and Argo CD; this
 repository never deploys to the cluster and does not contain cluster manifests.
 
-Flow: public Galaxy source → GitHub-hosted Actions → private GHCR image →
-Argo-managed k3s StatefulSet pulling via an `imagePullSecret`.
+Flow: public Galaxy source → GitHub-hosted Actions → public GHCR image →
+Argo-managed k3s StatefulSet pulling the image anonymously.
 
 ## Image
 
@@ -34,17 +35,24 @@ Argo-managed k3s StatefulSet pulling via an `imagePullSecret`.
   Workflow permissions are minimal: `contents: read`, `packages: write`.
   The token is only passed to the login action input and never echoed.
 
-### Privacy (must stay private)
+### Public image (safe by construction)
 
-- All images and the `galaxy` GHCR package must remain **private**. The
-  workflow never sets or changes package visibility and publishes nothing
-  public.
-- GHCR package visibility is not controllable from the workflow. If the
-  package does not yet exist, the first `GITHUB_TOKEN` push creates it with
-  the account default (private for user accounts). Verify and keep the
-  setting: **GitHub → your profile avatar → *Your profile* → *Packages*
-  (or `github.com/renab/packages/container/galaxy`) → `galaxy` → *Visibility*
-  dropdown → keep it on *Private***. Do not switch it to public.
+- The repository and the `galaxy` GHCR package are **public**:
+  `docker pull ghcr.io/renab/galaxy:<tag>` works without authentication
+  (verified against the published `main` tag).
+- That is acceptable because the image contains no secrets and no data. The
+  published image's full filesystem was audited after a pull: base
+  `node:20-alpine`, compiled `dist/`, production `node_modules`,
+  `package.json`, and an empty `/home/node/.eve-sde`. No `.env` files, keys,
+  tokens, databases, git metadata, or local build paths in source maps.
+- All sensitive state (SDE `eve.db`, `auth.db`, `config.json`,
+  `galaxy-state.db`, `galaxy-secret.key`) lives on the mounted state volume
+  (see below), never in the image.
+- Keep it that way. The build context is the whole repository, and only the
+  paths the Dockerfile copies end up in the image (currently `package.json`,
+  `tsconfig.json`, and `src/`). Adding a secret, credential, or personal data
+  to the Dockerfile or to any copied path would expose it publicly. Do not
+  bake secrets into the image or pass them as build args/env.
 - k3s has no in-cluster registry; it pulls directly from GHCR.
 
 ### Image naming and tags
@@ -122,7 +130,7 @@ Kubernetes set `fsGroup: 1000` on the pod):
 - A Kubernetes **StatefulSet** (not a Deployment) in `homelab-infra` managed
   by Argo CD, with:
   - image `ghcr.io/renab/galaxy:<full commit SHA>` (pinned per release),
-  - `imagePullSecrets` referencing a GHCR pull secret (below),
+  - `imagePullSecrets` optional while the package is public (below),
   - one volume (e.g. a PVC with a stable name) mounted at `/home/node/.eve-sde`,
   - `securityContext.fsGroup: 1000`,
   - liveness/readiness probes on `GET /health` with a long initial delay,
@@ -152,10 +160,13 @@ Do not scale beyond one replica: each pod derives a different key (different
 hostnames), the `auth.db` and `galaxy-state.db` SQLite files are single-writer,
 and the `ReadWriteOnce` volume attaches to one pod only.
 
-### k3s authentication to private GHCR
+### k3s pull (public image)
 
-Create a pull secret on the cluster (a long-lived token is required here; the
-CI `GITHUB_TOKEN` cannot be used in-cluster):
+The package is public, so k3s pulls the image without credentials — no
+`imagePullSecrets` is required in the pod spec. If a pull secret is still
+preferred (uniformity, or in case the package is ever made private), create
+one on the cluster (a long-lived token is required here; the CI
+`GITHUB_TOKEN` cannot be used in-cluster):
 
 ```bash
 kubectl -n <namespace> create secret docker-registry ghcr-galaxy-pull \
@@ -165,6 +176,5 @@ kubectl -n <namespace> create secret docker-registry ghcr-galaxy-pull \
 ```
 
 The token needs package read access only — a classic PAT with `read:packages`,
-or a fine-grained PAT with *Read packages* on `galaxy`. Reference the secret
-in the pod spec's `imagePullSecrets`. The package visibility itself must stay
-Private on GitHub.
+or a fine-grained PAT with *Read packages* on `galaxy` — and is referenced
+via the pod spec's `imagePullSecrets`.
