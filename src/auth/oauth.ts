@@ -57,6 +57,48 @@ export interface CharacterInfo {
   scopes: string;
 }
 
+export interface CallbackConfig {
+  /** Full callback URL sent to EVE SSO as redirect_uri (auth + token exchange). */
+  url: string;
+  /** Path portion of the callback URL (route on the main HTTP server when configured). */
+  path: string;
+  /** True when the URL comes from EVE_SSO_CALLBACK_URL; false for the local default. */
+  explicit: boolean;
+}
+
+/**
+ * Resolve the OAuth callback target.
+ *
+ * - `EVE_SSO_CALLBACK_URL` (e.g. `https://galaxy.example.net/callback`): the
+ *   publicly reachable URL registered with EVE SSO. The callback is served by
+ *   the main HTTP server on this path, so no extra port is exposed — required
+ *   for deployments behind k3s/Traefik or any public HTTPS ingress.
+ * - Unset (local development): `http://localhost:8085/callback`, served by a
+ *   dedicated in-process listener, preserving the original behavior.
+ */
+export function getCallbackConfig(): CallbackConfig {
+  const raw = (process.env.EVE_SSO_CALLBACK_URL ?? "").trim();
+  if (!raw) {
+    return { url: `http://localhost:${CALLBACK_PORT}${CALLBACK_PATH}`, path: CALLBACK_PATH, explicit: false };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`EVE_SSO_CALLBACK_URL must be an absolute URL, got: ${raw}`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`EVE_SSO_CALLBACK_URL must use http(s), got: ${parsed.protocol}`);
+  }
+  if (parsed.pathname === "/") {
+    throw new Error(`EVE_SSO_CALLBACK_URL must include a callback path (e.g. ${raw}/callback)`);
+  }
+  parsed.search = "";
+  parsed.hash = "";
+  return { url: parsed.toString(), path: parsed.pathname, explicit: true };
+}
+
 export interface AuthResult {
   tokens: OAuthTokens;
   character: CharacterInfo;
@@ -72,117 +114,176 @@ function generatePKCE(): { verifier: string; challenge: string } {
   return { verifier, challenge };
 }
 
-let pendingFlow: {
+interface PendingFlow {
   verifier: string;
   state: string;
   clientId: string;
+  redirectUri: string;
+  scopes: string;
   resolve: (result: AuthResult) => void;
   reject: (err: Error) => void;
-  server: http.Server;
+  server: http.Server | null;
   timeout: ReturnType<typeof setTimeout>;
-} | null = null;
+}
 
+let pendingFlow: PendingFlow | null = null;
 let pendingPromise: Promise<AuthResult> | null = null;
 
-export function startLoginFlow(clientId: string, scopes?: string[]): { authUrl: string } {
-  if (pendingFlow) {
-    clearTimeout(pendingFlow.timeout);
-    pendingFlow.server.close();
-    pendingFlow.reject(new Error("Login flow superseded by new login attempt"));
-    pendingFlow = null;
-    pendingPromise = null;
-  }
-
-  const { verifier, challenge } = generatePKCE();
-  const state = crypto.randomBytes(16).toString("hex");
-  const redirectUri = `http://localhost:${CALLBACK_PORT}${CALLBACK_PATH}`;
-  const selectedScopes = [...new Set(scopes ?? DEFAULT_SCOPES)];
-
+export function buildAuthorizeUrl(
+  clientId: string,
+  redirectUri: string,
+  scopes: string[],
+  challenge: string,
+  state: string
+): string {
   const params = new URLSearchParams({
     response_type: "code",
     redirect_uri: redirectUri,
     client_id: clientId,
-    scope: selectedScopes.join(" "),
+    scope: scopes.join(" "),
     code_challenge: challenge,
     code_challenge_method: "S256",
     state,
   });
+  return `${EVE_AUTHORIZE_URL}?${params.toString()}`;
+}
 
-  const authUrl = `${EVE_AUTHORIZE_URL}?${params.toString()}`;
+/**
+ * Handle an incoming OAuth callback (EVE SSO redirect). Shared by the
+ * dedicated local listener (default) and the main HTTP server route
+ * (EVE_SSO_CALLBACK_URL). Validates state, exchanges the code, and settles
+ * the pending login flow.
+ */
+export function handleOAuthCallback(rawUrl: string, respond: (status: number, html: string) => void): void {
+  const flow = pendingFlow;
+  if (!flow) {
+    respond(
+      400,
+      "<h1>Authentication Failed</h1><p>No login in progress. Start a login with esi_login first.</p>"
+    );
+    return;
+  }
+
+  let url: URL;
+  try {
+    url = new URL(rawUrl, flow.redirectUri);
+  } catch {
+    respond(400, "<h1>Authentication Failed</h1><p>Malformed callback request</p>");
+    return;
+  }
+
+  const code = url.searchParams.get("code");
+  const returnedState = url.searchParams.get("state");
+  const error = url.searchParams.get("error");
+
+  if (error) {
+    respond(400, `<h1>Authentication Failed</h1><p>${escapeHtml(error)}</p>`);
+    flow.reject(new Error(`OAuth error: ${error}`));
+    cleanupFlow();
+    return;
+  }
+
+  if (returnedState !== flow.state) {
+    respond(400, "<h1>Authentication Failed</h1><p>Invalid state parameter</p>");
+    flow.reject(new Error("Invalid state — possible CSRF"));
+    cleanupFlow();
+    return;
+  }
+
+  if (!code) {
+    respond(400, "<h1>Authentication Failed</h1><p>No authorization code</p>");
+    flow.reject(new Error("No authorization code received"));
+    cleanupFlow();
+    return;
+  }
+
+  void (async () => {
+    try {
+      const tokens = await exchangeCode(code, flow.clientId, flow.redirectUri, flow.verifier);
+      const character = decodeCharacterFromJwt(tokens.accessToken);
+      respond(
+        200,
+        `<h1>Authentication Successful!</h1><p>Logged in as <strong>${escapeHtml(character.characterName)}</strong>. You can close this tab.</p>`
+      );
+      flow.resolve({
+        tokens,
+        character: { ...character, scopes: flow.scopes },
+      });
+    } catch (err) {
+      respond(500, "<h1>Authentication Failed</h1><p>Token exchange error</p>");
+      flow.reject(err instanceof Error ? err : new Error(String(err)));
+    } finally {
+      cleanupFlow();
+    }
+  })();
+}
+
+function cleanupFlow(): void {
+  const flow = pendingFlow;
+  if (!flow) return;
+  clearTimeout(flow.timeout);
+  flow.server?.close();
+  pendingFlow = null;
+  pendingPromise = null;
+}
+
+export function startLoginFlow(clientId: string, scopes?: string[]): { authUrl: string } {
+  if (pendingFlow) {
+    const previous = pendingFlow;
+    cleanupFlow();
+    previous.reject(new Error("Login flow superseded by new login attempt"));
+  }
+
+  const callback = getCallbackConfig();
+  const { verifier, challenge } = generatePKCE();
+  const state = crypto.randomBytes(16).toString("hex");
+  const redirectUri = callback.url;
+  const selectedScopes = [...new Set(scopes ?? DEFAULT_SCOPES)];
+
+  const authUrl = buildAuthorizeUrl(clientId, redirectUri, selectedScopes, challenge, state);
 
   pendingPromise = new Promise<AuthResult>((resolve, reject) => {
-    const server = http.createServer(async (req, res) => {
-      if (!req.url?.startsWith(CALLBACK_PATH)) {
+    const timeout = setTimeout(() => {
+      reject(new Error("Login timed out after 5 minutes. Start a new login with esi_login."));
+      cleanupFlow();
+    }, LOGIN_TIMEOUT_MS);
+
+    const flow: PendingFlow = {
+      verifier,
+      state,
+      clientId,
+      redirectUri,
+      scopes: selectedScopes.join(" "),
+      resolve,
+      reject,
+      server: null,
+      timeout,
+    };
+    pendingFlow = flow;
+
+    if (callback.explicit) {
+      // Public callback: the main HTTP server serves this path (see src/http.ts),
+      // so no extra listener is opened and no extra port needs to be exposed.
+      process.stderr.write(`OAuth callback will be served by the main HTTP server at ${redirectUri}\n`);
+      return;
+    }
+
+    // Local development default: dedicated in-process listener on localhost.
+    const server = http.createServer((req, res) => {
+      if (!req.url?.startsWith(callback.path)) {
         res.writeHead(404);
         res.end("Not found");
         return;
       }
-
-      const url = new URL(req.url, `http://localhost:${CALLBACK_PORT}`);
-      const code = url.searchParams.get("code");
-      const returnedState = url.searchParams.get("state");
-      const error = url.searchParams.get("error");
-
-      if (error) {
-        res.writeHead(400, { "Content-Type": "text/html" });
-        res.end(`<h1>Authentication Failed</h1><p>${escapeHtml(error)}</p>`);
-        reject(new Error(`OAuth error: ${error}`));
-        cleanup();
-        return;
-      }
-
-      if (returnedState !== state) {
-        res.writeHead(400, { "Content-Type": "text/html" });
-        res.end("<h1>Authentication Failed</h1><p>Invalid state parameter</p>");
-        reject(new Error("Invalid state — possible CSRF"));
-        cleanup();
-        return;
-      }
-
-      if (!code) {
-        res.writeHead(400, { "Content-Type": "text/html" });
-        res.end("<h1>Authentication Failed</h1><p>No authorization code</p>");
-        reject(new Error("No authorization code received"));
-        cleanup();
-        return;
-      }
-
-      try {
-        const tokens = await exchangeCode(code, clientId, redirectUri, verifier);
-        const character = decodeCharacterFromJwt(tokens.accessToken);
-        res.writeHead(200, { "Content-Type": "text/html" });
-        res.end(
-          `<h1>Authentication Successful!</h1><p>Logged in as <strong>${escapeHtml(character.characterName)}</strong>. You can close this tab.</p>`
-        );
-        resolve({
-          tokens,
-          character: { ...character, scopes: selectedScopes.join(" ") },
-        });
-      } catch (err) {
-        res.writeHead(500, { "Content-Type": "text/html" });
-        res.end("<h1>Authentication Failed</h1><p>Token exchange error</p>");
-        reject(err instanceof Error ? err : new Error(String(err)));
-      } finally {
-        cleanup();
-      }
+      handleOAuthCallback(req.url, (status, html) => {
+        res.writeHead(status, { "Content-Type": "text/html" });
+        res.end(html);
+      });
     });
-
-    const timeout = setTimeout(() => {
-      reject(new Error("Login timed out after 5 minutes. Start a new login with esi_login."));
-      cleanup();
-    }, LOGIN_TIMEOUT_MS);
-
-    function cleanup(): void {
-      clearTimeout(timeout);
-      server.close();
-      pendingFlow = null;
-      pendingPromise = null;
-    }
+    flow.server = server;
 
     server.listen(CALLBACK_PORT, () => {
-      process.stderr.write(
-        `OAuth callback server listening on http://localhost:${CALLBACK_PORT}${CALLBACK_PATH}\n`
-      );
+      process.stderr.write(`OAuth callback server listening on ${redirectUri}\n`);
     });
 
     server.on("error", (err: NodeJS.ErrnoException) => {
@@ -194,8 +295,6 @@ export function startLoginFlow(clientId: string, scopes?: string[]): { authUrl: 
       pendingFlow = null;
       pendingPromise = null;
     });
-
-    pendingFlow = { verifier, state, clientId, resolve, reject, server, timeout };
   });
 
   return { authUrl };

@@ -297,13 +297,15 @@ live in `homelab-infra`. See
 
 To use the live character data tools, you need an EVE SSO application:
 
-1. Register at https://developers.eveonline.com — create an app with "Authentication & API Access", callback URL `http://localhost:8085/callback`
+1. Register at https://developers.eveonline.com — create an app with "Authentication & API Access" and a callback URL:
+   - local development: `http://localhost:8085/callback`
+   - container/ingress deployment (k3s/Traefik): your public HTTPS URL, e.g. `https://galaxy.example.net/callback` — see [Container deployment: OAuth callback](docs/container-deployment.md#oauth-callback-eve-sso)
 2. Create `~/.eve-sde/config.json`:
    ```json
    { "clientId": "your_client_id_here" }
    ```
 3. Use the `esi_login` tool. It immediately returns an EVE SSO authorization URL.
-4. Open that URL on the Windows machine running the MCP within five minutes, approve the scopes, and select a character. EVE redirects the local browser to `http://localhost:8085/callback` and the MCP stores the tokens in the background.
+4. Open that URL within five minutes, approve the scopes, and select a character. Locally, EVE redirects the browser to `http://localhost:8085/callback`. In container deployments, set `EVE_SSO_CALLBACK_URL` to your public callback URL — the callback is then served by the main HTTP server on `PORT` at that path (no extra port, no port-forwarding). The MCP stores the tokens in the background.
 5. Use `esi_status` to confirm that authentication succeeded.
 
 Tokens are encrypted at rest (AES-256-GCM, key in `~/.eve-sde/auth-secret.key`) and stored in `~/.eve-sde/auth.db`. Scopes include skill reading, wallet, market, industry, planetary industry, character and corporation assets, contracts, fittings (read+write), and autopilot waypoint updates. Corporation assets require the authenticated character to have the Director role. ESI exposes planetary industry and skill queues as read-only, so neither can be modified through this MCP. Multi-character support is built in.

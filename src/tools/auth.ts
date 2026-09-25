@@ -90,7 +90,7 @@ export function registerAuthTools(server: McpServer): void {
           {
             type: "text",
             text:
-              `Open this EVE SSO authorization URL on the Windows machine running the MCP within 5 minutes:\n\n${authUrl}\n\n` +
+              `Open this EVE SSO authorization URL on any device within 5 minutes:\n\n${authUrl}\n\n` +
               "After approving the requested scopes and selecting a character, use esi_status to confirm the connection.",
           },
         ],

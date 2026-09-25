@@ -67,8 +67,12 @@ Argo-managed k3s StatefulSet pulling the image anonymously.
 
 ### Ports
 
-- `3001` — MCP HTTP bridge (`GET /health`, `POST /mcp`). Override with the
-  `PORT` environment variable.
+- `3001` — MCP HTTP bridge (`GET /health`, `POST /mcp`) **and the EVE SSO
+  OAuth callback route** (`GET <callback path>`, see
+  [OAuth callback](#oauth-callback-eve-sso)). Override with the `PORT`
+  environment variable. This is the only port the pod needs to expose — the
+  legacy in-process `localhost:8085` listener is not started when
+  `EVE_SSO_CALLBACK_URL` is configured.
 
 ### Environment variables
 
@@ -81,10 +85,12 @@ Argo-managed k3s StatefulSet pulling the image anonymously.
 | `NEXUM_BASE_URL` | `https://eve-nexum.com` | Nexum API base |
 | `NEXUM_PRESENCE_RETENTION_HOURS` | `48` | Nexum presence history |
 | `NEXUM_STALE_SECONDS` | `300` | Nexum stream staleness |
+| `EVE_SSO_CALLBACK_URL` | unset → local `http://localhost:8085/callback` | Public OAuth callback URL for `esi_login`; see [OAuth callback](#oauth-callback-eve-sso) |
 
-No secrets are required as environment variables; all credentials are files on
-the state volume (below). Do not bake secrets into the image or pass them as
-env.
+`EVE_SSO_CALLBACK_URL` is a public URL, not a secret — it is safe to set in
+plain env. No other secrets are required as environment variables; all
+credentials are files on the state volume (below). Do not bake secrets into
+the image or pass them as env.
 
 ### Persistent storage
 
@@ -108,10 +114,12 @@ Kubernetes set `fsGroup: 1000` on the pod):
   volume; required to decrypt `auth.db`; created automatically on first use —
   legacy hostname-derived installs are migrated to it on first start).
 - Character tokens in `auth.db` (encrypted at rest); `esi_login` requires a
-  human to open the returned URL, and the OAuth callback listens on
-  `http://localhost:8085` *inside the container* — use `kubectl port-forward`
-  for the callback when enrolling, or pre-seed `auth.db`/`config.json` into
-  the volume.
+  human to open the returned URL and approve the scopes. Configure
+  `EVE_SSO_CALLBACK_URL` so the OAuth redirect reaches the pod through the
+  ingress (see [OAuth callback](#oauth-callback-eve-sso)); without it the
+  callback targets `http://localhost:8085` *inside the container* and can
+  only be reached via `kubectl port-forward`, or by pre-seeding
+  `auth.db`/`config.json` into the volume.
 
 ### External dependencies (outbound HTTPS)
 
@@ -129,6 +137,75 @@ Kubernetes set `fsGroup: 1000` on the pod):
   readiness probe a generous `initialDelaySeconds`/start period for first boot
   on an empty volume; subsequent starts are fast.
 
+## OAuth callback (EVE SSO)
+
+`esi_login` performs a standard OAuth 2.0 authorization-code flow with PKCE
+against `login.eveonline.com`. The callback URL is **not** hardcoded to a
+production hostname — it comes from `EVE_SSO_CALLBACK_URL`:
+
+- **Set** (required for k3s/Traefik): a public, ingress-routable URL such as
+  `https://galaxy.example.net/callback`. The app serves the callback on its
+  **main port** (`PORT`, default `3001`) at the URL's path
+  (`GET /callback` in the example), so the ingress only needs to route one
+  path on one port — no second Service port, no port-forwarding.
+- **Unset** (local development): the app keeps the historical behavior and
+  listens for the callback on `http://localhost:8085/callback` in-process.
+  This mode is unusable from a browser unless port 8085 is reachable — which
+  is why the container deployment must set the variable.
+
+Requirements and assumptions for the k3s/Traefik path:
+
+1. **EVE SSO app registration.** Register the *same* URL in the EVE SSO
+   developer portal (https://developers.eveonline.com) as the callback/redirect
+   URL. EVE SSO rejects code exchanges whose `redirect_uri` does not exactly
+   match a registered callback — including scheme and trailing slash.
+2. **Ingress.** Traefik (or any ingress) must route `GET <path>` on the
+   public host to the pod's `PORT` (default `3001`). Path assumptions:
+   - host-based ingress: `https://galaxy.example.net/callback` →
+     `EVE_SSO_CALLBACK_URL=https://galaxy.example.net/callback`;
+   - path-based ingress on a shared host:
+     `https://galaxy.example.net/galaxy/callback` →
+     `EVE_SSO_CALLBACK_URL=https://galaxy.example.net/galaxy/callback`.
+     The pod mounts the route at the exact path from the variable, so the
+     ingress should forward the original path without rewriting (a rewrite
+     would make the pod see a different path than the route expects).
+   - The route is read at process startup, like `HOST`/`PORT`; changing it
+     requires a pod restart.
+3. **TLS termination at the ingress.** The pod speaks plain HTTP on `3001`;
+   the public URL must be HTTPS (EVE SSO redirects a user's browser there,
+   and the authorization code is carried in the query string). Terminate TLS
+   at Traefik; no changes inside the pod.
+4. **Single replica.** The pending OAuth flow (state, PKCE verifier, timeout)
+   lives in process memory, so exactly one replica must receive the callback
+   — the same constraint as the `auth.db`/`galaxy-state.db` single-writer
+   requirement. Do not scale up.
+5. **Argo CD / homelab-infra config.** In the Galaxy StatefulSet:
+
+   ```yaml
+   env:
+     - name: EVE_SSO_CALLBACK_URL
+       value: "https://galaxy.example.net/callback" # must match the EVE SSO app
+   ```
+
+   plus the ingress resource for the same host/path. Example Argo CD values
+   snippet (adjust to the repo's conventions):
+
+   ```yaml
+   galaxy:
+     env:
+       EVE_SSO_CALLBACK_URL: "https://galaxy.example.net/callback"
+     ingress:
+       host: "galaxy.example.net"
+       path: "/callback"
+       pathType: Prefix
+       backendPort: 3001
+   ```
+
+Security notes: the callback validates the per-flow random `state` parameter
+and exchanges the code with PKCE `S256`; the code itself is never logged (the
+HTTP access log records the path without the query string). The route answers
+with `400` when no login flow is pending, so probing it is harmless.
+
 ## What homelab-infra must provide (later)
 
 - A Kubernetes **StatefulSet** (not a Deployment) in `homelab-infra` managed
@@ -138,7 +215,10 @@ Kubernetes set `fsGroup: 1000` on the pod):
   - one volume (e.g. a PVC with a stable name) mounted at `/home/node/.eve-sde`,
   - `securityContext.fsGroup: 1000`,
   - liveness/readiness probes on `GET /health` with a long initial delay,
-  - `PORT` (and optionally `GALAXY_STATE_DB`, `NEXUM_*`) via env/config,
+  - `PORT` (and optionally `GALAXY_STATE_DB`, `NEXUM_*`,
+    `EVE_SSO_CALLBACK_URL`) via env/config,
+  - an ingress route for the OAuth callback path on `PORT` (see
+    [OAuth callback](#oauth-callback-eve-sso)),
   - exactly one replica — do not scale up.
 - No in-cluster registry; no GitOps automation in this repository.
 

@@ -6,6 +6,7 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { getCallbackConfig, handleOAuthCallback } from "./auth/oauth.js";
 import { closeAuthDb } from "./auth/tokens.js";
 import { closeDatabase, sdeExists } from "./database.js";
 import { downloadSde } from "./downloader.js";
@@ -72,6 +73,17 @@ app.use((req, res, next) => {
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, name: SERVER_INFO.name, version: SERVER_INFO.version });
+});
+
+// EVE SSO OAuth callback. When EVE_SSO_CALLBACK_URL is configured, the public
+// callback is served here on the main port (the only port exposed by the
+// ingress), instead of a dedicated localhost:8085 listener. The path is read
+// from EVE_SSO_CALLBACK_URL at startup, like HOST and PORT.
+const oauthCallbackPath = getCallbackConfig().path;
+app.get(oauthCallbackPath, (req, res) => {
+  handleOAuthCallback(req.originalUrl ?? req.url ?? "", (status, html) => {
+    res.status(status).type("html").send(html);
+  });
 });
 
 app.post("/mcp", async (req, res) => {
