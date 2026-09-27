@@ -57,14 +57,16 @@ export class NexumStore {
   state(id: string): Json { const r=this.db.prepare("SELECT state FROM nexum_maps WHERE id=?").get(id) as any; if(!r)throw new Error("Map not found"); return JSON.parse(r.state); }
   saveState(id: string, state: Json): void { this.db.prepare("UPDATE nexum_maps SET state=? WHERE id=?").run(JSON.stringify(state),id); }
   patchMap(id: string, patch: Json): void { this.db.prepare("UPDATE nexum_maps SET metadata=? WHERE id=?").run(JSON.stringify({...this.map(id),...patch}),id); }
-  discover(c: Json, maps: Json[]): void {
+  // base defaults to the credential's stored field for callers that don't route live requests
+  // (e.g. tests); NexumService always passes the env-resolved base explicitly.
+  discover(c: Json, maps: Json[], base: string = c.base_url): void {
     this.db.transaction(()=>{
       this.db.prepare("DELETE FROM nexum_map_access WHERE credential_id=?").run(c.id);
       for(const m of maps) {
-        const id=canonicalMapId(c.base_url,String(m.id));
-        const metadata={id,base_url:c.base_url,nexum_map_id:String(m.id),name:m.name,health:"uninitialized",stream_connected:false,
+        const id=canonicalMapId(base,String(m.id));
+        const metadata={id,base_url:base,nexum_map_id:String(m.id),name:m.name,health:"uninitialized",stream_connected:false,
           hydrated_at:null,last_event_at:null,last_resync_at:null,last_error:null,created_at:this.now()};
-        this.db.prepare("INSERT OR IGNORE INTO nexum_maps VALUES (?,?,?,?,?)").run(id,c.base_url,String(m.id),JSON.stringify(metadata),JSON.stringify({systems:[],connections:[],routes:[]}));
+        this.db.prepare("INSERT OR IGNORE INTO nexum_maps VALUES (?,?,?,?,?)").run(id,base,String(m.id),JSON.stringify(metadata),JSON.stringify({systems:[],connections:[],routes:[]}));
         this.db.prepare("INSERT INTO nexum_map_access VALUES (?,?,?)").run(c.id,id,JSON.stringify({...m,last_verified_at:this.now()}));
       }
     })();

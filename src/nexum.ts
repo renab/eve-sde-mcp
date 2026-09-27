@@ -42,6 +42,8 @@ export class NexumService {
       if(!Number.isFinite(this.options[k])||this.options[k]<=0)throw new Error("Invalid Nexum timing configuration");
   }
   private now(){return this.store.now();}
+  // Single source of truth for where live requests go; never read from stored credential base_url.
+  private nexumBase():string{return normalizeBaseUrl(process.env.NEXUM_BASE_URL??"https://eve-nexum.com");}
   private serialize<T>(fn:()=>Promise<T>):Promise<T>{const p=this.management.then(fn);this.management=p.catch(()=>{});return p;}
   private candidates(map:string):Json[]{
     const access=new Set(this.store.access(map).map(a=>a.credential_id));
@@ -51,7 +53,7 @@ export class NexumService {
   private async get(c:Json,endpoint:string,signal?:AbortSignal):Promise<any>{
     const retryAt=this.store.credential(c.id).retry_at??0;
     if(retryAt>this.now())throw new NexumError(429,retryAt-this.now(),"Nexum rate limited");
-    return this.transport.get(c.base_url,this.secrets.get(c.secret_ref),endpoint,AbortSignal.any([this.lifetime.signal,...(signal?[signal]:[])]));
+    return this.transport.get(this.nexumBase(),this.secrets.get(c.secret_ref),endpoint,AbortSignal.any([this.lifetime.signal,...(signal?[signal]:[])]));
   }
   private failure(c:Json,e:unknown,map?:string):void {
     const status=e instanceof NexumError?e.status:0;
@@ -62,25 +64,25 @@ export class NexumService {
     if(status===404 && map) this.store.db.prepare("DELETE FROM nexum_map_access WHERE credential_id=? AND canonical_map_id=?").run(c.id,map);
   }
   private async discover(c:Json,key?:string):Promise<Json[]> {
-    const result=key!==undefined ? await this.transport.get(c.base_url,key,"/api/v1/maps",this.lifetime.signal) : await this.get(c,"/api/v1/maps");
+    const result=key!==undefined ? await this.transport.get(this.nexumBase(),key,"/api/v1/maps",this.lifetime.signal) : await this.get(c,"/api/v1/maps");
     if(!object(result)||!Array.isArray(result.maps)||result.maps.some((m:any)=>!object(m)||!idValid(m.id)))throw new NexumError(0,0,"Malformed Nexum maps response");
     return result.maps;
   }
-  addCredential(input:{api_key:string;character_id?:string;label?:string;base_url?:string}):Promise<Json>{
+  addCredential(input:{api_key:string;character_id?:string;label?:string}):Promise<Json>{
     return this.serialize(async()=>{
-      const base=normalizeBaseUrl(input.base_url??process.env.NEXUM_BASE_URL??"https://eve-nexum.com");
+      const base=this.nexumBase();
       const c:Json={id:crypto.randomUUID(),base_url:base,label:input.label??"Nexum",bound_character_id:input.character_id??null,
         bound_character_name:null,identity_source:input.character_id?"caller_supplied":"unavailable",capabilities:["read"],chain_write_status:"unknown",
         scope:null,expiry:null,expiry_known:false,enabled:true,health:"uninitialized",created_at:this.now(),updated_at:this.now()};
       // Reject accidental secret reuse in otherwise safe fields.
-      if([c.label,c.bound_character_id,c.base_url].some(v=>typeof v==="string"&&v.includes(input.api_key)))throw new NexumError(0,0,"Secret supplied in metadata");
+      if([c.label,c.bound_character_id].some(v=>typeof v==="string"&&v.includes(input.api_key)))throw new NexumError(0,0,"Secret supplied in metadata");
       const maps=await this.discover(c,input.api_key);
       // Validate events capability once; use a map without an existing stream when possible.
       // For shared maps this short probe is closed before enrollment; never two managed streams.
       let probe:NexumStream|undefined;
       if(maps.length){probe=await this.transport.stream(base,input.api_key,`/api/v1/maps/${encodeURIComponent(String(maps[0].id))}/events`,this.lifetime.signal);probe.close();c.capabilities.push("live_events");}
       c.secret_ref=c.id;c.health="healthy";c.last_success_at=this.now();c.last_discovery_at=this.now();
-      this.store.db.transaction(()=>{this.secrets.put(c.secret_ref,input.api_key);this.store.saveCredential(c);this.store.discover(c,maps);})();
+      this.store.db.transaction(()=>{this.secrets.put(c.secret_ref,input.api_key);this.store.saveCredential(c);this.store.discover(c,maps,base);})();
       this.ensureWorkers();
       return this.credentialResult(c.id);
     });
@@ -95,8 +97,8 @@ export class NexumService {
     const c=this.store.credential(id);
     try{
       const maps=await this.discover(c);
-      if(maps.length){const p=await this.transport.stream(c.base_url,this.secrets.get(c.secret_ref),`/api/v1/maps/${encodeURIComponent(String(maps[0].id))}/events`,this.lifetime.signal);p.close();}
-      this.store.discover(c,maps);this.store.patchCredential(id,{health:"healthy",capabilities:maps.length?["read","live_events"]:["read"],last_success_at:this.now(),last_discovery_at:this.now(),last_error:null,retry_at:0});
+      if(maps.length){const p=await this.transport.stream(this.nexumBase(),this.secrets.get(c.secret_ref),`/api/v1/maps/${encodeURIComponent(String(maps[0].id))}/events`,this.lifetime.signal);p.close();}
+      this.store.discover(c,maps,this.nexumBase());this.store.patchCredential(id,{health:"healthy",capabilities:maps.length?["read","live_events"]:["read"],last_success_at:this.now(),last_discovery_at:this.now(),last_error:null,retry_at:0});
       await this.reconcileWorkers();
     }catch(e){this.failure(c,e);await this.reconcileWorkers();}
     return this.credentialResult(id);
@@ -108,7 +110,7 @@ export class NexumService {
     if(input.label?.includes(input.api_key??this.secrets.get(c.secret_ref)))throw new NexumError(0,0,"Secret supplied in metadata");
     if(input.api_key){
       maps=await this.discover(c,input.api_key);
-      if(maps.length){const p=await this.transport.stream(c.base_url,input.api_key,`/api/v1/maps/${encodeURIComponent(String(maps[0].id))}/events`,this.lifetime.signal);p.close();}
+      if(maps.length){const p=await this.transport.stream(this.nexumBase(),input.api_key,`/api/v1/maps/${encodeURIComponent(String(maps[0].id))}/events`,this.lifetime.signal);p.close();}
     }
     const restart=!!input.api_key||(input.enabled!==undefined&&input.enabled!==c.enabled);
     if(restart)await this.stopCredentialWorkers(id);
@@ -118,7 +120,7 @@ export class NexumService {
         ...(input.character_id!==undefined?{bound_character_id:input.character_id,identity_source:"user_confirmed",
           ...(input.character_id!==c.bound_character_id?{bound_character_name:null}:{})}:{}),
         ...(maps?{health:"healthy",capabilities:maps.length?["read","live_events"]:["read"],last_success_at:this.now(),last_discovery_at:this.now(),last_error:null,retry_at:0}: {})});
-      if(maps)this.store.discover(c,maps);
+      if(maps)this.store.discover(c,maps,this.nexumBase());
     })();
     if(restart)this.ensureWorkers();return this.credentialResult(id);
   });}
@@ -157,7 +159,7 @@ export class NexumService {
         const interval=c.health==="degraded"?60_000:this.options.accessRefreshMs;
         if(!force&&this.now()-(c.last_discovery_attempt_at??c.last_discovery_at??0)<interval)continue;
         this.store.patchCredential(c.id,{last_discovery_attempt_at:this.now()});
-        try{const maps=await this.discover(c);if(this.stopped)break;this.store.discover(c,maps);this.store.patchCredential(c.id,{health:"healthy",last_success_at:this.now(),last_discovery_at:this.now(),last_error:null});}
+        try{const maps=await this.discover(c);if(this.stopped)break;this.store.discover(c,maps,this.nexumBase());this.store.patchCredential(c.id,{health:"healthy",last_success_at:this.now(),last_discovery_at:this.now(),last_error:null});}
         catch(e){if(!this.stopped)this.failure(c,e);}
       }
       if(!this.stopped)await this.reconcileWorkers();
@@ -196,7 +198,7 @@ export class NexumService {
       const session=new AbortController(),signal=AbortSignal.any([w.controller.signal,session.signal]);
       try{
         await this.delay(Math.max(0,(c.retry_at??0)-this.now()),signal);if(signal.aborted)break;
-        w.stream=await this.transport.stream(c.base_url,this.secrets.get(c.secret_ref),prefix(m)+"/events",signal);
+        w.stream=await this.transport.stream(this.nexumBase(),this.secrets.get(c.secret_ref),prefix(m)+"/events",signal);
         const buffered:Json[]=[];let ready=false,ended=false;
         // Subscribe before hydration to cover the REST/stream handoff. Buffer ordered deltas.
         pump=(async()=>{for await(const e of w.stream!.events){
@@ -285,7 +287,7 @@ export class NexumService {
     if(!this.transport.patch){this.store.patchCredential(writer.id,{chain_write_status:"unavailable",chain_write_error:"Configured Nexum transport has no PATCH support"});return;}
     for(const change of changes) {
       try {
-        await this.transport.patch(writer.base_url,this.secrets.get(writer.secret_ref),`${prefix(m)}/systems/${encodeURIComponent(change.systemId)}/signatures/${encodeURIComponent(change.signatureId)}`,{notes:change.notes},this.lifetime.signal);
+        await this.transport.patch(this.nexumBase(),this.secrets.get(writer.secret_ref),`${prefix(m)}/systems/${encodeURIComponent(change.systemId)}/signatures/${encodeURIComponent(change.signatureId)}`,{notes:change.notes},this.lifetime.signal);
         const resource=this.store.resources(id,change.systemId), rows=(resource.signatures.items as Json[]).map(s=>String(s.id)===change.signatureId?{...s,notes:change.notes}:s);
         this.store.saveResource(id,change.systemId,"signatures",rows);
         this.store.patchCredential(writer.id,{chain_write_status:"available",chain_write_error:null,last_chain_write_at:this.now()});

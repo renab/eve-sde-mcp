@@ -41,12 +41,13 @@ class Upstream {
 let store:NexumStore,secrets:SecretStore,service:NexumService,up:Upstream,tmp:string,key:string;
 const until=async(fn:()=>boolean)=>{for(let i=0;i<100;i++){if(fn())return;await new Promise(r=>setTimeout(r,5));}expect(fn()).toBe(true);};
 beforeEach(()=>{
+  process.env.NEXUM_BASE_URL=base;
   tmp=fs.mkdtempSync(path.join(os.tmpdir(),"galaxy-nexum-test-"));
   store=new NexumStore(openStateDatabase(":memory:"));secrets=new SecretStore(store.db,path.join(tmp,"key"));up=new Upstream();
   service=new NexumService(store,secrets,up,{debounceMs:10,retryMs:10,random:()=>0.5});key=crypto.randomBytes(32).toString("base64url");
 });
-afterEach(async()=>{await service.stop();store.db.close();fs.rmSync(tmp,{recursive:true,force:true});vi.restoreAllMocks();});
-async function enroll(label="McGreggor",api_key=key){const c=await service.addCredential({api_key,label,base_url:base});await until(()=>store.map(mapId).health==="live");return c;}
+afterEach(async()=>{await service.stop();store.db.close();fs.rmSync(tmp,{recursive:true,force:true});vi.restoreAllMocks();delete process.env.NEXUM_BASE_URL;});
+async function enroll(label="McGreggor",api_key=key){const c=await service.addCredential({api_key,label});await until(()=>store.map(mapId).health==="live");return c;}
 
 describe("Nexum credentials and canonical synchronization",()=>{
   it("encrypts secrets, supports unknown/null expiry, and never serializes keys or secret refs",async()=>{
@@ -73,9 +74,9 @@ describe("Nexum credentials and canonical synchronization",()=>{
     expect(up.calls).toEqual([]);expect(service.systemState(mapId,"s1").structures.items[0].eveId).toBe("9007199254740993");
   });
   it("rejects bad keys and insufficient live-event scope before storage",async()=>{
-    up.bad.add(key);await expect(service.addCredential({api_key:key,base_url:base})).rejects.toBeInstanceOf(NexumError);
+    up.bad.add(key);await expect(service.addCredential({api_key:key})).rejects.toBeInstanceOf(NexumError);
     up.bad.clear();up.stream.mockRejectedValueOnce(new NexumError(403));
-    await expect(service.addCredential({api_key:key,base_url:base})).rejects.toBeInstanceOf(NexumError);
+    await expect(service.addCredential({api_key:key})).rejects.toBeInstanceOf(NexumError);
     expect(store.credentials()).toEqual([]);expect(store.db.prepare("SELECT * FROM galaxy_secrets").all()).toEqual([]);
   });
   it("revalidation marks revoked credentials unhealthy while retaining cache",async()=>{
@@ -316,7 +317,7 @@ describe("remote tool security and SSE transport",()=>{
   });
   it("remote MCP enrollment returns safe metadata, including for upstream failures",async()=>{
     const tools:Record<string,any>={};registerNexumTools({tool:(n:any,_d:any,s:any,h:any)=>tools[n]={s:z.object(s),h}} as any,()=>service);
-    const result=await tools.nexum_add_credential.h({api_key:key,base_url:base});expect(result.isError).toBeUndefined();expect(JSON.stringify(result)).not.toContain(key);
+    const result=await tools.nexum_add_credential.h({api_key:key});expect(result.isError).toBeUndefined();expect(JSON.stringify(result)).not.toContain(key);
     up.get.mockRejectedValueOnce(new Error(key));const failed=await tools.nexum_test_credential.h({credential_id:JSON.parse(result.content[0].text).id});expect(JSON.stringify(failed)).not.toContain(key);
   });
   it("parses fragmented unnamed frames, comments, malformed JSON and 64-bit-safe IDs",async()=>{

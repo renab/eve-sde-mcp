@@ -12,8 +12,8 @@ export function registerNexumTools(server:McpServer, getService:()=>NexumService
       catch(e){return {isError:true,content:[{type:"text" as const,text:JSON.stringify({error:e instanceof NexumError?e.message:"Nexum operation failed; check IDs and nexum_status. No credential values are returned."})}]};}
     });
   };
-  tool("nexum_add_credential","Remotely validate and securely enroll a Nexum Read + live events key. Supports non-expiring keys. No local setup required. Character ID is caller-supplied; API cannot verify identity/expiry/exact scope.",
-    {api_key:secret,character_id:id.optional(),label:z.string().max(160).optional(),base_url:z.string().max(2048).optional()},(s,a)=>s.addCredential(a));
+  tool("nexum_add_credential","Remotely validate and securely enroll a Nexum Read + live events key. Supports non-expiring keys. No local setup required. Character ID is caller-supplied; API cannot verify identity/expiry/exact scope. Targets the Nexum instance set by the NEXUM_BASE_URL environment variable (defaults to https://eve-nexum.com); this is not configurable per credential.",
+    {api_key:secret,character_id:id.optional(),label:z.string().max(160).optional()},(s,a)=>s.addCredential(a));
   tool("nexum_list_credentials","List safe Nexum credential metadata; never returns keys.",{},s=>s.listCredentials());
   tool("nexum_test_credential","Revalidate a stored Nexum key and discover map access and live-event capability.",{credential_id:id},(s,a)=>s.testCredential(a.credential_id));
   tool("nexum_update_credential","Update Nexum label/enabled state, set a user-confirmed character binding, or securely validate and replace its key. Character binding alone changes local metadata without touching the key or restarting sync; it is not verified by Nexum.",

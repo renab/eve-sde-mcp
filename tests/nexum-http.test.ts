@@ -30,7 +30,7 @@ it("enrolls and lists credentials through actual remote MCP HTTP without logging
         body:JSON.stringify({jsonrpc:"2.0",id:1,method:"tools/call",params:{name,arguments:args}})});
       expect(res.status).toBe(200);return res.text();
     };
-    const enrolled=await call("nexum_add_credential",{api_key:key,base_url:"https://nexum.example",label:"McGreggor"});
+    const enrolled=await call("nexum_add_credential",{api_key:key,label:"McGreggor"});
     expect(enrolled).toContain("McGreggor");expect(enrolled).not.toContain(key);
     const listed=await call("nexum_list_credentials",{});expect(listed).toContain("McGreggor");expect(listed).not.toContain(key);
     expect(logs.join("\n")).not.toContain(key);expect(logs.join("\n")).toContain("[REDACTED]");

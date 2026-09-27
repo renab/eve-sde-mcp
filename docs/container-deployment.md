@@ -82,7 +82,7 @@ Argo-managed k3s StatefulSet pulling the image anonymously.
 | `PORT` | `3001` (image) | Listen port |
 | `NODE_ENV` | `production` (image) | Runtime mode |
 | `GALAXY_STATE_DB` | `/home/node/.eve-sde/galaxy-state.db` | Ledger/ESI cache/Nexum SQLite file |
-| `NEXUM_BASE_URL` | `https://eve-nexum.com` | Nexum API base |
+| `NEXUM_BASE_URL` | `https://eve-nexum.com` | Nexum API base; read fresh on every request for every credential (not stored/cached) |
 | `NEXUM_PRESENCE_RETENTION_HOURS` | `48` | Nexum presence history |
 | `NEXUM_STALE_SECONDS` | `300` | Nexum stream staleness |
 | `EVE_SSO_CALLBACK_URL` | unset → local `http://localhost:8085/callback` | Public OAuth callback URL for `esi_login`; see [OAuth callback](#oauth-callback-eve-sso) |

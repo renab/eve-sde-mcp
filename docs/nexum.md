@@ -14,7 +14,7 @@ Nexum's public API intentionally does **not** permit API keys to PATCH map syste
 
 ## Remote enrollment
 
-Use `nexum_add_credential` over Galaxy's existing authenticated remote MCP connection. Supply `api_key`, optionally `label`, `character_id` (decimal string), and `base_url`. The default instance is `https://eve-nexum.com`. Create a **Read + live events** key in Nexum's UI; non-expiring keys are supported. Enrollment never requires SSH, a CLI, environment editing or direct database access.
+Use `nexum_add_credential` over Galaxy's existing authenticated remote MCP connection. Supply `api_key`, optionally `label` and `character_id` (decimal string). Create a **Read + live events** key in Nexum's UI; non-expiring keys are supported. Enrollment never requires SSH, a CLI, environment editing or direct database access.
 
 Enrollment validates `GET /api/v1/maps`, then briefly opens/closes one accessible map's `/events` endpoint to verify live-event capability. The probe is distinct from the one long-lived managed stream; enrolling an additional credential does not rehydrate an already-live map. Probes may briefly overlap an existing stream during explicit validation. With no accessible maps, read authentication is validated and live-event capability remains unverified until a map becomes accessible.
 
@@ -58,7 +58,7 @@ Health: `uninitialized` before hydration; `live` after hydration and a healthy s
 
 Nexum authenticates only when a REST request/stream opens, and emits no key-revoked/map-access-removed event. Accordingly, a lightweight map-list discovery runs every six hours per healthy credential, also finding newly shared maps; transient discovery failures retry after a minute, respecting rate-limit backoff. It never reloads healthy map content. Removed bindings terminate affected workers. No periodic full-map safety polling is used.
 
-Optional operator tuning (not credential enrollment): `NEXUM_BASE_URL`, `NEXUM_PRESENCE_RETENTION_HOURS` (48), `NEXUM_STALE_SECONDS` (300). Service constructor timing options support tests/embedded deployments, including `accessRefreshMs`. Nonfinite/nonpositive timings fail closed with safe startup diagnostics.
+Optional operator tuning (not credential enrollment): `NEXUM_BASE_URL` (defaults to `https://eve-nexum.com`; this is the only thing that controls which Nexum instance every credential talks to — it is read fresh on every live request, not cached or stored per credential), `NEXUM_PRESENCE_RETENTION_HOURS` (48), `NEXUM_STALE_SECONDS` (300). Service constructor timing options support tests/embedded deployments, including `accessRefreshMs`. Nonfinite/nonpositive timings fail closed with safe startup diagnostics.
 
 ## Presence provenance
 
