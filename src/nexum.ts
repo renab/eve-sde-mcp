@@ -8,6 +8,7 @@ import { SecretStore } from "./secrets.js";
 import { NexumStore, resourceKinds, type Json, type ResourceKind } from "./nexum-store.js";
 import { HttpNexumTransport, NexumError, normalizeBaseUrl, type NexumStream, type NexumTransport } from "./nexum-client.js";
 import { defaultChainNoteFormat, planChain, validateChainNoteFormat } from "./nexum-chain.js";
+import { mapDecisionBoundary } from "./map-decision-boundary.js";
 
 const prefix=(m:Json)=>`/api/v1/maps/${encodeURIComponent(m.nexum_map_id)}`;
 const object=(v:any):v is Json=>!!v && typeof v==="object" && !Array.isArray(v);
@@ -143,7 +144,7 @@ export class NexumService {
     this.stopped=false;
     if(this.lifetime.signal.aborted)this.lifetime=new AbortController();
     if(this.pruneTimer)return;
-    for(const m of this.store.maps())this.store.patchMap(m.id,{stream_connected:false,health:m.hydrated_at?"degraded":"uninitialized",disconnected_at:this.now()});
+    for(const m of this.store.maps())void mapDecisionBoundary.run(m.id,()=>this.store.patchMap(m.id,{stream_connected:false,health:m.hydrated_at?"degraded":"uninitialized",disconnected_at:this.now()}));
     this.pruneTimer=setInterval(()=>{this.store.prune(this.options.retentionMs);this.esiLocations.prune(this.options.retentionMs);this.refreshAccess();this.ensureWorkers();},60_000);this.pruneTimer.unref();
     // Background discovery has bounded HTTP calls and cannot block Galaxy startup.
     this.esiLocations.start();
@@ -180,9 +181,9 @@ export class NexumService {
     if(this.stopped)return;
     for(const m of this.store.maps()) {
       if(this.workers.has(m.id))continue;
-      if(!this.candidates(m.id).length){this.store.patchMap(m.id,{stream_connected:false,health:"auth_failed",disconnected_at:m.disconnected_at??this.now()});continue;}
+       if(!this.candidates(m.id).length){void mapDecisionBoundary.run(m.id,()=>this.store.patchMap(m.id,{stream_connected:false,health:"auth_failed",disconnected_at:m.disconnected_at??this.now()}));continue;}
       const w:Worker={controller:new AbortController(),task:Promise.resolve()};this.workers.set(m.id,w);
-      w.task=this.run(m.id,w).catch(()=>{this.store.patchMap(m.id,{health:"degraded",last_error:"Nexum worker stopped"});})
+       w.task=this.run(m.id,w).catch(()=>mapDecisionBoundary.run(m.id,()=>this.store.patchMap(m.id,{health:"degraded",last_error:"Nexum worker stopped"})))
         .finally(()=>{if(this.workers.get(m.id)===w)this.workers.delete(m.id);});
     }
   }
@@ -211,16 +212,16 @@ export class NexumService {
         if(ended)throw new NexumError();
         while(buffered.length)await this.enqueue(id,()=>this.handleEvent(id,buffered.shift()!,c,signal));
         ready=true;failures=0;
-        this.store.patchMap(id,{health:"live",stream_connected:true,stream_credential_id:c.id,disconnected_at:null,last_error:null});
+        await mapDecisionBoundary.run(id,()=>this.store.patchMap(id,{health:"live",stream_connected:true,stream_credential_id:c.id,disconnected_at:null,last_error:null}));
         this.store.patchCredential(c.id,{health:"healthy",capabilities:["read","live_events"],last_success_at:this.now(),last_error:null});
         await pump;if(!signal.aborted)throw new NexumError();
       }catch(e){
         if(!w.controller.signal.aborted){this.failure(c,e,id);failures++;
-          this.store.patchMap(id,{last_error:safeError(e),reconnect_attempts:(this.store.map(id).reconnect_attempts??0)+1});}
+          await mapDecisionBoundary.run(id,()=>this.store.patchMap(id,{last_error:safeError(e),reconnect_attempts:(this.store.map(id).reconnect_attempts??0)+1}));}
       }finally{
         session.abort();w.stream?.close();await pump?.catch(()=>{});
         for(const [key,t]of this.pending)if(key.startsWith(id+":")){clearTimeout(t);this.pending.delete(key);}
-        const map=this.store.map(id);this.store.patchMap(id,{stream_connected:false,health:this.candidates(id).length?(map.hydrated_at?"degraded":"uninitialized"):"auth_failed",disconnected_at:map.disconnected_at??this.now()});
+        await mapDecisionBoundary.run(id,()=>{const map=this.store.map(id);this.store.patchMap(id,{stream_connected:false,health:this.candidates(id).length?(map.hydrated_at?"degraded":"uninitialized"):"auth_failed",disconnected_at:map.disconnected_at??this.now()});});
       }
       await this.delay(Math.min(300_000,this.options.retryMs*2**Math.min(failures,8))*(0.75+this.options.random()*0.5),w.controller.signal);
     }
@@ -243,7 +244,10 @@ export class NexumService {
       if(!Array.isArray(data))throw new NexumError(0,0,"Malformed Nexum resource");resources.push({system:String(s.id),kind,data});
     }
     if(signal?.aborted)return;
-    this.store.db.transaction(()=>{
+    let committed=false;
+    await mapDecisionBoundary.run(id,()=>{
+      if(signal?.aborted)return;
+      this.store.db.transaction(()=>{
       this.store.saveState(id,full);
       if(mergeResync){
         const ids=new Set(full.systems.map((s:Json)=>String(s.id)));
@@ -256,7 +260,10 @@ export class NexumService {
         if(r.kind==="signatures")this.store.retireAbsentChainReservations(id,r.system,r.data,full);
       }
       this.store.patchMap(id,{name:full.name,hydrated_at:this.now(),last_rest_success_at:this.now(),last_resync_at:m.hydrated_at?this.now():null});
-    })();
+      })();
+      committed=true;
+    });
+    if(!committed)return;
     this.scheduleChain(id,c);
   }
   private scheduleChain(id:string,c:Json):void {
@@ -265,6 +272,9 @@ export class NexumService {
     timer.unref();this.chainPending.set(id,timer);
   }
   private async reconcileChain(id:string,c:Json):Promise<void> {
+    return mapDecisionBoundary.run(id,()=>this.reconcileChainLocked(id,c));
+  }
+  private async reconcileChainLocked(id:string,c:Json):Promise<void> {
     const m=this.store.map(id), noteFormat=this.chainNoteFormat(id).format;
     let plan=planChain(this.store.state(id),systemId=>this.store.resources(id,systemId),noteFormat,this.store.chainReservations(id));
     if(plan.reservations.length){this.store.saveChainReservations(id,plan.reservations);plan=planChain(this.store.state(id),systemId=>this.store.resources(id,systemId),noteFormat,this.store.chainReservations(id));}
@@ -300,15 +310,18 @@ export class NexumService {
   }
   private schedule(id:string,key:string,fn:()=>Promise<void>):void {
     const k=id+":"+key;if(this.pending.has(k))return;
-    const t=setTimeout(()=>{this.pending.delete(k);void this.enqueue(id,fn).catch(e=>{
+    const t=setTimeout(()=>{this.pending.delete(k);void this.enqueue(id,fn).catch(e=>mapDecisionBoundary.run(id,()=>{
       this.store.patchMap(id,{health:"degraded",last_error:safeError(e)});
       // A failed targeted refresh must recover even if no further event arrives.
       const w=this.workers.get(id);
       if(w?.credential)this.failure(this.store.credential(w.credential),e);
       w?.stream?.close();
-    });},this.options.debounceMs);t.unref();this.pending.set(k,t);
+    }));},this.options.debounceMs);t.unref();this.pending.set(k,t);
   }
   async handleEvent(id:string,e:Json,c:Json,signal?:AbortSignal):Promise<void>{
+    return mapDecisionBoundary.run(id,()=>this.handleEventLocked(id,e,c,signal));
+  }
+  private async handleEventLocked(id:string,e:Json,c:Json,signal?:AbortSignal):Promise<void>{
     if(signal?.aborted)return;
     if(!object(e)||typeof e.type!=="string"){this.store.patchMap(id,{last_error:"Malformed Nexum event"});return;}
     if(e.type==="__heartbeat"){this.store.patchMap(id,{last_stream_activity_at:this.now()});return;}
@@ -326,11 +339,11 @@ export class NexumService {
         if(signal?.aborted||!this.store.state(id).systems.some((s:Json)=>String(s.id)===String(e.systemId)))return;
         const data=await this.get(c,`${prefix(this.store.map(id))}/systems/${encodeURIComponent(String(e.systemId))}/${kind}`,signal);
         if(!Array.isArray(data))throw new NexumError(0,0,"Malformed Nexum resource");
-        if(!signal?.aborted){
+        await mapDecisionBoundary.run(id,()=>{if(!signal?.aborted&&this.store.state(id).systems.some((s:Json)=>String(s.id)===String(e.systemId))){
           this.store.saveResource(id,String(e.systemId),kind,data);
           if(kind==="signatures")this.store.retireAbsentChainReservations(id,String(e.systemId),data,this.store.state(id));
           this.store.patchMap(id,{last_rest_success_at:this.now()});this.scheduleChain(id,c);
-        }
+        }});
       });return;
     }
     if(e.type==="map.resync"){

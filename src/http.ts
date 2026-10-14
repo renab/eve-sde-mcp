@@ -14,6 +14,7 @@ import { createMcpServer, SERVER_INFO } from "./server.js";
 import { beginForeground } from "./work-priority.js";
 import { startKeepWarm,stopKeepWarm } from "./keep-warm.js";
 import { startNexum,stopNexum } from "./nexum.js";
+import { stopWormholeSystems } from "./wormholesystems.js";
 import { redactSecrets } from "./secrets.js";
 
 const host = process.env.HOST || "127.0.0.1";
@@ -145,12 +146,13 @@ if (isMainModule) {
   const shutdown = async (signal: string) => {
     stopKeepWarm();
     await stopNexum();
+    const httpClosed = new Promise<void>(resolve => httpServer.close(() => resolve()));
+    await stopWormholeSystems();
     console.log(`Received ${signal}; shutting down.`);
-    httpServer.close(() => {
-      closeDatabase();
-      closeAuthDb();
-      process.exit(0);
-    });
+    await httpClosed;
+    closeDatabase();
+    closeAuthDb();
+    process.exit(0);
     setTimeout(() => process.exit(1), 10_000).unref();
   };
   process.on("SIGINT", () => shutdown("SIGINT"));

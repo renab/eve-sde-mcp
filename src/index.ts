@@ -7,10 +7,12 @@ import { downloadSde } from "./downloader.js";
 import { createMcpServer } from "./server.js";
 import { startKeepWarm,stopKeepWarm } from "./keep-warm.js";
 import { startNexum,stopNexum } from "./nexum.js";
+import { stopWormholeSystems } from "./wormholesystems.js";
 
 async function shutdown(): Promise<void> {
   stopKeepWarm();
   await stopNexum();
+  await stopWormholeSystems();
   closeDatabase();
   closeAuthDb();
 }

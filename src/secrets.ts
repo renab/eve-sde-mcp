@@ -9,7 +9,7 @@ export function redactSecrets(value: unknown): any {
   if (Array.isArray(value)) return value.map(redactSecrets);
   if (!value || typeof value !== "object") return value;
   const obj = value as Record<string, unknown>;
-  const credentialTool = typeof obj.name === "string" && /^nexum_(add|update)_credential$/.test(obj.name);
+  const credentialTool = typeof obj.name === "string" && /^(?:nexum|wormholesystems)_(?:add|update)_credential$/.test(obj.name);
   return Object.fromEntries(Object.entries(obj).map(([k,v]) => [k,
     /api.?key|authorization|password|secret|token/i.test(k) || (credentialTool && k === "arguments")
       ? "[REDACTED]" : redactSecrets(v)]));

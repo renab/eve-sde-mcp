@@ -20,6 +20,7 @@ import { registerPersistenceTools } from "./tools/persistence.js";
 import { registerKeepWarmTools } from "./tools/keep-warm.js";
 import { registerNexumTools } from "./tools/nexum.js";
 import { registerEntityContextTools } from "./tools/entity-context.js";
+import { registerWormholeSystemsTools } from "./tools/wormholesystems.js";
 import { beginForeground } from "./work-priority.js";
 import { enrichStructureToolResult } from "./structures.js";
 import { endpointDiscoveryShape } from "./entities.js";
@@ -83,6 +84,7 @@ export function createMcpServer(): McpServer {
   registerEntityContextTools(server);
   registerKeepWarmTools(server);
   registerNexumTools(server);
+  registerWormholeSystemsTools(server);
 
   return server;
 }
