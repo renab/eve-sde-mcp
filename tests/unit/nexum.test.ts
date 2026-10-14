@@ -32,6 +32,9 @@ class Upstream {
   patch=vi.fn(async(_base:string,key:string,_url:string,_body:Record<string,unknown>)=>{
     if(this.bad.has(key))throw new NexumError(403);return {ok:true};
   });
+  put=vi.fn(async(_base:string,key:string,_url:string,_body:Record<string,unknown>)=>{
+    if(this.bad.has(key))throw new NexumError(403);return {ok:true};
+  });
   stream=vi.fn(async(_base:string,key:string,_url:string,signal?:AbortSignal)=>{
     if(this.bad.has(key))throw new NexumError(401);
     const f=new Feed();this.feeds.push(f);signal?.addEventListener("abort",()=>f.close(),{once:true});return f;
@@ -48,6 +51,14 @@ beforeEach(()=>{
 });
 afterEach(async()=>{await service.stop();store.db.close();fs.rmSync(tmp,{recursive:true,force:true});vi.restoreAllMocks();delete process.env.NEXUM_BASE_URL;});
 async function enroll(label="McGreggor",api_key=key){const c=await service.addCredential({api_key,label});await until(()=>store.map(mapId).health==="live");return c;}
+const noteIdentity=(signatureCode="ABC-123")=>({connectionId:"note-edge",fromSystemId:"s1",toSystemId:"s2",
+  fromEveSystemId:31000001,toEveSystemId:31000002,signatureCode,maxStalenessMs:30_000});
+function prepareNoteRow(signatureId:string,notes=""){
+  store.saveState(mapId,{systems:[{id:"s1",eveSystemId:31000001},{id:"s2",eveSystemId:31000002}],
+    connections:[{id:"note-edge",sourceId:"s1",targetId:"s2",sourceSignatureId:signatureId,targetSignatureId:"partner-row",broken:false,timeStatus:"stable"}],routes:[]});
+  store.patchMap(mapId,{health:"live",hydrated_at:store.now()});
+  store.saveResource(mapId,"s1","signatures",[{id:signatureId,signature:"ABC-123",status:"active",notes}]);
+}
 
 describe("Nexum credentials and canonical synchronization",()=>{
   it("encrypts secrets, supports unknown/null expiry, and never serializes keys or secret refs",async()=>{
@@ -62,6 +73,113 @@ describe("Nexum credentials and canonical synchronization",()=>{
     await enroll("Minner",crypto.randomBytes(32).toString("base64url"));
     expect(store.maps()).toHaveLength(1);expect(store.access(mapId)).toHaveLength(2);expect(up.live()).toHaveLength(1);
     expect(up.calls).toEqual(["/api/v1/maps"]);
+  });
+  it("routes source-owned topology PUT and signature-note PATCH through Nexum's configured map transport",async()=>{
+    await enroll();
+    const request={sourceIdentity:"wormholesystems:source-map",snapshot:{complete:true,revision:"rev",fetchedAt:"2026-10-13T11:59:59.000Z",
+      observedAt:"2026-10-13T11:59:59.000Z",maxAgeMs:30_000},systems:[],connections:[]};
+    await service.writeWormholesystemsTopology(mapId,request);
+    expect(up.put).toHaveBeenCalledWith(base,key,`${endpoint}/wormholesystems/topology`,request,expect.any(AbortSignal));
+
+    prepareNoteRow("sig-row-1");
+    await expect(service.writeWormholesystemsSignatureNotes(mapId,[{systemId:"s1",signatureId:"sig-row-1",notes:".0-1 ABC-123 C3 medium",expectedIdentity:noteIdentity()}],()=>[]))
+      .resolves.toEqual({written:1,status:"completed",items:[{item_index:0,status:"written"}]});
+    expect(up.patch).toHaveBeenCalledWith(base,key,`${endpoint}/systems/s1/signatures/sig-row-1`,
+      {notes:".0-1 ABC-123 C3 medium"},expect.any(AbortSignal));
+    expect(store.resources(mapId,"s1").signatures.items).toEqual([{id:"sig-row-1",signature:"ABC-123",status:"active",notes:".0-1 ABC-123 C3 medium"}]);
+    prepareNoteRow("sig-row-2","manual");
+    up.patch.mockClear();
+    await expect(service.writeWormholesystemsSignatureNotes(mapId,[{systemId:"s1",signatureId:"sig-row-2",notes:".1-2 DEF-456 C4 large",expectedIdentity:noteIdentity()}],()=>[]))
+      .resolves.toMatchObject({status:"blocked",written:0});
+    expect(up.patch).not.toHaveBeenCalled();
+  });
+  it("serializes source alliance-note patches through the existing per-map Nexum queue",async()=>{
+    await enroll();
+    prepareNoteRow("source-note-row");
+    let enter!:()=>void,release!:()=>void;
+    const entered=new Promise<void>(resolve=>{enter=resolve;});
+    const hold=new Promise<void>(resolve=>{release=resolve;});
+    const queued=(service as any).enqueue(mapId,async()=>{enter();await hold;});
+    await entered;
+
+    const write=service.writeWormholesystemsSignatureNotes(mapId,[{systemId:"s1",signatureId:"source-note-row",notes:".0-1 ABC-123 C3 medium",expectedIdentity:noteIdentity()}],()=>[]);
+    await Promise.resolve();
+    expect(up.patch).not.toHaveBeenCalled();
+    release();
+    await queued;
+    await expect(write).resolves.toEqual({written:1,status:"completed",items:[{item_index:0,status:"written"}]});
+    expect(up.patch).toHaveBeenCalledWith(base,key,`${endpoint}/systems/s1/signatures/source-note-row`,
+      {notes:".0-1 ABC-123 C3 medium"},expect.any(AbortSignal));
+    expect(store.resources(mapId,"s1").signatures.items[0].notes).toBe(".0-1 ABC-123 C3 medium");
+  });
+  it("revalidates the current Nexum directional identity after waiting in the per-map queue",async()=>{
+    await enroll();prepareNoteRow("source-note-row");
+    let enter!:()=>void,release!:()=>void;
+    const entered=new Promise<void>(resolve=>{enter=resolve;}),hold=new Promise<void>(resolve=>{release=resolve;});
+    const queued=(service as any).enqueue(mapId,async()=>{enter();await hold;});
+    await entered;
+    const write=service.writeWormholesystemsSignatureNotes(mapId,[{systemId:"s1",signatureId:"source-note-row",
+      notes:".0-1 ABC-123 C3 medium",expectedIdentity:noteIdentity()}],()=>[]);
+    await Promise.resolve();
+    store.saveState(mapId,{...store.state(mapId),connections:[{id:"changed-edge",sourceId:"s1",targetId:"s2",
+      sourceSignatureId:"source-note-row",targetSignatureId:"partner-row",broken:false,timeStatus:"stable"}]});
+    release();await queued;
+    await expect(write).resolves.toMatchObject({written:0,status:"blocked",
+      blockers:["current Nexum directional signature identity changed after alliance-note preview"]});
+    expect(up.patch).not.toHaveBeenCalled();
+  });
+  it("reports an intervening desired note as unchanged rather than a write",async()=>{
+    await enroll();prepareNoteRow("source-note-row");
+    let enter!:()=>void,release!:()=>void;
+    const entered=new Promise<void>(resolve=>{enter=resolve;}),hold=new Promise<void>(resolve=>{release=resolve;});
+    const queued=(service as any).enqueue(mapId,async()=>{enter();await hold;});
+    await entered;
+    const desired=".0-1 ABC-123 C3 medium";
+    const write=service.writeWormholesystemsSignatureNotes(mapId,[{systemId:"s1",signatureId:"source-note-row",
+      notes:desired,expectedIdentity:noteIdentity()}],()=>[]);
+    await Promise.resolve();
+    store.saveResource(mapId,"s1","signatures",[{id:"source-note-row",signature:"ABC-123",status:"active",notes:desired}]);
+    release();await queued;
+    await expect(write).resolves.toEqual({written:0,status:"unchanged",items:[{item_index:0,status:"unchanged"}]});
+    expect(up.patch).not.toHaveBeenCalled();
+  });
+  it("keeps an acknowledged PATCH written when local cache persistence fails",async()=>{
+    await enroll();prepareNoteRow("source-note-row");
+    const desired=".0-1 ABC-123 C3 medium";
+    vi.spyOn(store,"saveResource").mockImplementationOnce(()=>{throw new Error("local disk failure");});
+
+    const result=await service.writeWormholesystemsSignatureNotes(mapId,[{systemId:"s1",signatureId:"source-note-row",
+      notes:desired,expectedIdentity:noteIdentity()}],()=>[]);
+
+    expect(up.patch).toHaveBeenCalledWith(base,key,`${endpoint}/systems/s1/signatures/source-note-row`,{notes:desired},expect.any(AbortSignal));
+    expect(result).toMatchObject({written:1,status:"completed",local_cache_status:"degraded",
+      items:[{item_index:0,status:"written",warnings:[expect.stringContaining("local signature cache persistence failed")] }],
+      warnings:[expect.stringContaining("local signature cache persistence failed")]});
+    expect(store.map(mapId)).toMatchObject({local_cache_status:"degraded",
+      local_cache_warning:expect.stringContaining("local signature cache persistence failed")});
+    expect(store.credential(store.credentials()[0].id).chain_write_status).toBe("available");
+    expect(store.resources(mapId,"s1").signatures.items[0].notes).toBe("");
+  });
+  it("reports acknowledged PATCHes on partial failure without exposing upstream error text",async()=>{
+    await enroll();
+    store.saveState(mapId,{systems:[{id:"s1",eveSystemId:31000001},{id:"s2",eveSystemId:31000002},{id:"s3",eveSystemId:31000003}],connections:[
+      {id:"note-edge-1",sourceId:"s1",targetId:"s2",sourceSignatureId:"sig-1",targetSignatureId:"partner-1",broken:false,timeStatus:"stable"},
+      {id:"note-edge-2",sourceId:"s1",targetId:"s3",sourceSignatureId:"sig-2",targetSignatureId:"partner-2",broken:false,timeStatus:"stable"}],routes:[]});
+    store.patchMap(mapId,{health:"live",hydrated_at:store.now()});
+    store.saveResource(mapId,"s1","signatures",[
+      {id:"sig-1",signature:"ABC-123",status:"active",notes:""},{id:"sig-2",signature:"DEF-456",status:"active",notes:""},
+    ]);
+    const first={systemId:"s1",signatureId:"sig-1",notes:"first",expectedIdentity:{...noteIdentity(),connectionId:"note-edge-1"}};
+    const second={systemId:"s1",signatureId:"sig-2",notes:"second",expectedIdentity:{...noteIdentity("DEF-456"),connectionId:"note-edge-2",toSystemId:"s3",toEveSystemId:31000003}};
+    up.patch.mockImplementationOnce(async()=>({ok:true})).mockImplementationOnce(async()=>{throw new Error("sensitive upstream response");});
+    const result=await service.writeWormholesystemsSignatureNotes(mapId,[first,second],()=>[]);
+    expect(result).toEqual({written:1,status:"failed",items:[
+      {item_index:0,status:"written"},{item_index:1,status:"failed"},
+    ]});
+    expect(JSON.stringify(result)).not.toContain("sensitive upstream response");
+    expect(store.resources(mapId,"s1").signatures.items).toEqual([
+      {id:"sig-1",signature:"ABC-123",status:"active",notes:"first"},{id:"sig-2",signature:"DEF-456",status:"active",notes:""},
+    ]);
   });
   it("hydrates map plus three narrow resource lists; every ordinary MCP read is cache-only",async()=>{
     await enroll();expect(up.calls).toEqual(["/api/v1/maps",endpoint,...["signatures","anomalies","structures"].map(k=>`${endpoint}/systems/s1/${k}`)]);
@@ -224,6 +342,29 @@ describe("chain identifier reconciliation",()=>{
     const diagnostic=service.chainDiagnostics(mapId);
     expect(diagnostic.note_format).toBe("WH | {chain} | {sig} | {dest_type}");expect(diagnostic.note_format_record).toMatchObject({id:record.id,key:mapId});
   });
+  it("suppresses legacy chain notes only on the enabled WormholeSystems target map",async()=>{
+    await enroll();
+    store.db.exec("CREATE TABLE wormholesystems_config (id TEXT PRIMARY KEY, config_json TEXT NOT NULL)");
+    store.db.prepare("INSERT INTO wormholesystems_config(id,config_json) VALUES ('singleton',?)").run(JSON.stringify({canonicalMapId:mapId,liveSyncEnabled:true}));
+    await service.handleEvent(mapId,{type:"system.update",id:"s1",updates:{isHome:true}},store.credential(store.credentials()[0].id));
+    store.saveResource(mapId,"s1","signatures",[{id:"h1",sigId:"ABC-123",sigType:"wormhole",whLeadsTo:"C3",notes:"old"}]);
+    up.patch.mockClear();
+    await service.reconcileChainNotes(mapId);
+    expect(up.patch).not.toHaveBeenCalled();
+    expect(store.map(mapId).chain_sync).toMatchObject({note_format:"wormholesystems_source"});
+
+    const credential=store.credential(store.credentials()[0].id);
+    store.discover(credential,[{id:"map-1",name:"Wormlife"},{id:"map-2",name:"Other"}],base);
+    const otherMap=canonicalMapId(base,"map-2");
+    store.saveState(otherMap,{id:"map-2",name:"Other",systems:[
+      {id:"home",isHome:true,systemClass:"C3",customLabels:[]},{id:"branch",name:"J223207",systemClass:"C2",customLabels:[]}],
+      connections:[{id:"edge",sourceId:"home",targetId:"branch",connectionType:"standard",sourceSignatureId:"home-row",targetSignatureId:"branch-row",broken:false}],routes:[]});
+    store.saveResource(otherMap,"home","signatures",[{id:"home-row",sigId:"ABC-123",sigType:"wormhole",notes:""}]);
+    store.saveResource(otherMap,"branch","signatures",[{id:"branch-row",sigId:"DEF-456",sigType:"wormhole",notes:""}]);
+    await service.reconcileChainNotes(otherMap);
+    expect(up.patch).toHaveBeenCalledWith(base,key,"/api/v1/maps/map-2/systems/home/signatures/home-row",expect.anything(),expect.anything());
+    expect(up.patch).toHaveBeenCalledWith(base,key,"/api/v1/maps/map-2/systems/branch/signatures/branch-row",expect.anything(),expect.anything());
+  });
   it("writes only a changed directional signature note and updates the local cache before its echo",async()=>{
     const c=await enroll();up.calls=[];
     await service.handleEvent(mapId,{type:"system.update",id:"s1",updates:{isHome:true}},store.credential(c.id));
@@ -330,5 +471,13 @@ describe("remote tool security and SSE transport",()=>{
     await expect(new HttpNexumTransport().get(base,key,"/api/v1/maps")).rejects.toMatchObject({status:429,retryAfterMs:12000,message:"Nexum HTTP 429"});
     expect(fetcher).toHaveBeenCalledWith(base+"/api/v1/maps",expect.objectContaining({redirect:"error",headers:expect.objectContaining({Authorization:`Bearer ${key}`})}));
     expect(normalizeBaseUrl(base+"/")).toBe(base);expect(()=>normalizeBaseUrl("http://example.com")).toThrow();expect(()=>normalizeBaseUrl(`https://${key}@example.com`)).toThrow();
+  });
+  it("sends topology through a bounded authenticated PUT without following redirects",async()=>{
+    const body={sourceIdentity:"wormholesystems:source-map",snapshot:{complete:true,revision:"rev",fetchedAt:"2026-10-13T11:59:59.000Z",
+      observedAt:"2026-10-13T11:59:59.000Z",maxAgeMs:30_000},systems:[],connections:[]};
+    const fetcher=vi.spyOn(globalThis,"fetch").mockResolvedValue(new Response(JSON.stringify({createdSystems:1}),{status:200}));
+    await expect(new HttpNexumTransport().put!(base,key,`${endpoint}/wormholesystems/topology`,body)).resolves.toEqual({createdSystems:1});
+    expect(fetcher).toHaveBeenCalledWith(base+`${endpoint}/wormholesystems/topology`,expect.objectContaining({method:"PUT",body:JSON.stringify(body),
+      redirect:"error",headers:expect.objectContaining({Authorization:`Bearer ${key}`,"Content-Type":"application/json"})}));
   });
 });

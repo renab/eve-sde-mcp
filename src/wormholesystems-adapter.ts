@@ -147,7 +147,6 @@ export function normalizeSourceSnapshot(input: {
   const systems: WormholeSystemsFixture["systems"] = [];
   const sourceDetails: unknown[] = [];
   const signatures: WormholeSystemsFixture["signatures"] = [];
-  const signatureByDirection = new Map<string, string>();
   const signatureBySourceId = new Map<string, { key: string; mapSystemId: string; signatureCode: string; sourceConnectionId: string | null }>();
   const signatureRowByKey = new Map<string, string>();
   const auditRecordCountByDetail: number[] = [];
@@ -228,9 +227,6 @@ export function normalizeSourceSnapshot(input: {
       if (!sourceId || !signatureCode || !mapSystemId) return;
       if (signatures.some(signature => signature.sourceSignatureId === sourceId)) issues.push({ path: `${signaturePath}.id`, reason: "duplicate source signature identity" });
       const key = `source-signature:${mapSystemId}:${sourceId}`;
-      const directionKey = `${mapSystemId}\0${signatureCode}`;
-      if (signatureByDirection.has(directionKey)) issues.push({ path: signaturePath, reason: "duplicate directional source signature identity" });
-      signatureByDirection.set(directionKey, key);
       signatureBySourceId.set(sourceId, { key, mapSystemId, signatureCode, sourceConnectionId: connectionId });
       signatureRowByKey.set(key, mapSystemId);
       signatures.push({ signatureKey: key, scannerEveSystemId: detailEveId, signatureCode,
@@ -257,6 +253,7 @@ export function normalizeSourceSnapshot(input: {
   const connectionDirectionKeys = new Map<string, [string | null, string | null]>();
   const connectionObservedAtById = new Map<string, string | null>();
   const signatureConnectionByResourceId = new Map<string, string>();
+  const connectionSignatureResourceIds = new Map<string, Set<string>>();
   for (const connection of connectionById.values()) {
     const fromEveSystemId = sourceSystemIds.get(connection.fromRowId);
     const toEveSystemId = sourceSystemIds.get(connection.toRowId);
@@ -281,7 +278,6 @@ export function normalizeSourceSnapshot(input: {
         continue;
       }
       const seenSignatureIds = new Set<string>();
-      const seenDirections = new Set<string>();
       connectionSignatures.forEach((value, index) => {
         const path = `${relationship.path}.signatures[${index}]`;
         if (!record(value)) { issues.push({ path, reason: "expected a connection-signature source record" }); return; }
@@ -300,15 +296,25 @@ export function normalizeSourceSnapshot(input: {
         if (value.map_connection_id !== undefined && value.map_connection_id !== null && opaque(value.map_connection_id, `${path}.map_connection_id`, issues) !== connection.id)
           issues.push({ path: `${path}.map_connection_id`, reason: "connection signature references a different connection" });
         const fullSignature = sourceId ? signatureBySourceId.get(sourceId) : undefined;
-        if (sourceId && !fullSignature)
-          issues.push({ path: `${path}.id`, reason: "connection signature does not reference a selected-system signature resource" });
         if (fullSignature && (fullSignature.mapSystemId !== rowId || fullSignature.signatureCode !== code))
           issues.push({ path, reason: "connection signature reference contradicts its full signature resource" });
         if (code && rowId && (rowId === connection.fromRowId || rowId === connection.toRowId)) {
-          const direction = `${rowId}\0${code}`;
-          if (seenDirections.has(direction)) issues.push({ path, reason: "duplicate connection signature relationship" });
-          seenDirections.add(direction);
-          if (!signatureByDirection.has(direction)) issues.push({ path, reason: "connection signature does not reference a selected-system signature" });
+          // A slim signature with no selected-system counterpart is valid
+          // source evidence but cannot render that direction's note.
+          if (sourceId) {
+            const linked = connectionSignatureResourceIds.get(connection.id) ?? new Set<string>();
+            linked.add(sourceId);
+            connectionSignatureResourceIds.set(connection.id, linked);
+          }
+          if (fullSignature && sourceId && fullSignature.sourceConnectionId === null) {
+            const normalizedSignature = signatures.find(signature => signature.sourceSignatureId === sourceId);
+            if (normalizedSignature) {
+              const destinationRowId = fullSignature.mapSystemId === connection.fromRowId ? connection.toRowId : connection.fromRowId;
+              const destinationEveId = sourceSystemIds.get(destinationRowId);
+              normalizedSignature.sourceConnectionId = connection.id;
+              if (destinationEveId !== undefined) normalizedSignature.connectedEveSystemId = destinationEveId;
+            }
+          }
           if (fullSignature?.sourceConnectionId && fullSignature.sourceConnectionId !== connection.id)
             issues.push({ path, reason: "connection signature contradicts selected signature connection identity" });
         }
@@ -319,11 +325,12 @@ export function normalizeSourceSnapshot(input: {
     }
     connectionObservedAtById.set(connection.id, connectionObservedAt);
     const endpointKeys: [string | null, string | null] = [null, null];
+    const nestedSourceIds = connectionSignatureResourceIds.get(connection.id) ?? new Set<string>();
     for (const [index, rowId] of [connection.fromRowId, connection.toRowId].entries()) {
-      // A signature's direct map_connection_id is a confirmed directional reference too.
-      const directional = signatures.filter(signature => signature.sourceConnectionId === connection.id &&
-        signature.scannerEveSystemId === sourceSystemIds.get(rowId));
-      if (directional.length > 1) issues.push({ path: connection.path, reason: "connection has multiple selected signatures for one endpoint" });
+      // A signature's direct map_connection_id or its validated nested
+      // connection-resource ID supplies the directional link.
+      const directional = signatures.filter(signature => signature.scannerEveSystemId === sourceSystemIds.get(rowId) &&
+        (signature.sourceConnectionId === connection.id || (signature.sourceSignatureId !== null && nestedSourceIds.has(signature.sourceSignatureId))));
       if (!endpointKeys[index] && directional.length === 1) endpointKeys[index] = directional[0].signatureKey;
     }
     connectionDirectionKeys.set(connection.id, endpointKeys);
@@ -343,11 +350,77 @@ export function normalizeSourceSnapshot(input: {
       toSignatureKey: relatedTo ?? (to.length === 1 ? to[0].signatureKey : null) });
   }
 
+  // A successfully normalized map detail plus every selected member detail is
+  // the complete source snapshot. Row timestamps and visual status are not
+  // topology freshness or liveness evidence.
+  const topologySystems = mapSystems.map((row, index) => {
+    const sourceSystemId = opaque(row.id, `$.data.map_solarsystems[${index}].id`, issues);
+    const eveSystemId = eveId(row.solarsystem_id, `$.data.map_solarsystems[${index}].solarsystem_id`, issues);
+    const position = record(row.position) ? row.position : {};
+    const coordinateValue = (value: unknown) => typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= 1_000_000 ? value : null;
+    return { sourceSystemId: sourceSystemId ?? "", eveSystemId: eveSystemId ?? 0,
+      positionX: coordinateValue(position.x), positionY: coordinateValue(position.y) };
+  });
+  const sourceValue = (value: unknown): string | null => typeof value === "string" && value.length > 0 && value.length <= 128 &&
+    value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value) ? value : null;
+  const topologyConnections = [...connectionById.values()].map(connection => ({
+    sourceConnectionId: connection.id,
+    fromSourceSystemId: connection.fromRowId,
+    toSourceSystemId: connection.toRowId,
+    connectionType: sourceValue(connection.value.type),
+    size: sourceValue(connection.value.ship_size),
+  }));
+
+  const homeEveSystemId = eveId(detail.home_solarsystem_id, "$.data.home_solarsystem_id", []);
+  const homeRows = homeEveSystemId === null ? [] : mapSystems.filter(row => eveId(row.solarsystem_id, "$.data.map_solarsystems.solarsystem_id", []) === homeEveSystemId);
+  const bookmarkSettings = record(detail.bookmark_settings) ? detail.bookmark_settings : {};
+  const rawStatusVocabulary = bookmarkSettings.status_annotations;
+  const knownStatusAnnotations = Array.isArray(rawStatusVocabulary)
+    ? [...new Set(rawStatusVocabulary.filter((value): value is string => typeof value === "string" && value.length > 0 &&
+      value.length <= 128 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value)))].sort()
+    : [];
+  const aliasCandidates = new Map<string, Array<{ sourceSystemId: string; alias: string; isHome: boolean; statusAnnotation: string | null; statusAnnotationConflict: boolean }>>();
+  const selectedDetailsByMember = new Map<string, Record<string, unknown>>();
+  for (const raw of sourceDetails) if (record(raw) && record(raw.data) && typeof raw.data.id === "string")
+    selectedDetailsByMember.set(raw.data.id, raw.data);
+  if (homeRows.length === 1 && homeEveSystemId !== null) mapSystems.forEach((row, index) => {
+    const sourceSystemId = opaque(row.id, `$.data.map_solarsystems[${index}].id`, []);
+    const systemEveId = eveId(row.solarsystem_id, `$.data.map_solarsystems[${index}].solarsystem_id`, []);
+    const alias = typeof row.alias === "string" ? row.alias
+      : Number.isSafeInteger(row.alias) && Number(row.alias) >= 0 ? String(row.alias) : null;
+    if (!sourceSystemId || systemEveId === null || alias === null || alias.length > 32) return;
+    const selectedDetail = selectedDetailsByMember.get(sourceSystemId);
+    const selectedAlias = selectedDetail?.alias;
+    if (selectedAlias !== undefined && selectedAlias !== null && String(selectedAlias) !== alias) return;
+    const isHome = systemEveId === homeEveSystemId;
+    const validAlias = isHome ? alias === "0" : /^[1-9]\d*$/.test(alias);
+    if (!validAlias) return;
+    const statusAgrees = selectedDetail?.status === undefined || selectedDetail.status === row.status;
+    const records = aliasCandidates.get(alias) ?? [];
+    records.push({ sourceSystemId, alias, isHome,
+      statusAnnotation: typeof row.status === "string" ? row.status : null,
+      statusAnnotationConflict: !statusAgrees });
+    aliasCandidates.set(alias, records);
+  });
+  // Duplicate aliases make only those directions ambiguous; omit them from
+  // validated note evidence while retaining all other rows.
+  const allianceSystems = [...aliasCandidates.values()].filter(rows => rows.length === 1).map(rows => rows[0]);
+  const allianceConnections = [...connectionById.values()].map(connection => ({
+    sourceConnectionId: connection.id,
+    size: sourceValue(connection.value.ship_size),
+  }));
+  const allianceSignatures = signatures.filter(signature => signature.sourceSignatureId !== null).map(signature => ({
+    sourceSignatureId: signature.sourceSignatureId!, statusAnnotation: null,
+  }));
+
   if (issues.length) return { ok: false, issues: issues.slice(0, 40) };
   const canonical = normalizeWormholeSystemsFixture({ fixtureOnly: true, sourceKind: "wormholesystems", schemaVersion: 1,
     sourceIdentity: input.sourceIdentity, revisionOrDigest: input.revisionOrDigest, fetchedAt: input.fetchedAt,
     observedAt, scope: { canonicalMapId: input.canonicalMapId, eveSolarSystemIds: systems.map(system => system.eveSolarSystemId) },
-    systems, signatures, connections, authorityMetadata: { confirmed: false, fields: null },
+    systems, signatures, connections,
+    topologyEvidence: { complete: true, systems: topologySystems, connections: topologyConnections },
+    allianceNoteEvidence: { knownStatusAnnotations, systems: allianceSystems, connections: allianceConnections, signatures: allianceSignatures },
+    authorityMetadata: { confirmed: false, fields: null },
     sourceMetadata: { map: detail, mapSolarSystems: mapSystems, solarSystemDetails: sourceDetails } });
   if (!canonical.ok) return { ok: false, issues: canonical.issues.slice(0, 40).map(issue => ({ path: issue.path, reason: issue.reason })) };
   return { ok: true, fixture: canonical.value, diagnostics: { systemCount: systems.length, signatureCount: signatures.length,

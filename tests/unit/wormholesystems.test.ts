@@ -11,7 +11,7 @@ import { registerWormholeSystemsTools } from "../../src/tools/wormholesystems.js
 import {
   WormholeSystemsClient, WormholeSystemsError, validateWormholeSystemsOrigin, validateWormholeSystemsPathPrefix,
 } from "../../src/wormholesystems-client.js";
-import { WormholeSystemsService } from "../../src/wormholesystems.js";
+import { canonicalSolarSystemClassFromSde, WormholeSystemsService } from "../../src/wormholesystems.js";
 import { normalizeSourceSnapshot } from "../../src/wormholesystems-adapter.js";
 import { mapDecisionBoundary } from "../../src/map-decision-boundary.js";
 
@@ -19,7 +19,8 @@ const tmpDirs: string[] = [];
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); for (const dir of tmpDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 const response = (payload: unknown, status = 200, headers: Record<string, string> = {}) => new Response(JSON.stringify(payload), { status, headers });
 
-function harness(transport: typeof fetch = vi.fn(async () => response({ data: [] })), sleep: (ms: number) => Promise<void> = async () => {}) {
+function harness(transport: typeof fetch = vi.fn(async () => response({ data: [] })), sleep: (ms: number) => Promise<void> = async () => {},
+  systemClass?: (eveSystemId: number) => string | null) {
   const db = openStateDatabase(":memory:");
   const store = new NexumStore(db, () => Date.parse("2026-10-13T12:00:00.000Z"));
   const credential = { id: "nexum-test", base_url: "https://nexum.invalid", label: "fixture", enabled: true };
@@ -29,9 +30,18 @@ function harness(transport: typeof fetch = vi.fn(async () => response({ data: []
   const secrets = { put: (id: string, value: string) => secretValues.set(id, value), get: (id: string) => {
     const value = secretValues.get(id); if (!value) throw new Error("Credential secret unavailable"); return value;
   }, remove: (id: string) => secretValues.delete(id) };
-  const service = new WormholeSystemsService(store, secrets, transport, () => Date.parse("2026-10-13T12:00:00.000Z"), sleep);
+  const nexumWrites = {
+    writeWormholesystemsTopology: vi.fn(async () => ({ status: "ok" } as any)),
+    writeWormholesystemsSignatureNotes: vi.fn(async (_map: string, changes: Array<any>, validateSource?: () => string[]) => {
+      const blockers = validateSource?.() ?? [];
+      return blockers.length ? { written: 0, status: "blocked", blockers,
+        items: changes.map((_: any, item_index: number) => ({ item_index, status: item_index ? "not_attempted" : "blocked" })) } as any :
+        { written: changes.length, status: "completed", items: changes.map((_: any, item_index: number) => ({ item_index, status: "written" })) } as any;
+    }),
+  };
+  const service = new WormholeSystemsService(store, secrets, transport, () => Date.parse("2026-10-13T12:00:00.000Z"), sleep, nexumWrites, systemClass);
   const maps = store.maps();
-  return { db, store, service, secrets, secretValues, targetMap: maps.find(map => map.name === "Target")!.id, otherMap: maps.find(map => map.name === "Other")!.id };
+  return { db, store, service, secrets, secretValues, nexumWrites, targetMap: maps.find(map => map.name === "Target")!.id, otherMap: maps.find(map => map.name === "Other")!.id };
 }
 
 async function configured(service: WormholeSystemsService, target: string, route: "id" | "slug" = "id") {
@@ -223,7 +233,8 @@ describe("WormholeSystems service and MCP controls", () => {
     await configured(h.service, h.targetMap, "slug");
     const result = await h.service.testConnection();
     expect(result).toMatchObject({ status: "maps_detail_schema_ok", authenticated: true, selected_upstream_map_id: "api-map-7", live_sync_enabled: false });
-    expect(h.service.configuration()).toMatchObject({ live_sync_enabled: false });
+    expect(h.service.configuration()).toMatchObject({ live_sync_enabled: false, eligible_for_writes: false,
+      write_eligibility: { topology: { eligible: false }, alliance_notes: { eligible: false } } });
     expect(h.service.enableSync()).toMatchObject({ live_sync_enabled: true, eligible_for_writes: false });
     expect(h.service.disableSync()).toMatchObject({ live_sync_enabled: false, eligible_for_writes: false });
     expect(calls.map(call => call.url)).toEqual(["https://wormholes.invalid/api/maps", "https://wormholes.invalid/api/maps/api-map-7",
@@ -466,6 +477,7 @@ describe("WormholeSystems service and MCP controls", () => {
     const result = await h.service.syncMap(h.targetMap);
     expect(result).toMatchObject({ status: "snapshot_validated", source_calls: 4, systemCount: 2,
       signatureCount: 2, connectionCount: 1, auditRecordCount: 2, eligible_for_writes: false, nexum_writes_attempted: false });
+    expect(result).toMatchObject({ topology_apply: { endpoint: "PUT /api/v1/maps/:mapId/wormholesystems/topology", status: "blocked" } });
     expect(transport.mock.calls.map(call => String(call[0]))).toEqual([
       "https://wormholes.invalid/api/maps", "https://wormholes.invalid/api/maps/api-map-7",
       "https://wormholes.invalid/api/map-solarsystems/map-system-a", "https://wormholes.invalid/api/map-solarsystems/map-system-b",
@@ -487,10 +499,170 @@ describe("WormholeSystems service and MCP controls", () => {
     expect(JSON.parse(stored.payload_json).fixture.sourceMetadata.solarSystemDetails[0].data.audits).toHaveLength(1);
     expect(h.service.status(h.targetMap)).toMatchObject({ source_freshness_evidence: { system_observations: 0,
       signature_observations: 0, signature_freshness_deadlines: 0, connection_observations: 0, connection_freshness_deadlines: 0 } });
+    const cachedState = h.store.state(h.targetMap) as any;
+    cachedState.systems = [{ id: "cached-system", eveSystemId: 31_000_002, systemClass: "C6" }];
+    h.store.saveState(h.targetMap, cachedState);
     const preview = h.service.preview(h.targetMap) as any;
     expect(preview.preview).toMatchObject({ local_only: true, upstream_calls: 0, writes_enabled: false });
+    expect(preview.preview.topology_apply).toMatchObject({ endpoint: "PUT /api/v1/maps/:mapId/wormholesystems/topology", eligible: false,
+      blockers: expect.arrayContaining(["systems[0].positionX: verified source-owned map position is unavailable"]) });
+    expect(preview.preview.alliance_notes).toHaveLength(2);
+    expect(preview.preview.alliance_notes.every((note: any) => note.eligible_for_write === false && note.blocking_fields.length > 0)).toBe(true);
+    expect(preview.preview.alliance_notes.every((note: any) => note.desired_note === null &&
+      note.blocking_fields.some((reason: string) => reason.includes("alias") || reason.includes("home identity")))).toBe(true);
+    expect(h.nexumWrites.writeWormholesystemsTopology).not.toHaveBeenCalled();
+    expect(h.nexumWrites.writeWormholesystemsSignatureNotes).not.toHaveBeenCalled();
     expect(JSON.stringify(preview)).not.toContain("token-do-not-echo");
     expect(transport.mock.calls.every(call => (call[1] as RequestInit | undefined)?.method === "GET")).toBe(true);
+    h.db.close();
+  });
+
+  it("previews and writes real directional alliance notes even when the topology API fails", async () => {
+    vi.stubEnv("GALAXY_WORMSYSTEMS_MAX_STALENESS_MS", "30000");
+    const mapRows = [
+      { id: "map-system-a", map_id: "api-map-7", solarsystem_id: 31_000_001, alias: "0", status: "SAFE", position: { x: 10, y: 20 } },
+      { id: "map-system-b", map_id: "api-map-7", solarsystem_id: 31_000_002, alias: "1", status: "SAFE", position: { x: 30, y: 40 } },
+    ];
+    const sigA = { id: "source-signature-a", signature_id: "ABC-123", map_solarsystem_id: "map-system-a", map_connection_id: "source-edge" };
+    const sigB = { id: "source-signature-b", signature_id: "DEF-456", map_solarsystem_id: "map-system-b", map_connection_id: "source-edge" };
+    let reverseAvailable = true;
+    const edge = () => ({ id: "source-edge", from_map_solarsystem_id: "map-system-a", to_map_solarsystem_id: "map-system-b",
+      type: "standard", ship_size: "medium", signatures: [
+        { id: sigA.id, signature_id: sigA.signature_id, map_solarsystem_id: sigA.map_solarsystem_id },
+        ...(reverseAvailable ? [{ id: sigB.id, signature_id: sigB.signature_id, map_solarsystem_id: sigB.map_solarsystem_id }] : []),
+      ] });
+    const mapDetail = () => ({ id: "api-map-7", slug: "api-slug", home_solarsystem_id: 31_000_001,
+      map_solarsystems: mapRows, map_connections: [edge()], bookmark_settings: { status_annotations: ["SAFE"] } });
+    const details = () => [
+      { data: { id: "map-system-a", map_id: "api-map-7", solarsystem_id: 31_000_001, alias: "0", signatures: [{ ...sigA, status: "inactive" }], map_connections: [edge()], audits: [] } },
+      { data: { id: "map-system-b", map_id: "api-map-7", solarsystem_id: 31_000_002, alias: "1",
+        signatures: reverseAvailable ? [{ ...sigB, status: "inactive" }] : [], map_connections: [edge()], audits: [] } },
+    ];
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: mapDetail() });
+      if (url.endsWith("/map-solarsystems/map-system-a")) return response(details()[0]);
+      if (url.endsWith("/map-solarsystems/map-system-b")) return response(details()[1]);
+      throw new Error("Unexpected source route");
+    });
+    const h = harness(transport as typeof fetch, async () => {}, id => id === 31_000_001 ? "C3" : "C2");
+    await configured(h.service, h.targetMap);
+    const connectionTest = await h.service.testConnection();
+    expect(connectionTest).toMatchObject({ status: "maps_detail_schema_ok" });
+    h.service.enableSync();
+
+    h.store.patchMap(h.targetMap, { health: "live", hydrated_at: Date.parse("2026-10-13T12:00:00.000Z") });
+    const nexumState = { systems: [
+      { id: "nexum-a", eveSystemId: 31_000_001, systemClass: "NS" }, { id: "nexum-b", eveSystemId: 31_000_002, systemClass: "C6" },
+    ], connections: [{ id: "nexum-edge", sourceId: "nexum-a", targetId: "nexum-b", connectionType: "standard",
+      sourceSignatureId: "nexum-sig-a", targetSignatureId: "nexum-sig-b", broken: false, timeStatus: "stable" }], routes: [] };
+    h.store.saveState(h.targetMap, nexumState);
+    h.store.saveResource(h.targetMap, "nexum-a", "signatures", [{ id: "nexum-sig-a", signature: "ABC-123", status: "active", notes: "" }]);
+    h.store.saveResource(h.targetMap, "nexum-b", "signatures", [{ id: "nexum-sig-b", signature: "DEF-456", status: "active", notes: "" }]);
+    h.nexumWrites.writeWormholesystemsTopology.mockResolvedValueOnce({ createdSystems: 1, preservedSystems: 2,
+      updatedSystems: 0, deletedSystems: 0, createdConnections: 0, preservedConnections: 1,
+      updatedConnections: 0, deletedConnections: 0, conflicts: [{ itemId: "source-member", reason: "preserved" }] } as any);
+    const cacheWarning = "Nexum acknowledged the alliance-note PATCH, but local signature cache persistence failed; cached notes may be stale.";
+    h.nexumWrites.writeWormholesystemsSignatureNotes.mockResolvedValueOnce({ written: 2, status: "completed", local_cache_status: "degraded",
+      warnings: [cacheWarning], items: [{ item_index: 0, status: "written" }, { item_index: 1, status: "written" }] } as any);
+    const result = await h.service.syncMap(h.targetMap) as any;
+    expect(result).toMatchObject({ eligible_for_writes: true, topology_apply: { status: "completed" }, alliance_note_writes_attempted: true,
+      alliance_note_apply: { status: "completed", written: 2, local_cache_status: "degraded", warnings: [cacheWarning] } });
+    expect(h.nexumWrites.writeWormholesystemsTopology).toHaveBeenCalledWith(h.targetMap, expect.objectContaining({
+      snapshot: { complete: true, fetchedAt: result.fetched_at },
+      systems: expect.arrayContaining([{ sourceSystemId: "map-system-a", eveSystemId: 31_000_001, positionX: 10, positionY: 20 }]),
+      connections: [{ sourceConnectionId: "source-edge", fromSourceSystemId: "map-system-a", toSourceSystemId: "map-system-b",
+        connection_type: "standard", ship_size: "medium" }],
+    }));
+    expect(result.topology_apply).toMatchObject({ request_status: "succeeded", reconciliation_status: "partial",
+      created_systems: 1, preserved_systems: 2, preserved_connections: 1, conflict_count: 1 });
+    const noteWriteCall = h.nexumWrites.writeWormholesystemsSignatureNotes.mock.calls[0];
+    expect(noteWriteCall[0]).toBe(h.targetMap);
+    expect(noteWriteCall[1]).toEqual(expect.arrayContaining([
+      expect.objectContaining({ systemId: "nexum-a", signatureId: "nexum-sig-a", notes: ".0-1 ABC-123 C2 medium SAFE",
+        expectedIdentity: expect.objectContaining({ connectionId: "nexum-edge", signatureCode: "ABC-123" }) }),
+      expect.objectContaining({ systemId: "nexum-b", signatureId: "nexum-sig-b", notes: "..1-0 DEF-456 C3 medium SAFE",
+        expectedIdentity: expect.objectContaining({ connectionId: "nexum-edge", signatureCode: "DEF-456" }) }),
+    ]));
+    expect(noteWriteCall[2]).toBeTypeOf("function");
+    expect(h.service.status(h.targetMap)).toMatchObject({ eligible_for_topology_write: true,
+      eligible_for_alliance_note_writes: true, eligible_for_writes: true,
+      last_attempt: { write_outcomes: { topology: { status: "completed" }, alliance_notes: { status: "completed", written: 2,
+        items: [{ item_index: 0, status: "written" }, { item_index: 1, status: "written" }], local_cache_status: "degraded", warnings: [cacheWarning] } } } });
+    const preview = h.service.preview(h.targetMap) as any;
+    expect(preview.preview.alliance_notes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ desired_note: ".0-1 ABC-123 C2 medium SAFE", eligible_for_write: true }),
+      expect.objectContaining({ desired_note: "..1-0 DEF-456 C3 medium SAFE", eligible_for_write: true }),
+    ]));
+
+    h.nexumWrites.writeWormholesystemsTopology.mockResolvedValueOnce({ createdSystems: 0, preservedSystems: 0,
+      updatedSystems: 0, deletedSystems: 0, createdConnections: 0, preservedConnections: 0,
+      updatedConnections: 0, deletedConnections: 0, conflicts: [] } as any);
+    const noOp = await h.service.syncMap(h.targetMap) as any;
+    expect(noOp.topology_apply).toMatchObject({ status: "completed", request_status: "succeeded",
+      reconciliation_status: "unchanged", conflict_count: 0 });
+
+    h.nexumWrites.writeWormholesystemsTopology.mockRejectedValue(new Error("topology endpoint unavailable"));
+    h.nexumWrites.writeWormholesystemsSignatureNotes.mockImplementationOnce(async (_map, _changes, validateSource) => {
+      h.db.prepare("UPDATE wormholesystems_source_snapshots SET revision_or_digest='interleaved-revision',fetched_at='2026-10-13T11:00:00.000Z' WHERE map_id=?").run(h.targetMap);
+      const configRow = h.db.prepare("SELECT config_json FROM wormholesystems_config WHERE id='singleton'").get() as any;
+      const interleavedConfig = { ...JSON.parse(configRow.config_json), configurationRevision: "interleaved-config-revision" };
+      h.db.prepare("UPDATE wormholesystems_config SET config_json=? WHERE id='singleton'").run(JSON.stringify(interleavedConfig));
+      const blockers = validateSource?.() ?? [];
+      return { written: 0, status: "blocked", blockers, items: [{ item_index: 0, status: "blocked" }] } as any;
+    });
+    const stale = await h.service.syncMap(h.targetMap) as any;
+    expect(stale).toMatchObject({ topology_apply: { status: "failed" }, alliance_note_writes_attempted: false, eligible_for_writes: false,
+      alliance_note_apply: { status: "blocked", blockers: expect.arrayContaining([
+        "source configuration changed after alliance-note preview",
+        "source snapshot revision or identity changed after alliance-note preview",
+        "source snapshot exceeds the configured maximum matching staleness",
+      ]) } });
+    expect(h.service.configuration()).toMatchObject({ eligible_for_writes: false,
+      write_eligibility: { topology: { eligible: false }, alliance_notes: { eligible: false } } });
+
+    reverseAvailable = false;
+    const partial = await h.service.syncMap(h.targetMap) as any;
+    expect(partial).toMatchObject({ status: "snapshot_validated", topology_apply: { status: "failed" } });
+    const partialNoteCall = h.nexumWrites.writeWormholesystemsSignatureNotes.mock.lastCall!;
+    expect(partialNoteCall[0]).toBe(h.targetMap);
+    expect(partialNoteCall[1]).toEqual([expect.objectContaining({ systemId: "nexum-a", signatureId: "nexum-sig-a",
+      notes: ".0-1 ABC-123 C2 medium SAFE", expectedIdentity: expect.objectContaining({ signatureCode: "ABC-123" }) })]);
+    expect(partialNoteCall[2]).toBeTypeOf("function");
+    const partialPreview = h.service.preview(h.targetMap) as any;
+    expect(partialPreview.preview.alliance_notes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ desired_note: ".0-1 ABC-123 C2 medium SAFE", eligible_for_write: true }),
+      expect.objectContaining({ desired_note: null, eligible_for_write: false,
+        blocking_fields: expect.arrayContaining(["directional signature: source connection has no unique linked signature for this endpoint"]) }),
+    ]));
+
+    h.nexumWrites.writeWormholesystemsSignatureNotes.mockImplementationOnce(async (_map, changes) => {
+      const intervening = changes[0];
+      const signatures = h.store.resources(h.targetMap, intervening.systemId).signatures.items as any[];
+      h.store.saveResource(h.targetMap, intervening.systemId, "signatures", signatures.map(signature =>
+        signature.id === intervening.signatureId ? { ...signature, notes: intervening.notes } : signature));
+      return { written: 0, status: "unchanged", items: changes.map((_: any, item_index: number) => ({ item_index, status: "unchanged" })) } as any;
+    });
+    const interleavedNoOp = await h.service.syncMap(h.targetMap) as any;
+    expect(interleavedNoOp.alliance_note_apply).toMatchObject({ status: "unchanged", written: 0, skipped: 1, blocked: 1,
+      items: [{ item_index: 0, status: "skipped" }, { item_index: 1, status: "blocked" }] });
+    expect(h.service.status(h.targetMap)).toMatchObject({ last_attempt: { write_outcomes: { alliance_notes: {
+      status: "unchanged", written: 0, skipped: 1, blocked: 1,
+      items: [{ item_index: 0, status: "skipped" }, { item_index: 1, status: "blocked" }] } } } });
+    const interleavedSignatures = h.store.resources(h.targetMap, "nexum-a").signatures.items as any[];
+    h.store.saveResource(h.targetMap, "nexum-a", "signatures", interleavedSignatures.map(signature => ({ ...signature, notes: "" })));
+
+    reverseAvailable = true;
+    h.nexumWrites.writeWormholesystemsSignatureNotes.mockImplementationOnce(async (_map, changes) => {
+      return { written: 1, status: "failed", items: [{ item_index: 0, status: "written" }, { item_index: 1, status: "failed" }] } as any;
+    });
+    const partialPatchFailure = await h.service.syncMap(h.targetMap) as any;
+    expect(partialPatchFailure.alliance_note_apply).toMatchObject({ status: "failed", written: 1, failed: 1, skipped: 0,
+      not_attempted: 0, items: [{ item_index: 0, status: "written" }, { item_index: 1, status: "failed" }] });
+    expect(h.service.status(h.targetMap)).toMatchObject({ last_attempt: { write_outcomes: { alliance_notes: {
+      status: "failed", written: 1, failed: 1, items: [{ item_index: 0, status: "written" }, { item_index: 1, status: "failed" }] } } } });
+    expect(partialPatchFailure.alliance_note_write_error).toBe("Nexum alliance-note PATCH failed; details omitted");
     h.db.close();
   });
 
@@ -499,8 +671,8 @@ describe("WormholeSystems service and MCP controls", () => {
       { id: "map-system-a", map_id: "api-map-7", solarsystem_id: 31_000_001 },
       { id: "map-system-b", map_id: "api-map-7", solarsystem_id: 31_000_002 },
     ];
-    const signatureA = { id: "signature-resource-a", signature_id: "ABC-123", map_solarsystem_id: "map-system-a", map_connection_id: "edge" };
-    const signatureB = { id: "signature-resource-b", signature_id: "DEF-456", map_solarsystem_id: "map-system-b", map_connection_id: "edge" };
+    const signatureA = { id: "signature-resource-a", signature_id: "ABC-123", map_solarsystem_id: "map-system-a" };
+    const signatureB = { id: "signature-resource-b", signature_id: "DEF-456", map_solarsystem_id: "map-system-b" };
     const referenceA = { id: signatureA.id, signature_id: signatureA.signature_id, map_solarsystem_id: signatureA.map_solarsystem_id };
     const referenceB = { id: signatureB.id, signature_id: signatureB.signature_id, map_solarsystem_id: signatureB.map_solarsystem_id };
     const connection = (signatures: unknown[]) => ({ id: "edge", from_map_solarsystem_id: "map-system-a",
@@ -519,14 +691,20 @@ describe("WormholeSystems service and MCP controls", () => {
     if (valid.ok) expect(valid.fixture.signatures.map(signature => [signature.sourceSignatureId, signature.signatureCode])).toEqual([
       ["signature-resource-a", "ABC-123"], ["signature-resource-b", "DEF-456"],
     ]);
+    if (valid.ok) expect(valid.fixture.connections[0]).toMatchObject({ fromSignatureKey: expect.stringContaining("signature-resource-a"),
+      toSignatureKey: expect.stringContaining("signature-resource-b") });
 
     const missingIdA = { signature_id: "ABC-123", map_solarsystem_id: "map-system-a" };
     expect(normalize([connection([missingIdA, referenceB])], [connection([referenceA]), connection([referenceB])]))
       .toMatchObject({ ok: false });
     expect(normalize([connection([referenceA, referenceB])], [connection([missingIdA]), connection([referenceB])]))
       .toMatchObject({ ok: false });
-    expect(normalize([connection([{ ...referenceA, id: "wrong-signature-resource" }, referenceB])],
-      [connection([referenceA]), connection([referenceB])])).toMatchObject({ ok: false });
+    const missingDirectionalLink = normalize([connection([{ ...referenceA, id: "wrong-signature-resource" }, referenceB])],
+      [connection([{ ...referenceA, id: "wrong-signature-resource" }]), connection([referenceB])]);
+    expect(missingDirectionalLink).toMatchObject({ ok: true });
+    if (missingDirectionalLink.ok) expect(missingDirectionalLink.fixture.connections[0]).toMatchObject({
+      fromSignatureKey: null, toSignatureKey: expect.stringContaining("signature-resource-b"),
+    });
     const duplicate = normalize([connection([referenceA, { ...referenceB, id: referenceA.id }])],
       [connection([referenceA]), connection([referenceB])]);
     expect(duplicate).toMatchObject({ ok: false });

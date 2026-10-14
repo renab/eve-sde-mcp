@@ -14,6 +14,7 @@ export interface NexumStream { events: AsyncIterable<Json>; close(): void; }
 export interface NexumTransport {
   get(base: string, key: string, endpoint: string, signal?: AbortSignal): Promise<any>;
   patch?(base: string, key: string, endpoint: string, body: Record<string,unknown>, signal?: AbortSignal): Promise<any>;
+  put?(base: string, key: string, endpoint: string, body: Record<string,unknown>, signal?: AbortSignal): Promise<any>;
   stream(base: string, key: string, endpoint: string, signal?: AbortSignal): Promise<NexumStream>;
 }
 /** Nexum uses unnamed data frames, no event IDs/replay, and comment heartbeats every 25s. */
@@ -58,6 +59,14 @@ export class HttpNexumTransport implements NexumTransport {
     const s=AbortSignal.any([AbortSignal.timeout(20_000),...(signal?[signal]:[])]);
     try {
       const r=await fetch(base+endpoint,{method:"PATCH",headers:{Authorization:`Bearer ${key}`,Accept:"application/json","Content-Type":"application/json"},body:JSON.stringify(body),redirect:"error",signal:s});
+      if(!r.ok){const retry=r.headers.get("retry-after"),ms=retry?(/^\d+(\.\d+)?$/.test(retry)?Number(retry)*1000:Math.max(0,Date.parse(retry)-Date.now())):0;await r.body?.cancel();throw new NexumError(r.status,Number.isFinite(ms)?ms:0,`Nexum HTTP ${r.status}`);}
+      const text=await r.text(); return text?parseEsiJson(text):{};
+    } catch(e){if(e instanceof NexumError)throw e;throw new NexumError();}
+  }
+  async put(base:string,key:string,endpoint:string,body:Record<string,unknown>,signal?:AbortSignal):Promise<any> {
+    const s=AbortSignal.any([AbortSignal.timeout(20_000),...(signal?[signal]:[])]);
+    try {
+      const r=await fetch(base+endpoint,{method:"PUT",headers:{Authorization:`Bearer ${key}`,Accept:"application/json","Content-Type":"application/json"},body:JSON.stringify(body),redirect:"error",signal:s});
       if(!r.ok){const retry=r.headers.get("retry-after"),ms=retry?(/^\d+(\.\d+)?$/.test(retry)?Number(retry)*1000:Math.max(0,Date.parse(retry)-Date.now())):0;await r.body?.cancel();throw new NexumError(r.status,Number.isFinite(ms)?ms:0,`Nexum HTTP ${r.status}`);}
       const text=await r.text(); return text?parseEsiJson(text):{};
     } catch(e){if(e instanceof NexumError)throw e;throw new NexumError();}

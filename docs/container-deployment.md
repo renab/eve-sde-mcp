@@ -127,8 +127,9 @@ Kubernetes set `fsGroup: 1000` on the pod):
   is disabled by default and requires a successful explicit connection/schema
   test followed by `wormholesystems_enable_sync`; registration or testing alone
   does not activate it. This repository has not tested the actual alliance
-  deployment. Source sync remains on-demand and GET-only; no Nexum writes or
-  authority-dependent bookmark rendering are enabled.
+  deployment. Source sync remains on-demand and GET-only. A validated complete
+  map snapshot may qualify for the configured Nexum topology and note gates;
+  deployed source credentials, routes, schema and rate limits remain unverified.
 
 ### External dependencies (outbound HTTPS)
 

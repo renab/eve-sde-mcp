@@ -2,8 +2,21 @@
  * Versioned canonical snapshot boundary for synthetic fixtures and the
  * strictly validated WormholeSystems source adapter. Nothing here performs I/O.
  */
+
 export type ConnectionState = "active" | "broken" | "expired" | "unknown";
 export type FixtureSignatureStatus = "active" | "inactive" | "unknown";
+export type ValidatedTopologyEvidence = {
+  complete: true;
+  systems: Array<{ sourceSystemId: string; eveSystemId: number; positionX: number | null; positionY: number | null }>;
+  connections: Array<{ sourceConnectionId: string; fromSourceSystemId: string; toSourceSystemId: string;
+    connectionType: string | null; size: string | null }>;
+};
+export type ValidatedAllianceNoteEvidence = {
+  knownStatusAnnotations: string[];
+  systems: Array<{ sourceSystemId: string; alias: string; isHome: boolean; statusAnnotation: string | null; statusAnnotationConflict: boolean }>;
+  connections: Array<{ sourceConnectionId: string; size: string | null }>;
+  signatures: Array<{ sourceSignatureId: string; statusAnnotation: string | null }>;
+};
 
 export type WormholeSystemsFixture = {
   fixtureOnly: true;
@@ -42,6 +55,10 @@ export type WormholeSystemsFixture = {
     fromSignatureKey: string | null;
     toSignatureKey: string | null;
   }>;
+  /** Present only after the adapter has semantically validated every Nexum topology field. */
+  topologyEvidence?: ValidatedTopologyEvidence;
+  /** Present only after aliases and explicit alliance annotations have validated source semantics. */
+  allianceNoteEvidence?: ValidatedAllianceNoteEvidence;
   authorityMetadata: { confirmed: false; fields: null };
   /** Raw validated source fields are retained as opaque JSON, never interpreted as authority. */
   sourceMetadata?: unknown;
@@ -137,7 +154,7 @@ const identity = (scanner: number, code: string, sourceId: string | null) => `${
 export function validateWormholeSystemsFixture(input: unknown): FixtureValidationResult {
   const issues: FixtureValidationIssue[] = [];
   if (!isRecord(input)) return { ok: false, issues: [{ path: "$", reason: "expected an object" }] };
-  const fixtureKeys = ["fixtureOnly", "sourceKind", "schemaVersion", "sourceIdentity", "revisionOrDigest", "fetchedAt", "observedAt", "scope", "systems", "signatures", "connections", "authorityMetadata", "sourceMetadata"];
+  const fixtureKeys = ["fixtureOnly", "sourceKind", "schemaVersion", "sourceIdentity", "revisionOrDigest", "fetchedAt", "observedAt", "scope", "systems", "signatures", "connections", "topologyEvidence", "allianceNoteEvidence", "authorityMetadata", "sourceMetadata"];
   for (const key of ["fixtureOnly", "schemaVersion", "sourceIdentity", "revisionOrDigest", "fetchedAt", "observedAt", "scope", "systems", "signatures", "connections", "authorityMetadata"])
     if (!(key in input)) issues.push({ path: `$.${key}`, reason: "required field is missing" });
   for (const key of Object.keys(input)) if (!fixtureKeys.includes(key)) issues.push({ path: `$.${key}`, reason: "unrecognized field" });
@@ -221,6 +238,83 @@ export function validateWormholeSystemsFixture(input: unknown): FixtureValidatio
     };
     if (!boundedJson(input.sourceMetadata)) issues.push({ path: "$.sourceMetadata", reason: "expected bounded JSON source fields" });
   }
+  if (input.topologyEvidence !== undefined) {
+    const evidence = input.topologyEvidence;
+    if (!isRecord(evidence)) issues.push({ path: "$.topologyEvidence", reason: "expected explicitly validated topology evidence" });
+    else {
+      strictKeys(evidence, ["complete", "systems", "connections"], "$.topologyEvidence", issues);
+      if (evidence.complete !== true) issues.push({ path: "$.topologyEvidence.complete", reason: "topology authority requires a complete fetched map snapshot" });
+      for (const [name, rows] of [["systems", evidence.systems], ["connections", evidence.connections]] as const) {
+        if (!Array.isArray(rows)) { issues.push({ path: `$.topologyEvidence.${name}`, reason: "expected a bounded evidence array" }); continue; }
+        if (rows.length > (name === "systems" ? 100 : 2_000)) issues.push({ path: `$.topologyEvidence.${name}`, reason: "evidence array exceeds its bound" });
+        rows.forEach((row, index) => {
+          const p = `$.topologyEvidence.${name}[${index}]`;
+          if (!isRecord(row)) { issues.push({ path: p, reason: "expected an evidence record" }); return; }
+          if (name === "systems") {
+            strictKeys(row, ["sourceSystemId", "eveSystemId", "positionX", "positionY"], p, issues);
+            nonempty(row.sourceSystemId, `${p}.sourceSystemId`, issues);
+            eveId(row.eveSystemId, `${p}.eveSystemId`, issues);
+            for (const key of ["positionX", "positionY"])
+              if (row[key] !== null && (typeof row[key] !== "number" || !Number.isFinite(row[key]))) issues.push({ path: `${p}.${key}`, reason: "expected a finite source coordinate or null" });
+          } else {
+            strictKeys(row, ["sourceConnectionId", "fromSourceSystemId", "toSourceSystemId", "connectionType", "size"], p, issues);
+            nonempty(row.sourceConnectionId, `${p}.sourceConnectionId`, issues);
+            nonempty(row.fromSourceSystemId, `${p}.fromSourceSystemId`, issues);
+            nonempty(row.toSourceSystemId, `${p}.toSourceSystemId`, issues);
+            for (const key of ["connectionType", "size"])
+              if (row[key] !== null && (typeof row[key] !== "string" || row[key].length > 128)) issues.push({ path: `${p}.${key}`, reason: "expected a bounded source value or null" });
+          }
+        });
+      }
+    }
+  }
+  if (input.allianceNoteEvidence !== undefined) {
+    const evidence = input.allianceNoteEvidence;
+    if (!isRecord(evidence)) issues.push({ path: "$.allianceNoteEvidence", reason: "expected explicitly validated alliance-note evidence" });
+    else {
+      strictKeys(evidence, ["knownStatusAnnotations", "systems", "connections", "signatures"], "$.allianceNoteEvidence", issues);
+      const annotations = new Set<string>();
+      if (!Array.isArray(evidence.knownStatusAnnotations)) issues.push({ path: "$.allianceNoteEvidence.knownStatusAnnotations", reason: "expected a validated status-annotation vocabulary" });
+      else evidence.knownStatusAnnotations.forEach((value, index) => {
+        if (typeof value !== "string" || !value.trim() || value.trim() !== value || value.length > 128 || /[\u0000-\u001f\u007f]/.test(value))
+          issues.push({ path: `$.allianceNoteEvidence.knownStatusAnnotations[${index}]`, reason: "expected a bounded exact status annotation" });
+        else if (annotations.has(value)) issues.push({ path: `$.allianceNoteEvidence.knownStatusAnnotations[${index}]`, reason: "duplicate status annotation" });
+        else annotations.add(value);
+      });
+      if (!Array.isArray(evidence.systems)) issues.push({ path: "$.allianceNoteEvidence.systems", reason: "expected validated source aliases" });
+      else evidence.systems.forEach((row, index) => {
+        const p = `$.allianceNoteEvidence.systems[${index}]`;
+        if (!isRecord(row)) { issues.push({ path: p, reason: "expected a source alias record" }); return; }
+        strictKeys(row, ["sourceSystemId", "alias", "isHome", "statusAnnotation", "statusAnnotationConflict"], p, issues);
+        nonempty(row.sourceSystemId, `${p}.sourceSystemId`, issues);
+        if (typeof row.isHome !== "boolean") issues.push({ path: `${p}.isHome`, reason: "expected validated home identity" });
+        if (typeof row.statusAnnotationConflict !== "boolean") issues.push({ path: `${p}.statusAnnotationConflict`, reason: "expected explicit source status consistency evidence" });
+        if (typeof row.alias !== "string" || (row.isHome === true ? row.alias !== "0" : !/^[1-9]\d*$/.test(row.alias)))
+          issues.push({ path: `${p}.alias`, reason: "home alias must be 0; branch aliases must be positive decimals" });
+        if (row.statusAnnotation !== undefined && row.statusAnnotation !== null &&
+            (typeof row.statusAnnotation !== "string" || row.statusAnnotation.length > 128 || row.statusAnnotation.trim() !== row.statusAnnotation))
+          issues.push({ path: `${p}.statusAnnotation`, reason: "expected a bounded exact source status value or null" });
+      });
+      if (!Array.isArray(evidence.connections)) issues.push({ path: "$.allianceNoteEvidence.connections", reason: "expected validated connection sizes" });
+      else evidence.connections.forEach((row, index) => {
+        const p = `$.allianceNoteEvidence.connections[${index}]`;
+        if (!isRecord(row)) { issues.push({ path: p, reason: "expected a source connection note record" }); return; }
+        strictKeys(row, ["sourceConnectionId", "size"], p, issues);
+        nonempty(row.sourceConnectionId, `${p}.sourceConnectionId`, issues);
+        if (row.size !== null && (typeof row.size !== "string" || row.size.length > 128))
+          issues.push({ path: `${p}.size`, reason: "expected a bounded source ship-size value or null" });
+      });
+      if (!Array.isArray(evidence.signatures)) issues.push({ path: "$.allianceNoteEvidence.signatures", reason: "expected validated directional-signature annotations" });
+      else evidence.signatures.forEach((row, index) => {
+        const p = `$.allianceNoteEvidence.signatures[${index}]`;
+        if (!isRecord(row)) { issues.push({ path: p, reason: "expected a source signature note record" }); return; }
+        strictKeys(row, ["sourceSignatureId", "statusAnnotation"], p, issues);
+        nonempty(row.sourceSignatureId, `${p}.sourceSignatureId`, issues);
+        if (row.statusAnnotation !== null && (typeof row.statusAnnotation !== "string" || row.statusAnnotation.length > 128 || row.statusAnnotation.trim() !== row.statusAnnotation))
+          issues.push({ path: `${p}.statusAnnotation`, reason: "expected a bounded exact source status value or null" });
+      });
+    }
+  }
 
   if (issues.length) return { ok: false, issues };
   const value = input as unknown as WormholeSystemsFixture;
@@ -259,6 +353,62 @@ export function validateWormholeSystemsFixture(input: unknown): FixtureValidatio
         issues.push({ path: `$.connections[${i}]`, reason: "directional signature reference contradicts connection endpoints or identity" });
     }
   }
+  if (value.topologyEvidence) {
+    const evidence = value.topologyEvidence;
+    const sourceSystemsById = new Map(value.systems.filter(system => system.sourceSystemId !== null).map(system => [system.sourceSystemId!, system]));
+    if (evidence.systems.length !== value.systems.length)
+      issues.push({ path: "$.topologyEvidence.systems", reason: "topology evidence must correspond to the complete selected map system list" });
+    for (const [index, system] of evidence.systems.entries()) {
+      const source = sourceSystemsById.get(system.sourceSystemId);
+      if (!source || source.eveSolarSystemId !== system.eveSystemId)
+        issues.push({ path: `$.topologyEvidence.systems[${index}]`, reason: "topology identity does not match the normalized source member/EVE identity" });
+    }
+    const sourceConnectionsById = new Map(value.connections.map(connection => [connection.sourceConnectionId, connection]));
+    const evidenceSystemByEve = new Map(evidence.systems.map(system => [system.eveSystemId, system.sourceSystemId]));
+    if (evidence.connections.length !== value.connections.length)
+      issues.push({ path: "$.topologyEvidence.connections", reason: "topology evidence must correspond to the complete selected map connection list" });
+    for (const [index, connection] of evidence.connections.entries()) {
+      const source = sourceConnectionsById.get(connection.sourceConnectionId);
+      if (!source || source.fromEveSystemId !== value.systems.find(system => system.sourceSystemId === connection.fromSourceSystemId)?.eveSolarSystemId ||
+          source.toEveSystemId !== value.systems.find(system => system.sourceSystemId === connection.toSourceSystemId)?.eveSolarSystemId)
+        issues.push({ path: `$.topologyEvidence.connections[${index}]`, reason: "topology endpoints do not match normalized source connection identity" });
+      if (!source)
+        issues.push({ path: `$.topologyEvidence.connections[${index}]`, reason: "topology connection is not in the normalized source snapshot" });
+      if (evidenceSystemByEve.get(source?.fromEveSystemId ?? 0) !== connection.fromSourceSystemId ||
+          evidenceSystemByEve.get(source?.toEveSystemId ?? 0) !== connection.toSourceSystemId)
+        issues.push({ path: `$.topologyEvidence.connections[${index}]`, reason: "topology endpoint member IDs are not in the validated source map" });
+    }
+  }
+  if (value.allianceNoteEvidence) {
+    const evidence = value.allianceNoteEvidence;
+    const sourceSystemsById = new Map(value.systems.filter(system => system.sourceSystemId !== null).map(system => [system.sourceSystemId!, system]));
+    const aliasIds = new Set<string>(), aliases = new Set<string>();
+    // Per-row alias/status ambiguity blocks that direction's note only; it does
+    // not invalidate the complete source snapshot or other alliance notes.
+    for (const [index, alias] of evidence.systems.entries()) {
+      if (!sourceSystemsById.has(alias.sourceSystemId)) issues.push({ path: `$.allianceNoteEvidence.systems[${index}]`, reason: "alias references an unknown source member ID" });
+      if (aliasIds.has(alias.sourceSystemId)) issues.push({ path: `$.allianceNoteEvidence.systems[${index}].sourceSystemId`, reason: "duplicate source member alias record" });
+      if (aliases.has(alias.alias)) issues.push({ path: `$.allianceNoteEvidence.systems[${index}].alias`, reason: "duplicate map alias is ambiguous" });
+      aliasIds.add(alias.sourceSystemId); aliases.add(alias.alias);
+    }
+    const connectionIds = new Set(value.connections.map(connection => connection.sourceConnectionId));
+    const noteConnectionIds = new Set<string>();
+    // Unsupported ship sizes remain visible to the renderer as a per-note blocker.
+    for (const [index, connection] of evidence.connections.entries()) {
+      if (!connectionIds.has(connection.sourceConnectionId)) issues.push({ path: `$.allianceNoteEvidence.connections[${index}]`, reason: "size references an unknown source connection ID" });
+      if (noteConnectionIds.has(connection.sourceConnectionId)) issues.push({ path: `$.allianceNoteEvidence.connections[${index}].sourceConnectionId`, reason: "duplicate source connection note record" });
+      noteConnectionIds.add(connection.sourceConnectionId);
+    }
+    const sourceSignatureIds = new Set(value.signatures.map(signature => signature.sourceSignatureId).filter((id): id is string => id !== null));
+    const noteSignatureIds = new Set<string>();
+    // An absent directional annotation is valid; a present unrecognized value
+    // is rejected by the renderer against the validated map vocabulary.
+    for (const [index, signature] of evidence.signatures.entries()) {
+      if (!sourceSignatureIds.has(signature.sourceSignatureId)) issues.push({ path: `$.allianceNoteEvidence.signatures[${index}]`, reason: "annotation references an unknown source signature ID" });
+      if (noteSignatureIds.has(signature.sourceSignatureId)) issues.push({ path: `$.allianceNoteEvidence.signatures[${index}].sourceSignatureId`, reason: "duplicate source signature annotation record" });
+      noteSignatureIds.add(signature.sourceSignatureId);
+    }
+  }
   return issues.length ? { ok: false, issues } : { ok: true, value };
 }
 
@@ -282,6 +432,16 @@ export function normalizeWormholeSystemsFixture(input: unknown): FixtureValidati
   for (const connection of value.connections) {
     connection.observedAt = canonicalTime(connection.observedAt);
     connection.freshUntil = canonicalTime(connection.freshUntil);
+  }
+  if (value.topologyEvidence) {
+    value.topologyEvidence.systems.sort((a, b) => a.eveSystemId - b.eveSystemId);
+    value.topologyEvidence.connections.sort((a, b) => a.sourceConnectionId.localeCompare(b.sourceConnectionId));
+  }
+  if (value.allianceNoteEvidence) {
+    value.allianceNoteEvidence.knownStatusAnnotations.sort((a, b) => a.localeCompare(b));
+    value.allianceNoteEvidence.systems.sort((a, b) => a.sourceSystemId.localeCompare(b.sourceSystemId));
+    value.allianceNoteEvidence.connections.sort((a, b) => a.sourceConnectionId.localeCompare(b.sourceConnectionId));
+    value.allianceNoteEvidence.signatures.sort((a, b) => a.sourceSignatureId.localeCompare(b.sourceSignatureId));
   }
   return { ok: true, value };
 }

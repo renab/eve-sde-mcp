@@ -35,10 +35,10 @@ export function registerWormholeSystemsTools(server: McpServer, getService: () =
     {}, service => service.disableSync());
   tool("wormholesystems_list_maps", "List accessible WormholeSystems API map IDs and slugs using the configured origin and credential. Explicit upstream GET; no sync or writes.",
     {}, service => service.listAccessibleMaps());
-  tool("wormholesystems_sync_map", "Fetch and validate one configured map snapshot on demand only when source sync was explicitly enabled after a successful test. Never writes to Nexum.",
+  tool("wormholesystems_sync_map", "Fetch and validate one explicitly enabled map snapshot. Eligible source-owned topology and signature notes may be applied to Nexum after final serialized revalidation; names and custom labels remain disabled.",
     { map_id: id }, (service, args) => service.syncMap(args.map_id));
   tool("wormholesystems_map_sync_status", "Read local source snapshot/run status and a local-only preview summary. No upstream calls or Nexum writes.",
     { map_id: id }, (service, args) => service.status(args.map_id));
-  tool("wormholesystems_preview_map_sync", "Local-only preview diagnostics. Makes zero upstream requests; authority-dependent bookmark notes and apply remain disabled.",
+  tool("wormholesystems_preview_map_sync", "Local-only preview diagnostics. Makes zero upstream requests and reports independent topology and alliance-note eligibility; does not write.",
     { map_id: id }, (service, args) => service.preview(args.map_id));
 }
