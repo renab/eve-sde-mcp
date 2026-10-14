@@ -37,13 +37,14 @@ function harness(transport: typeof fetch = vi.fn(async () => response({ data: []
 async function configured(service: WormholeSystemsService, target: string, route: "id" | "slug" = "id") {
   const credential = service.addCredential({ api_token: "token-do-not-echo", label: "Fixture key" });
   service.configure({ origin: "https://wormholes.invalid", api_path_prefix: "/api", map_route_key: route,
-    canonical_map_id: target, upstream_map_id: "api-map-7", credential_id: credential.id });
+    canonical_map_id: target, upstream_map_id: route === "id" ? "api-map-7" : "api-slug", credential_id: credential.id });
 }
 
 const selectedMapDetail = (id = "api-map-7") => ({ id, slug: "api-slug", map_solarsystems: [
-  { id: "map-system-test", solar_system_id: 31_000_001 },
+  { id: "map-system-test", map_id: id, solarsystem_id: 31_000_001 },
 ], map_connections: [] });
-const systemDetail = (id: string, eveId: number, signatures: unknown[] = []) => ({ data: { id, solar_system_id: eveId, signatures, connections: [], audit: [] } });
+const systemDetail = (id: string, eveId: number, signatures: unknown[] = [], mapId = "api-map-7") => ({ data: { id, map_id: mapId, solarsystem_id: eveId,
+  signatures, map_connections: [], audits: [] } });
 const testSystemDetail = () => systemDetail("map-system-test", 31_000_001);
 async function enableAfterTest(service: WormholeSystemsService) {
   const result = await service.testConnection();
@@ -85,27 +86,31 @@ describe("WormholeSystems GET client", () => {
     await expect(bad.listMaps()).rejects.toMatchObject({ status: 0, message: "Malformed WormholeSystems maps response" });
   });
 
-  it("preserves API map ID separately from slug route selection and rejects an ID mismatch", async () => {
+  it("uses the returned API map ID route and rejects a detail identity mismatch", async () => {
     const paths: string[] = [];
     const transport = vi.fn(async (input: string | URL | Request) => {
       paths.push(String(input));
       return response({ data: { id: paths.length === 1 ? "api-map-7" : "different-map", slug: "stable-slug" } });
     });
     const client = new WormholeSystemsClient({ origin: "https://source.example", apiPathPrefix: "/api", mapRouteKey: "slug" }, "x", transport as typeof fetch);
-    await client.mapDetail("api-map-7", "stable-slug");
-    expect(paths[0]).toBe("https://source.example/api/maps/stable-slug");
-    await expect(client.mapDetail("api-map-7", "another-slug")).rejects.toMatchObject({ message: "WormholeSystems map detail identity mismatch" });
+    await client.mapDetail("api-map-7");
+    expect(paths[0]).toBe("https://source.example/api/maps/api-map-7");
+    await expect(client.mapDetail("api-map-7")).rejects.toMatchObject({ message: "WormholeSystems map detail identity mismatch" });
   });
 
   it("exposes an explicit solar-system detail GET and bounds response bytes", async () => {
     const calls: string[] = [];
     const transport = vi.fn(async (input: string | URL | Request) => {
       calls.push(String(input));
-      return response({ data: { id: "map-system-1", signatures: [], connections: [], audit: [] } });
+      return response({ data: { id: "map-system-1", signatures: [], map_connections: [], audits: [] } });
     });
     const client = new WormholeSystemsClient({ origin: "https://source.example", apiPathPrefix: "/api", mapRouteKey: "id" }, "x", transport as typeof fetch);
     await client.solarSystemDetail("map-system-1");
     expect(calls).toEqual(["https://source.example/api/map-solarsystems/map-system-1"]);
+    await expect(client.solarSystemDetail("..")).rejects.toMatchObject({ message: "Invalid WormholeSystems solar-system selection" });
+    await expect(client.mapDetail("../api")).rejects.toMatchObject({ message: "Invalid WormholeSystems map selection" });
+    await expect(client.mapDetail("%2e%2e")).rejects.toMatchObject({ message: "Invalid WormholeSystems map selection" });
+    expect(calls).toHaveLength(1);
     const oversized = new WormholeSystemsClient({ origin: "https://source.example", apiPathPrefix: "/api", mapRouteKey: "id" }, "x",
       vi.fn(async () => response({ payload: "x".repeat(2000) })) as typeof fetch, { maxBytes: 1024, maxAttempts: 1 });
     await expect(oversized.listMaps()).rejects.toMatchObject({ message: "WormholeSystems response exceeded the size limit" });
@@ -211,7 +216,7 @@ describe("WormholeSystems service and MCP controls", () => {
       const url = String(input);
       calls.push({ url, auth: (init?.headers as Record<string, string>).Authorization, method: init?.method });
       if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
-      if (url.endsWith("/maps/api-slug")) return response({ data: selectedMapDetail() });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: selectedMapDetail() });
       return response(testSystemDetail());
     });
     const h = harness(transport as typeof fetch);
@@ -221,7 +226,7 @@ describe("WormholeSystems service and MCP controls", () => {
     expect(h.service.configuration()).toMatchObject({ live_sync_enabled: false });
     expect(h.service.enableSync()).toMatchObject({ live_sync_enabled: true, eligible_for_writes: false });
     expect(h.service.disableSync()).toMatchObject({ live_sync_enabled: false, eligible_for_writes: false });
-    expect(calls.map(call => call.url)).toEqual(["https://wormholes.invalid/api/maps", "https://wormholes.invalid/api/maps/api-slug",
+    expect(calls.map(call => call.url)).toEqual(["https://wormholes.invalid/api/maps", "https://wormholes.invalid/api/maps/api-map-7",
       "https://wormholes.invalid/api/map-solarsystems/map-system-test"]);
     expect(calls.every(call => call.method === "GET" && call.auth === "Bearer token-do-not-echo")).toBe(true);
     expect(JSON.stringify(result)).not.toContain("token-do-not-echo");
@@ -371,7 +376,7 @@ describe("WormholeSystems service and MCP controls", () => {
     const transport = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
       if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
-      if (url.endsWith("/maps/api-slug") || url.endsWith("/maps/api-map-7")) return response({ data: selectedMapDetail() });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: selectedMapDetail() });
       return response(testSystemDetail());
     });
     const h = harness(transport as typeof fetch);
@@ -426,129 +431,180 @@ describe("WormholeSystems service and MCP controls", () => {
     h.db.close();
   });
 
-  it("normalizes bounded source data and previews exact cached identities without rendering authority names", async () => {
-    vi.stubEnv("GALAXY_WORMSYSTEMS_MAX_STALENESS_MS", "300000");
-    const observed = "2026-10-13T11:59:00.000Z", freshUntil = "2026-10-13T12:01:00.000Z";
+  it("normalizes confirmed resource identities and leaves status and freshness unknown", async () => {
+    const mapConnection = { id: "source-edge", from_map_solarsystem_id: "map-system-a", to_map_solarsystem_id: "map-system-b",
+      mass_status: "stable", lifetime_status: "stable", lifetime_status_updated_at: "2026-10-13T11:59:00.000Z",
+      signatures: [
+        { id: "source-row-a", signature_id: "ABC-123", map_solarsystem_id: "map-system-a" },
+        { id: "source-row-b", signature_id: "DEF-456", map_solarsystem_id: "map-system-b" },
+      ] };
     const mapDetail = { ...selectedMapDetail(), map_solarsystems: [
-      { id: "map-system-a", solar_system_id: 31_000_001 }, { id: "map-system-b", solar_system_id: 31_000_002 },
-    ], map_connections: [{ id: "source-edge", source_map_solarsystem_id: "map-system-a", target_map_solarsystem_id: "map-system-b",
-      source_signature_id: "source-row-a", target_signature_id: "source-row-b", status: "active", observed_at: observed,
-      fresh_until: freshUntil, alias: "private source alias" }], alias_settings: null, bookmark_settings: { nullable: null } };
-    const signaturesA = [{ id: "source-row-a", signature_code: "ABC-123", connection_id: "source-edge",
-      connected_solar_system_id: 31_000_002, status: "active", size: null, observed_at: observed, fresh_until: freshUntil }];
-    const signaturesB = [{ id: "source-row-b", signature_code: "DEF-456", connection_id: "source-edge",
-      connected_solar_system_id: 31_000_001, status: "active", size: "large", observed_at: observed, fresh_until: freshUntil }];
-    const observedSystemDetail = (id: string, eveId: number, signatures: unknown[]) => ({ data: {
-      id, solar_system_id: eveId, signatures, connections: [], audit: [], observed_at: observed,
+      { id: "map-system-a", map_id: "api-map-7", solarsystem_id: "031000001" },
+      { id: "map-system-b", map_id: "api-map-7", solarsystem_id: "031000002" },
+    ], map_connections: [mapConnection], alias_settings: null, bookmark_settings: { nullable: null } };
+    const signaturesA = [{ id: "source-row-a", signature_id: "ABC-123", map_solarsystem_id: "map-system-a",
+      map_connection_id: "source-edge", wormhole_id: null, map_connection: { id: "source-edge" },
+      status: "active", fresh_until: "2026-10-13T12:01:00.000Z" }];
+    const signaturesB = [{ id: "source-row-b", signature_id: "DEF-456", map_solarsystem_id: "map-system-b",
+      map_connection_id: "source-edge", wormhole_id: null, map_connection: { id: "source-edge" }, status: "active" }];
+    const detailFor = (id: string, eveId: string, signatures: unknown[]) => ({ data: {
+      id, map_id: "api-map-7", solarsystem_id: eveId, signatures, map_connections: [mapConnection],
+      signatures_pasted_at: "2026-10-13T11:59:00.000Z", audits: [{ id: 9, created_at: "2026-10-13T11:59:00.000Z" }],
     } });
     const transport = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
       if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
       if (url.endsWith("/maps/api-map-7")) return response({ data: mapDetail });
-      if (url.endsWith("/map-solarsystems/map-system-a")) return response(observedSystemDetail("map-system-a", 31_000_001, signaturesA));
-      if (url.endsWith("/map-solarsystems/map-system-b")) return response(observedSystemDetail("map-system-b", 31_000_002, signaturesB));
+      if (url.endsWith("/map-solarsystems/map-system-a")) return response(detailFor("map-system-a", "031000001", signaturesA));
+      if (url.endsWith("/map-solarsystems/map-system-b")) return response(detailFor("map-system-b", "031000002", signaturesB));
       throw new Error("Unexpected source route");
     });
     const pacing = vi.fn(async () => {});
     const h = harness(transport as typeof fetch, pacing);
     await configured(h.service, h.targetMap);
     await enableAfterTest(h.service);
-    expect(pacing).toHaveBeenCalledTimes(1);
-    expect(pacing).toHaveBeenCalledWith(1_000);
-    h.store.saveState(h.targetMap, { systems: [
-      { id: "nexum-system-a", eveSystemId: 31_000_001 }, { id: "nexum-system-b", eveSystemId: 31_000_002 },
-    ], connections: [{ id: "nexum-edge", sourceId: "nexum-system-a", targetId: "nexum-system-b",
-      sourceSignatureId: "nexum-row-a", targetSignatureId: "nexum-row-b", broken: false, timeStatus: "stable" }] });
-    h.store.patchMap(h.targetMap, { health: "live", hydrated_at: Date.parse("2026-10-13T12:00:00.000Z") });
-    h.store.saveResource(h.targetMap, "nexum-system-a", "signatures", [{ id: "nexum-row-a", signature: "ABC-123", status: "active" }]);
-    h.store.saveResource(h.targetMap, "nexum-system-b", "signatures", [{ id: "nexum-row-b", signature: "DEF-456", status: "active" }]);
     const result = await h.service.syncMap(h.targetMap);
-    expect(pacing).toHaveBeenCalledTimes(2);
-    expect(pacing).toHaveBeenLastCalledWith(1_000);
-    expect(result).toMatchObject({ status: "snapshot_validated", source_calls: 4, systemCount: 2, signatureCount: 2,
-      opaqueMapConnectionCount: 1, eligible_for_matching: true, eligible_for_writes: false, nexum_writes_attempted: false });
+    expect(result).toMatchObject({ status: "snapshot_validated", source_calls: 4, systemCount: 2,
+      signatureCount: 2, connectionCount: 1, auditRecordCount: 2, eligible_for_writes: false, nexum_writes_attempted: false });
+    expect(transport.mock.calls.map(call => String(call[0]))).toEqual([
+      "https://wormholes.invalid/api/maps", "https://wormholes.invalid/api/maps/api-map-7",
+      "https://wormholes.invalid/api/map-solarsystems/map-system-a", "https://wormholes.invalid/api/map-solarsystems/map-system-b",
+      "https://wormholes.invalid/api/maps",
+      "https://wormholes.invalid/api/maps/api-map-7", "https://wormholes.invalid/api/map-solarsystems/map-system-a",
+      "https://wormholes.invalid/api/map-solarsystems/map-system-b",
+    ]);
     const stored = h.db.prepare("SELECT payload_json FROM wormholesystems_source_snapshots WHERE map_id=?").get(h.targetMap) as any;
-    expect(JSON.parse(stored.payload_json).fixture.sourceMetadata.map).toMatchObject({ alias_settings: null, bookmark_settings: { nullable: null } });
-    expect(JSON.parse(stored.payload_json).fixture.sourceMetadata.solarSystemDetails[0].data.audit).toEqual([]);
+    const fixture = JSON.parse(stored.payload_json).fixture;
+    expect(fixture.scope.eveSolarSystemIds).toEqual([31_000_001, 31_000_002]);
+    expect(fixture.systems.map((system: any) => system.sourceSystemId)).toEqual(["map-system-a", "map-system-b"]);
+    expect(fixture.signatures.map((signature: any) => signature.sourceSignatureId)).toEqual(["source-row-a", "source-row-b"]);
+    expect(fixture.signatures.map((signature: any) => signature.signatureCode)).toEqual(["ABC-123", "DEF-456"]);
+    expect(fixture.signatures.every((signature: any) => signature.sourceSignatureId !== signature.signatureCode)).toBe(true);
+    expect(fixture.connections[0]).toMatchObject({ sourceConnectionId: "source-edge", fromEveSystemId: 31_000_001,
+      toEveSystemId: 31_000_002, state: "unknown", observedAt: null, freshUntil: null });
+    expect(fixture.signatures.every((signature: any) => signature.status === "unknown" && signature.observedAt === null && signature.freshUntil === null)).toBe(true);
+    expect(fixture.observedAt).toBeNull();
+    expect(JSON.parse(stored.payload_json).fixture.sourceMetadata.solarSystemDetails[0].data.audits).toHaveLength(1);
+    expect(h.service.status(h.targetMap)).toMatchObject({ source_freshness_evidence: { system_observations: 0,
+      signature_observations: 0, signature_freshness_deadlines: 0, connection_observations: 0, connection_freshness_deadlines: 0 } });
     const preview = h.service.preview(h.targetMap) as any;
-    expect(preview.preview).toMatchObject({ local_only: true, upstream_calls: 0, final_names: "blocked_unavailable_authority_records",
-      counts: { matched: 1, identity_matches_without_conflict: 1, unmatched: 0, conflicts: 0 } });
-    expect(preview.preview.matched[0]).toMatchObject({ status: "identity_match_only", proposed_name: null,
-      identity_match_complete: true, eligible_for_reconciliation: false });
-    expect(JSON.stringify(preview)).not.toContain("private source alias");
-    delete process.env.GALAXY_WORMSYSTEMS_MAX_STALENESS_MS;
-    const missingThreshold = h.service.preview(h.targetMap) as any;
-    expect(missingThreshold.preview.matched[0]).toMatchObject({ identity_match_complete: false, status: "identity_match_conflicted" });
-    expect(missingThreshold.preview.snapshot_blockers).toContain("maximum matching staleness is not configured (GALAXY_WORMSYSTEMS_MAX_STALENESS_MS)");
-    expect(h.service.status(h.targetMap)).toMatchObject({ eligible_for_matching: false,
-      staleness_policy: { configured: false, status: "blocked_missing_or_invalid" } });
-    for (const invalidThreshold of ["0", "-1", "1e3", "9007199254740992"]) {
-      process.env.GALAXY_WORMSYSTEMS_MAX_STALENESS_MS = invalidThreshold;
-      const blocked = h.service.preview(h.targetMap) as any;
-      expect(blocked.preview.matched[0].identity_match_complete).toBe(false);
-      expect(blocked.preview.counts.identity_matches_without_conflict).toBe(0);
-    }
-    process.env.GALAXY_WORMSYSTEMS_MAX_STALENESS_MS = "300000";
-    process.env.GALAXY_WORMSYSTEMS_MAX_STALENESS_MS = "1000";
-    h.db.prepare("UPDATE wormholesystems_source_snapshots SET fetched_at=? WHERE map_id=?").run("2026-10-13T11:59:58.000Z", h.targetMap);
-    expect((h.service.preview(h.targetMap) as any).preview.matched[0].identity_match_complete).toBe(false);
-    expect((h.service.preview(h.targetMap) as any).preview.snapshot_blockers).toContain("source snapshot exceeds the configured maximum matching staleness");
-    h.db.prepare("UPDATE wormholesystems_source_snapshots SET fetched_at=? WHERE map_id=?").run("2026-10-13T12:00:00.000Z", h.targetMap);
-    h.db.prepare("UPDATE nexum_resources SET fetched_at=? WHERE map_id=?").run(Date.parse("2026-10-13T11:59:58.000Z"), h.targetMap);
-    expect((h.service.preview(h.targetMap) as any).preview.matched[0].identity_match_complete).toBe(false);
-    h.db.prepare("UPDATE nexum_resources SET fetched_at=? WHERE map_id=?").run(Date.parse("2026-10-13T12:00:00.000Z"), h.targetMap);
-    process.env.GALAXY_WORMSYSTEMS_MAX_STALENESS_MS = "300000";
-    const originalPayload = JSON.parse(stored.payload_json);
-    const staleObservation = "2026-10-13T11:50:00.000Z";
-    const staleObservationCases: Array<[string, (fixture: any) => void]> = [
-      ["source connection", fixture => { fixture.connections[0].observedAt = staleObservation; }],
-      ["source from-signature", fixture => { fixture.signatures[0].observedAt = staleObservation; }],
-      ["source to-signature", fixture => { fixture.signatures[1].observedAt = staleObservation; }],
-      ["source from-system", fixture => { fixture.systems[0].observedAt = staleObservation; }],
-      ["source to-system", fixture => { fixture.systems[1].observedAt = staleObservation; }],
-    ];
-    for (const [label, makeStale] of staleObservationCases) {
-      const changed = structuredClone(originalPayload);
-      makeStale(changed.fixture);
-      h.db.prepare("UPDATE wormholesystems_source_snapshots SET payload_json=? WHERE map_id=?").run(JSON.stringify(changed), h.targetMap);
-      const stalePreview = h.service.preview(h.targetMap) as any;
-      expect(stalePreview.preview.matched[0], label).toMatchObject({ status: "identity_match_conflicted", identity_match_complete: false });
-      expect(stalePreview.preview.conflicts[0].reason, label).toContain("configured maximum staleness");
-      if (label === "source connection" || label.includes("signature")) {
-        const staleSource = label === "source connection" ? changed.fixture.connections[0] : changed.fixture.signatures[label === "source from-signature" ? 0 : 1];
-        expect(Date.parse(staleSource.freshUntil)).toBeGreaterThan(Date.parse("2026-10-13T12:00:00.000Z"));
-      }
-    }
-    h.db.prepare("UPDATE wormholesystems_source_snapshots SET payload_json=? WHERE map_id=?").run(JSON.stringify(originalPayload), h.targetMap);
-    for (const state of ["inactive", "broken", "expired", "unknown"]) {
-      const changed = structuredClone(originalPayload);
-      changed.fixture.connections[0].state = state;
-      h.db.prepare("UPDATE wormholesystems_source_snapshots SET payload_json=? WHERE map_id=?").run(JSON.stringify(changed), h.targetMap);
-      const transitioned = h.service.preview(h.targetMap) as any;
-      expect(transitioned.preview.matched[0]).toMatchObject({ status: "identity_match_conflicted", identity_match_complete: false });
-      expect(transitioned.preview.conflicts[0].reason).toContain("source connection or both directional signatures are not active");
-    }
-    for (const status of ["inactive", "unknown"]) {
-      const changed = structuredClone(originalPayload);
-      changed.fixture.signatures[0].status = status;
-      h.db.prepare("UPDATE wormholesystems_source_snapshots SET payload_json=? WHERE map_id=?").run(JSON.stringify(changed), h.targetMap);
-      const transitioned = h.service.preview(h.targetMap) as any;
-      expect(transitioned.preview.matched[0]).toMatchObject({ status: "identity_match_conflicted", identity_match_complete: false });
-    }
-    h.db.prepare("UPDATE wormholesystems_source_snapshots SET payload_json=? WHERE map_id=?").run(JSON.stringify(originalPayload), h.targetMap);
-    expect(h.service.status(h.targetMap)).toMatchObject({ snapshot_present: true, source_api_map_id: "api-map-7", adapter_version: 1,
-      source_map_field_names: expect.arrayContaining(["alias_settings", "bookmark_settings", "map_connections", "map_solarsystems"]),
-      source_freshness_evidence: { signature_observations: 2, signature_freshness_deadlines: 2 },
-      last_attempt: { status: "snapshot_validated", source_calls: 4 } });
-    h.service.configure({ origin: "https://wormholes.invalid", api_path_prefix: "/api", map_route_key: "id",
-      canonical_map_id: h.targetMap, upstream_map_id: "api-map-7", credential_id: h.service.listCredentials()[0].id });
-    expect(h.db.prepare("SELECT eligible_for_matching FROM wormholesystems_source_snapshots WHERE map_id=?").get(h.targetMap))
-      .toMatchObject({ eligible_for_matching: 0 });
-    h.db.prepare("UPDATE wormholesystems_source_snapshots SET eligible_for_matching=1 WHERE map_id=?").run(h.targetMap);
-    const reconfigured = h.service.preview(h.targetMap) as any;
-    expect(reconfigured.preview.matched[0]).toMatchObject({ identity_match_complete: false, status: "identity_match_conflicted" });
-    expect(reconfigured.preview.snapshot_blockers).toContain("stored snapshot credential or configuration revision does not match current configuration");
+    expect(preview.preview).toMatchObject({ local_only: true, upstream_calls: 0, writes_enabled: false });
+    expect(JSON.stringify(preview)).not.toContain("token-do-not-echo");
     expect(transport.mock.calls.every(call => (call[1] as RequestInit | undefined)?.method === "GET")).toBe(true);
+    h.db.close();
+  });
+
+  it("cross-references nested signature resource IDs and rejects missing IDs locally and at the connection gate", async () => {
+    const mapSystems = [
+      { id: "map-system-a", map_id: "api-map-7", solarsystem_id: 31_000_001 },
+      { id: "map-system-b", map_id: "api-map-7", solarsystem_id: 31_000_002 },
+    ];
+    const signatureA = { id: "signature-resource-a", signature_id: "ABC-123", map_solarsystem_id: "map-system-a", map_connection_id: "edge" };
+    const signatureB = { id: "signature-resource-b", signature_id: "DEF-456", map_solarsystem_id: "map-system-b", map_connection_id: "edge" };
+    const referenceA = { id: signatureA.id, signature_id: signatureA.signature_id, map_solarsystem_id: signatureA.map_solarsystem_id };
+    const referenceB = { id: signatureB.id, signature_id: signatureB.signature_id, map_solarsystem_id: signatureB.map_solarsystem_id };
+    const connection = (signatures: unknown[]) => ({ id: "edge", from_map_solarsystem_id: "map-system-a",
+      to_map_solarsystem_id: "map-system-b", signatures });
+    const makeSystemDetails = (systemConnections: [unknown, unknown]) => [
+      { data: { ...systemDetail("map-system-a", 31_000_001, [signatureA], "api-map-7").data, map_connections: [systemConnections[0]] } },
+      { data: { ...systemDetail("map-system-b", 31_000_002, [signatureB], "api-map-7").data, map_connections: [systemConnections[1]] } },
+    ];
+    const normalize = (mapConnections: unknown[], systemConnections: [unknown, unknown]) => normalizeSourceSnapshot({
+      mapId: "api-map-7", canonicalMapId: "canonical", sourceIdentity: "wormholesystems:fixture", revisionOrDigest: "digest",
+      fetchedAt: "2026-10-13T12:00:00.000Z", detail: { data: { id: "api-map-7", map_solarsystems: mapSystems, map_connections: mapConnections } },
+      systemDetails: makeSystemDetails(systemConnections),
+    });
+    const valid = normalize([connection([referenceA, referenceB])], [connection([referenceA]), connection([referenceB])]);
+    expect(valid).toMatchObject({ ok: true });
+    if (valid.ok) expect(valid.fixture.signatures.map(signature => [signature.sourceSignatureId, signature.signatureCode])).toEqual([
+      ["signature-resource-a", "ABC-123"], ["signature-resource-b", "DEF-456"],
+    ]);
+
+    const missingIdA = { signature_id: "ABC-123", map_solarsystem_id: "map-system-a" };
+    expect(normalize([connection([missingIdA, referenceB])], [connection([referenceA]), connection([referenceB])]))
+      .toMatchObject({ ok: false });
+    expect(normalize([connection([referenceA, referenceB])], [connection([missingIdA]), connection([referenceB])]))
+      .toMatchObject({ ok: false });
+    expect(normalize([connection([{ ...referenceA, id: "wrong-signature-resource" }, referenceB])],
+      [connection([referenceA]), connection([referenceB])])).toMatchObject({ ok: false });
+    const duplicate = normalize([connection([referenceA, { ...referenceB, id: referenceA.id }])],
+      [connection([referenceA]), connection([referenceB])]);
+    expect(duplicate).toMatchObject({ ok: false });
+    if (!duplicate.ok) expect(duplicate.issues).toEqual(expect.arrayContaining([expect.objectContaining({
+      path: "$.data.map_connections[0].signatures[1].id", reason: "duplicate connection signature resource reference",
+    })]));
+
+    const invalidMapDetail = { id: "api-map-7", map_solarsystems: mapSystems,
+      map_connections: [connection([missingIdA, referenceB])] };
+    const details = makeSystemDetails([connection([referenceA]), connection([referenceB])]);
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: invalidMapDetail });
+      if (url.endsWith("/map-solarsystems/map-system-a")) return response(details[0]);
+      if (url.endsWith("/map-solarsystems/map-system-b")) return response(details[1]);
+      throw new Error("Unexpected source route");
+    });
+    const h = harness(transport as typeof fetch);
+    await configured(h.service, h.targetMap);
+    expect(await h.service.testConnection()).toMatchObject({ status: "request_failed", live_sync_enabled: false,
+      error: expect.stringContaining("$.data.map_connections[0].signatures[0].id") });
+    expect(h.service.configuration()).toMatchObject({ live_sync_enabled: false, schema_validated_at: null });
+    h.db.close();
+  });
+
+  it("rejects a nested signature resource reused under distinct connections without a direct connection ID", () => {
+    const mapSystems = [
+      { id: "map-system-a", map_id: "api-map-7", solarsystem_id: 31_000_001 },
+      { id: "map-system-b", map_id: "api-map-7", solarsystem_id: 31_000_002 },
+    ];
+    const reference = { id: "shared-signature-resource", signature_id: "ABC-123", map_solarsystem_id: "map-system-a" };
+    const connection = (id: string) => ({ id, from_map_solarsystem_id: "map-system-a",
+      to_map_solarsystem_id: "map-system-b", signatures: [reference] });
+    const edgeA = connection("edge-a");
+    const edgeB = connection("edge-b");
+    const result = normalizeSourceSnapshot({ mapId: "api-map-7", canonicalMapId: "canonical", sourceIdentity: "wormholesystems:fixture",
+      revisionOrDigest: "digest", fetchedAt: "2026-10-13T12:00:00.000Z",
+      detail: { data: { id: "api-map-7", map_solarsystems: mapSystems, map_connections: [edgeA, edgeB] } },
+      systemDetails: [
+        { data: { id: "map-system-a", map_id: "api-map-7", solarsystem_id: 31_000_001,
+          signatures: [{ ...reference, map_connection_id: null }], map_connections: [edgeA, edgeB], audits: [] } },
+        { data: { id: "map-system-b", map_id: "api-map-7", solarsystem_id: 31_000_002,
+          signatures: [], map_connections: [], audits: [] } },
+      ],
+    });
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) expect(result.issues).toContainEqual({ path: "$.data.map_connections[1].signatures[0].id",
+      reason: "connection signature resource is reused under a different map connection" });
+  });
+
+  it("keeps sync disabled when the connection test finds a signature reused across map connections", async () => {
+    const mapSystems = [
+      { id: "map-system-a", map_id: "api-map-7", solarsystem_id: 31_000_001 },
+      { id: "map-system-b", map_id: "api-map-7", solarsystem_id: 31_000_002 },
+    ];
+    const reference = { id: "shared-signature-resource", signature_id: "ABC-123", map_solarsystem_id: "map-system-a" };
+    const connection = (id: string) => ({ id, from_map_solarsystem_id: "map-system-a",
+      to_map_solarsystem_id: "map-system-b", signatures: [reference] });
+    const edgeA = connection("edge-a");
+    const edgeB = connection("edge-b");
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: { id: "api-map-7", map_solarsystems: mapSystems,
+        map_connections: [edgeA, edgeB] } });
+      if (url.endsWith("/map-solarsystems/map-system-a")) return response({ data: { id: "map-system-a", map_id: "api-map-7",
+        solarsystem_id: 31_000_001, signatures: [{ ...reference, map_connection_id: null }], map_connections: [edgeA, edgeB], audits: [] } });
+      if (url.endsWith("/map-solarsystems/map-system-b")) return response({ data: { id: "map-system-b", map_id: "api-map-7",
+        solarsystem_id: 31_000_002, signatures: [], map_connections: [], audits: [] } });
+      throw new Error("Unexpected source route");
+    });
+    const h = harness(transport as typeof fetch);
+    await configured(h.service, h.targetMap);
+    expect(await h.service.testConnection()).toMatchObject({ status: "request_failed", live_sync_enabled: false,
+      error: expect.stringContaining("$.data.map_connections[1].signatures[0].id") });
+    expect(h.service.configuration()).toMatchObject({ live_sync_enabled: false, schema_validated_at: null });
+    expect(() => h.service.enableSync()).toThrow("successful connection and selected-map schema test");
     h.db.close();
   });
 
@@ -556,12 +612,17 @@ describe("WormholeSystems service and MCP controls", () => {
     const at = "2026-10-13T11:59:00.000Z";
     const result = normalizeSourceSnapshot({ mapId: "source-map", canonicalMapId: "canonical-map", sourceIdentity: "wormholesystems:https://source.invalid/source-map",
       revisionOrDigest: "fixture-digest", fetchedAt: at, detail: { data: { id: "source-map", map_solarsystems: [
-        { id: "map-system-a", solar_system_id: 31_000_001 }, { id: "map-system-b", solar_system_id: 31_000_002 },
-      ], map_connections: [{ id: "edge", source_map_solarsystem_id: "map-system-a", target_map_solarsystem_id: "map-system-b",
-        source_signature_id: "row-a", target_signature_id: "row-b", status: "connected", observed_at: at, fresh_until: null, alias: null }],
+        { id: "map-system-a", map_id: "source-map", solarsystem_id: 31_000_001 },
+        { id: "map-system-b", map_id: "source-map", solarsystem_id: 31_000_002 },
+      ], map_connections: [{ id: "edge", from_map_solarsystem_id: "map-system-a", to_map_solarsystem_id: "map-system-b",
+        status: "connected", observed_at: at, fresh_until: null, alias: null }],
       alias_settings: null, bookmark_settings: null } }, systemDetails: [
-        systemDetail("map-system-a", 31_000_001, [{ id: "row-a", signature_code: "AAA-111", connection_id: "edge", connected_solar_system_id: 31_000_002, status: "resolved", observed_at: at, fresh_until: null }]),
-        systemDetail("map-system-b", 31_000_002, [{ id: "row-b", signature_code: "BBB-222", connection_id: "edge", connected_solar_system_id: 31_000_001, status: "resolved", observed_at: at, fresh_until: null }]),
+        { data: { ...systemDetail("map-system-a", 31_000_001, [{ id: "row-a", signature_id: "AAA-111", map_solarsystem_id: "map-system-a",
+          map_connection_id: "edge", status: "resolved", observed_at: at, fresh_until: null }], "source-map").data,
+          map_connections: [{ id: "edge", from_map_solarsystem_id: "map-system-a", to_map_solarsystem_id: "map-system-b" }] } },
+        { data: { ...systemDetail("map-system-b", 31_000_002, [{ id: "row-b", signature_id: "BBB-222", map_solarsystem_id: "map-system-b",
+          map_connection_id: "edge", status: "resolved", observed_at: at, fresh_until: null }], "source-map").data,
+          map_connections: [{ id: "edge", from_map_solarsystem_id: "map-system-a", to_map_solarsystem_id: "map-system-b" }] } },
       ] });
     expect(result).toMatchObject({ ok: true });
     if (result.ok) {
@@ -569,7 +630,63 @@ describe("WormholeSystems service and MCP controls", () => {
       expect(result.fixture.signatures.map(signature => signature.status)).toEqual(["unknown", "unknown"]);
       expect(result.fixture.sourceMetadata).toMatchObject({ map: { alias_settings: null, bookmark_settings: null,
         map_connections: [{ alias: null }] } });
+      expect(result.fixture.observedAt).toBeNull();
+      expect(result.fixture.connections[0].state).toBe("unknown");
+      expect(result.fixture.connections[0].freshUntil).toBeNull();
+      expect(result.fixture.signatures.every(signature => signature.status === "unknown" && signature.freshUntil === null)).toBe(true);
     }
+  });
+
+  it("rejects former candidate field names, identity mismatches and missing source identifiers", () => {
+    const at = "2026-10-13T11:59:00.000Z";
+    const base = {
+      id: "source-map",
+      map_solarsystems: [{ id: "member-row", map_id: "source-map", solarsystem_id: "031000001" }],
+      map_connections: [],
+    };
+    const memberDetail = (data: Record<string, unknown>) => ({ data: {
+      id: "member-row", map_id: "source-map", solarsystem_id: "031000001", signatures: [], map_connections: [], audits: [], ...data,
+    } });
+    const normalize = (map: unknown = base, details: unknown[] = [memberDetail({})]) => normalizeSourceSnapshot({
+      mapId: "source-map", canonicalMapId: "canonical", sourceIdentity: "wormholesystems:fixture", revisionOrDigest: "digest", fetchedAt: at,
+      detail: map, systemDetails: details,
+    });
+    expect(normalize({ ...base, map_solarsystems: [{ id: "member-row", map_id: "source-map", solar_system_id: 31_000_001 }] })).toMatchObject({
+      ok: false, issues: expect.arrayContaining([expect.objectContaining({ path: expect.stringContaining("solarsystem_id") })]),
+    });
+    expect(normalize(base, [{ data: { id: "member-row", map_id: "source-map", solarsystem_id: 31_000_001,
+      signatures: [], connections: [], audit: [] } }])).toMatchObject({ ok: false });
+    expect(normalize(base, [memberDetail({ id: "different-row" })])).toMatchObject({ ok: false });
+    expect(normalize({ ...base, map_connections: [{ id: "edge", from_map_solarsystem_id: "member-row", to_map_solarsystem_id: "outside" }] }))
+      .toMatchObject({ ok: false });
+    expect(normalize({ ...base, map_solarsystems: [{ id: "member-row", map_id: "other-map", solarsystem_id: 31_000_001 }] }))
+      .toMatchObject({ ok: false });
+    expect(normalize(base, [memberDetail({ map_id: "other-map" })])).toMatchObject({ ok: false });
+    expect(normalize(base, [memberDetail({ solarsystem_id: 31_000_002 })])).toMatchObject({ ok: false });
+    expect(normalize({ ...base, map_solarsystems: [{ map_id: "source-map", solarsystem_id: 31_000_001 }] })).toMatchObject({ ok: false });
+    expect(normalize(base, [memberDetail({ id: undefined })])).toMatchObject({ ok: false });
+    expect(normalize(base, [memberDetail({ map_id: undefined })])).toMatchObject({ ok: false });
+
+    const connection = { id: "edge", from_map_solarsystem_id: "member-row", to_map_solarsystem_id: "member-row" };
+    expect(normalize({ ...base, map_connections: [connection] })).toMatchObject({ ok: false });
+    expect(normalize({ ...base, map_connections: [{ id: "edge", from_map_solarsystem_id: "member-row" }] })).toMatchObject({ ok: false });
+    expect(normalize({ ...base, map_connections: [{ id: "edge", source_map_solarsystem_id: "member-row",
+      target_map_solarsystem_id: "member-row" }] })).toMatchObject({ ok: false });
+
+    const signatureDetail = memberDetail({ signatures: [{ id: "resource-signature", signature_id: "ABC-123",
+      map_solarsystem_id: "member-row", map_connection_id: null, wormhole_id: "wormhole-resource",
+      wormhole: { id: "wormhole-resource", leads_to: "031000002", total_mass: 1_000_000_000 } }] });
+    const good = normalize(base, [signatureDetail]);
+    expect(good).toMatchObject({ ok: true });
+    if (good.ok) expect(good.fixture).toMatchObject({ scope: { eveSolarSystemIds: [31_000_001] },
+      signatures: [{ sourceSignatureId: "resource-signature", signatureCode: "ABC-123", scannerEveSystemId: 31_000_001,
+        connectedEveSystemId: null, sourceConnectionId: null }] });
+    expect(normalize(base, [memberDetail({ signatures: [{ id: "resource-signature", signature_code: "ABC-123",
+      map_solarsystem_id: "member-row", connection_id: null }] })])).toMatchObject({ ok: false });
+    expect(normalize(base, [memberDetail({ signatures: [{ id: "resource-signature", signature_id: "ABC-123",
+      map_solarsystem_id: "outside", map_connection_id: null }] })])).toMatchObject({ ok: false });
+    expect(normalize(base, [memberDetail({ signatures: [{ signature_id: "ABC-123", map_solarsystem_id: "member-row" }] })]))
+      .toMatchObject({ ok: false });
   });
 
   it("aborts and awaits deferred source operations before shutdown returns", async () => {

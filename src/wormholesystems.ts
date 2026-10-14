@@ -39,6 +39,7 @@ type SourceConfig = WormholeSystemsConfig & {
   liveSyncEnabled: boolean;
   schemaValidatedAt: number | null;
   validatedCredentialId: string | null;
+  validatedApiMapId: string | null;
 };
 
 export class WormholeSystemsService {
@@ -108,7 +109,7 @@ export class WormholeSystemsService {
     const value = JSON.parse(row.config_json) as SourceConfig;
     return { ...value, configurationRevision: value.configurationRevision ?? `legacy:${value.configuredAt}`,
       liveSyncEnabled: value.liveSyncEnabled === true, schemaValidatedAt: value.schemaValidatedAt ?? null,
-      validatedCredentialId: value.validatedCredentialId ?? null };
+      validatedCredentialId: value.validatedCredentialId ?? null, validatedApiMapId: value.validatedApiMapId ?? null };
   }
 
   private saveConfig(value: SourceConfig): void {
@@ -145,6 +146,11 @@ export class WormholeSystemsService {
   private rejectSecretEcho(maps: ApiMapRecord[], token: string): void {
     if (maps.some(map => containsSecretValue(map, token)))
       throw new WormholeSystemsError(0, 0, "Malformed WormholeSystems maps response");
+  }
+
+  private selectedMap(maps: ApiMapRecord[], config: SourceConfig): ApiMapRecord | undefined {
+    const matches = maps.filter(map => config.mapRouteKey === "id" ? map.id === config.upstreamMapId : map.slug === config.upstreamMapId);
+    return matches.length === 1 ? matches[0] : undefined;
   }
 
   private track<T>(operation: () => Promise<T>): Promise<T> {
@@ -195,7 +201,7 @@ export class WormholeSystemsService {
     if (existing) this.assertTokenDoesNotMatchConfig(this.token(existing), configFields);
     const config: SourceConfig = { origin, apiPathPrefix, mapRouteKey: input.map_route_key, canonicalMapId,
       upstreamMapId, credentialId, configuredAt: this.now(), configurationRevision: crypto.randomUUID(),
-      liveSyncEnabled: false, schemaValidatedAt: null, validatedCredentialId: null };
+      liveSyncEnabled: false, schemaValidatedAt: null, validatedCredentialId: null, validatedApiMapId: null };
     this.withMapBoundarySync([...(existing ? [existing.canonicalMapId] : []), canonicalMapId], () => this.store.db.transaction(() => {
       this.saveConfig(config);
       for (const id of new Set([existing?.canonicalMapId, canonicalMapId].filter((value): value is string => !!value)))
@@ -275,7 +281,8 @@ export class WormholeSystemsService {
         this.secrets.put(current.secret_ref, input.api_token!);
         this.store.db.prepare("UPDATE wormholesystems_credentials SET metadata=? WHERE id=?").run(JSON.stringify(updated), id);
         if (config?.credentialId === id) {
-          this.saveConfig({ ...config, configurationRevision: crypto.randomUUID(), liveSyncEnabled: false, schemaValidatedAt: null, validatedCredentialId: null });
+          this.saveConfig({ ...config, configurationRevision: crypto.randomUUID(), liveSyncEnabled: false, schemaValidatedAt: null,
+            validatedCredentialId: null, validatedApiMapId: null });
           this.store.db.prepare("UPDATE wormholesystems_source_snapshots SET eligible_for_matching=0 WHERE map_id=?").run(config.canonicalMapId);
         }
       })());
@@ -308,7 +315,8 @@ export class WormholeSystemsService {
   }
 
   private invalidateActivation(config: SourceConfig): void {
-    this.saveConfig({ ...config, configurationRevision: crypto.randomUUID(), liveSyncEnabled: false, schemaValidatedAt: null, validatedCredentialId: null });
+    this.saveConfig({ ...config, configurationRevision: crypto.randomUUID(), liveSyncEnabled: false, schemaValidatedAt: null,
+      validatedCredentialId: null, validatedApiMapId: null });
     this.store.db.prepare("UPDATE wormholesystems_source_snapshots SET eligible_for_matching=0 WHERE map_id=?").run(config.canonicalMapId);
   }
 
@@ -319,10 +327,10 @@ export class WormholeSystemsService {
     if (!config || config.canonicalMapId !== mapId) blockers.push("source configuration does not target this canonical map");
     else {
       if (!config.liveSyncEnabled) blockers.push("source synchronization is not currently enabled");
-      if (!config.schemaValidatedAt || config.validatedCredentialId !== config.credentialId)
+      if (!config.schemaValidatedAt || config.validatedCredentialId !== config.credentialId || !config.validatedApiMapId)
         blockers.push("current source credential has not passed the selected-map schema test");
-      if (row.source_origin !== config.origin || row.source_api_map_id !== config.upstreamMapId ||
-          row.source_identity !== `wormholesystems:${JSON.stringify([config.origin, config.upstreamMapId])}`)
+      if (!config.validatedApiMapId || row.source_origin !== config.origin || row.source_api_map_id !== config.validatedApiMapId ||
+          row.source_identity !== `wormholesystems:${JSON.stringify([config.origin, config.validatedApiMapId])}`)
         blockers.push("stored source identity does not match current source configuration");
       if (row.credential_id !== config.credentialId || Number(row.source_configured_at) !== config.configuredAt ||
           row.source_config_revision !== config.configurationRevision)
@@ -354,19 +362,13 @@ export class WormholeSystemsService {
         const token = this.token(currentConfig);
         const maps = await client.listMaps(this.lifetime.signal);
         this.rejectSecretEcho(maps, token);
-        const selected = maps.find(map => map.id === currentConfig.upstreamMapId);
+        const selected = this.selectedMap(maps, currentConfig);
         if (!selected) {
           await mapDecisionBoundary.run(currentConfig.canonicalMapId, () => this.invalidateActivation(currentConfig!));
           return { status: "inaccessible_or_not_listed", accessible_map_count: maps.length,
             selected_upstream_map_id: currentConfig.upstreamMapId, authenticated: true, live_sync_enabled: false };
         }
-        const routeValue = currentConfig.mapRouteKey === "id" ? selected.id : selected.slug;
-        if (!routeValue) {
-          await mapDecisionBoundary.run(currentConfig.canonicalMapId, () => this.invalidateActivation(currentConfig!));
-          return { status: "route_key_unavailable", accessible_map_count: maps.length,
-            selected_upstream_map_id: currentConfig.upstreamMapId, authenticated: true, live_sync_enabled: false };
-        }
-        const detail = await client.mapDetail(selected.id, routeValue, this.lifetime.signal);
+        const detail = await client.mapDetail(selected.id, this.lifetime.signal);
         if (containsSecretValue(detail, token)) throw new WormholeSystemsError(0, 0, "Malformed WormholeSystems map response");
         const validated = validateSourceMapDetail(detail, selected.id);
         if (validated.issues.length) throw new WormholeSystemsError(0, 0, `Unsupported WormholeSystems map schema: ${validated.issues.slice(0, 4).map(issue => issue.path).join(", ")}`);
@@ -392,7 +394,8 @@ export class WormholeSystemsService {
         await mapDecisionBoundary.run(currentConfig.canonicalMapId, () => {
           this.store.db.prepare("UPDATE wormholesystems_credentials SET metadata=json_set(metadata,'$.validation_status','maps_detail_schema_ok','$.last_test_at',?) WHERE id=?")
             .run(this.now(), currentConfig.credentialId);
-          this.saveConfig({ ...currentConfig, schemaValidatedAt: this.now(), validatedCredentialId: currentConfig.credentialId });
+          this.saveConfig({ ...currentConfig, schemaValidatedAt: this.now(), validatedCredentialId: currentConfig.credentialId,
+            validatedApiMapId: selected.id });
         });
         return { status: "maps_detail_schema_ok", authenticated: true, accessible_map_count: maps.length,
           selected_upstream_map_id: selected.id, selected_system_count: mapSystems.length, source_calls: mapSystems.length + 2,
@@ -411,7 +414,7 @@ export class WormholeSystemsService {
     this.assertNoActiveSync();
     const config = this.config();
     if (!config) throw new Error("WormholeSystems source is not configured");
-    if (!config.schemaValidatedAt || config.validatedCredentialId !== config.credentialId)
+    if (!config.schemaValidatedAt || config.validatedCredentialId !== config.credentialId || !config.validatedApiMapId)
       throw new Error("A successful connection and selected-map schema test is required before enabling source sync");
     const resolved = this.store.map(config.canonicalMapId);
     if (resolved.id !== config.canonicalMapId || config.upstreamMapId !== opaqueId(config.upstreamMapId, "upstream map ID"))
@@ -463,7 +466,7 @@ export class WormholeSystemsService {
     let revisionOrdering: "unknown" | "observed_at" = "unknown";
     const snapshot = this.store.db.prepare("SELECT source_identity,source_origin,source_api_map_id,revision_or_digest,fetched_at,observed_at,payload_json FROM wormholesystems_source_snapshots WHERE map_id=?").get(mapId) as any;
     const credentialVersion = Number(this.metadata(config.credentialId).credential_version) || 1;
-    if (!config.liveSyncEnabled || !config.schemaValidatedAt || config.validatedCredentialId !== config.credentialId) {
+    if (!config.liveSyncEnabled || !config.schemaValidatedAt || config.validatedCredentialId !== config.credentialId || !config.validatedApiMapId) {
       this.store.db.prepare("INSERT INTO wormholesystems_source_runs(map_id,status,attempted_at,error_status,error_message,source_calls) VALUES (?,'disabled',?,0,?,0)")
         .run(mapId, attemptedAt, "Source synchronization has not been operator-enabled after a successful schema test.");
       return { map_id: mapId, status: "disabled", fetched: false, source_calls: 0,
@@ -478,7 +481,7 @@ export class WormholeSystemsService {
       sourceCalls++;
       const maps = await client.listMaps(this.lifetime.signal);
       this.rejectSecretEcho(maps, token);
-      const selected = maps.find(map => map.id === config.upstreamMapId);
+      const selected = this.selectedMap(maps, config);
       if (!selected) {
         await mapDecisionBoundary.run(mapId, () => this.store.db.transaction(() => {
           this.store.db.prepare("UPDATE wormholesystems_source_snapshots SET eligible_for_matching=0 WHERE map_id=?").run(mapId);
@@ -488,10 +491,10 @@ export class WormholeSystemsService {
         return { map_id: mapId, status: "inaccessible_or_not_listed", fetched: false, source_calls: 1, eligible_for_matching: false,
           eligible_for_writes: false, nexum_writes_attempted: false, last_good_snapshot_retained: !!snapshot };
       }
-      const routeValue = config.mapRouteKey === "id" ? selected.id : selected.slug;
-      if (!routeValue) throw new WormholeSystemsError(0, 0, "Configured WormholeSystems map route key is unavailable");
+      if (selected.id !== config.validatedApiMapId)
+        throw new WormholeSystemsError(0, 0, "Configured WormholeSystems map identity changed since validation");
       sourceCalls++;
-      const detail = await client.mapDetail(selected.id, routeValue, this.lifetime.signal);
+      const detail = await client.mapDetail(selected.id, this.lifetime.signal);
       if (containsSecretValue(detail, token)) throw new WormholeSystemsError(0, 0, "Malformed WormholeSystems map response");
       const mapValidation = validateSourceMapDetail(detail, selected.id);
       if (mapValidation.issues.length) throw new WormholeSystemsError(0, 0,

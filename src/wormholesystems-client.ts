@@ -13,6 +13,8 @@ export class WormholeSystemsError extends Error {
 }
 
 const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
+const safeRouteId = (value: string): boolean => !!value && value.length <= 256 && value.trim() === value && value !== "." && value !== ".." &&
+  !/[\/\\?#%\u0000-\u001f\u007f]/.test(value);
 
 export function validateWormholeSystemsOrigin(value: string): string {
   let url: URL;
@@ -150,9 +152,9 @@ export class WormholeSystemsClient {
     return result.data.map(row => ({ id: String((row as Record<string, unknown>).id), slug: typeof (row as Record<string, unknown>).slug === "string" ? (row as Record<string, unknown>).slug as string : null }));
   }
 
-  async mapDetail(apiMapId: string, routeKey: string, signal?: AbortSignal): Promise<unknown> {
-    if (!apiMapId || !routeKey || apiMapId.length > 256 || routeKey.length > 256) throw new WormholeSystemsError(0, 0, "Invalid WormholeSystems map selection");
-    const result = await this.get(`/maps/${encodeURIComponent(routeKey)}`, signal);
+  async mapDetail(apiMapId: string, signal?: AbortSignal): Promise<unknown> {
+    if (!safeRouteId(apiMapId)) throw new WormholeSystemsError(0, 0, "Invalid WormholeSystems map selection");
+    const result = await this.get(`/maps/${encodeURIComponent(apiMapId)}`, signal);
     const body = record(result) ? result.data : undefined;
     if (!record(body) || (typeof body.id !== "string" && !(typeof body.id === "number" && Number.isSafeInteger(body.id))) || String(body.id) !== apiMapId)
       throw new WormholeSystemsError(0, 0, "WormholeSystems map detail identity mismatch");
@@ -160,7 +162,7 @@ export class WormholeSystemsClient {
   }
 
   async solarSystemDetail(mapSolarSystemId: string, signal?: AbortSignal): Promise<unknown> {
-    if (!mapSolarSystemId || mapSolarSystemId.length > 256) throw new WormholeSystemsError(0, 0, "Invalid WormholeSystems solar-system selection");
+    if (!safeRouteId(mapSolarSystemId)) throw new WormholeSystemsError(0, 0, "Invalid WormholeSystems solar-system selection");
     return this.get(`/map-solarsystems/${encodeURIComponent(mapSolarSystemId)}`, signal);
   }
 }
