@@ -15,7 +15,7 @@ import {
 } from "./wormholesystems-client.js";
 
 const MAX_SYSTEM_DETAIL_REQUESTS = 100;
-const SYSTEM_DETAIL_PACING_MS = 50;
+const SYSTEM_DETAIL_PACING_MS = 1_000;
 const MAX_SOURCE_SNAPSHOT_BYTES = 16 * 1024 * 1024;
 const MAX_STALENESS_ENV = "GALAXY_WORMSYSTEMS_MAX_STALENESS_MS";
 const opaqueId = (value: unknown, label: string): string => {

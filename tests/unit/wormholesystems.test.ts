@@ -19,7 +19,7 @@ const tmpDirs: string[] = [];
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); for (const dir of tmpDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 const response = (payload: unknown, status = 200, headers: Record<string, string> = {}) => new Response(JSON.stringify(payload), { status, headers });
 
-function harness(transport: typeof fetch = vi.fn(async () => response({ data: [] }))) {
+function harness(transport: typeof fetch = vi.fn(async () => response({ data: [] })), sleep: (ms: number) => Promise<void> = async () => {}) {
   const db = openStateDatabase(":memory:");
   const store = new NexumStore(db, () => Date.parse("2026-10-13T12:00:00.000Z"));
   const credential = { id: "nexum-test", base_url: "https://nexum.invalid", label: "fixture", enabled: true };
@@ -29,7 +29,7 @@ function harness(transport: typeof fetch = vi.fn(async () => response({ data: []
   const secrets = { put: (id: string, value: string) => secretValues.set(id, value), get: (id: string) => {
     const value = secretValues.get(id); if (!value) throw new Error("Credential secret unavailable"); return value;
   }, remove: (id: string) => secretValues.delete(id) };
-  const service = new WormholeSystemsService(store, secrets, transport, () => Date.parse("2026-10-13T12:00:00.000Z"), async () => {});
+  const service = new WormholeSystemsService(store, secrets, transport, () => Date.parse("2026-10-13T12:00:00.000Z"), sleep);
   const maps = store.maps();
   return { db, store, service, secrets, secretValues, targetMap: maps.find(map => map.name === "Target")!.id, otherMap: maps.find(map => map.name === "Other")!.id };
 }
@@ -432,9 +432,12 @@ describe("WormholeSystems service and MCP controls", () => {
       if (url.endsWith("/map-solarsystems/map-system-b")) return response(observedSystemDetail("map-system-b", 31_000_002, signaturesB));
       throw new Error("Unexpected source route");
     });
-    const h = harness(transport as typeof fetch);
+    const pacing = vi.fn(async () => {});
+    const h = harness(transport as typeof fetch, pacing);
     await configured(h.service, h.targetMap);
     await enableAfterTest(h.service);
+    expect(pacing).toHaveBeenCalledTimes(1);
+    expect(pacing).toHaveBeenCalledWith(1_000);
     h.store.saveState(h.targetMap, { systems: [
       { id: "nexum-system-a", eveSystemId: 31_000_001 }, { id: "nexum-system-b", eveSystemId: 31_000_002 },
     ], connections: [{ id: "nexum-edge", sourceId: "nexum-system-a", targetId: "nexum-system-b",
@@ -443,6 +446,8 @@ describe("WormholeSystems service and MCP controls", () => {
     h.store.saveResource(h.targetMap, "nexum-system-a", "signatures", [{ id: "nexum-row-a", signature: "ABC-123", status: "active" }]);
     h.store.saveResource(h.targetMap, "nexum-system-b", "signatures", [{ id: "nexum-row-b", signature: "DEF-456", status: "active" }]);
     const result = await h.service.syncMap(h.targetMap);
+    expect(pacing).toHaveBeenCalledTimes(2);
+    expect(pacing).toHaveBeenLastCalledWith(1_000);
     expect(result).toMatchObject({ status: "snapshot_validated", source_calls: 4, systemCount: 2, signatureCount: 2,
       opaqueMapConnectionCount: 1, eligible_for_matching: true, eligible_for_writes: false, nexum_writes_attempted: false });
     const stored = h.db.prepare("SELECT payload_json FROM wormholesystems_source_snapshots WHERE map_id=?").get(h.targetMap) as any;
