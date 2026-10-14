@@ -299,6 +299,23 @@ describe("WormholeSystems service and MCP controls", () => {
     h.db.close();
   });
 
+  it("allows short config values inside bearer tokens but rejects exact secret reuse", () => {
+    const h = harness();
+    const token = "bearer-id-slug-2-/api";
+    const credential = h.service.addCredential({ api_token: token, label: "Fixture key" });
+    expect(() => h.service.configure({ origin: "https://wormholes.invalid", api_path_prefix: "/api", map_route_key: "id",
+      canonical_map_id: h.targetMap, upstream_map_id: "2", credential_id: credential.id })).not.toThrow();
+    expect(h.service.configuration()).toMatchObject({ configured: true, map_route_key: "id", upstream_map_id: "2" });
+
+    expect(() => h.service.updateCredential(credential.id, { api_token: "2" })).toThrow("Credential value");
+    expect(h.secrets.get(credential.id)).toBe(token);
+    expect(() => h.service.addCredential({ api_token: "label-secret", label: "label-secret" })).toThrow("Invalid credential label");
+    expect(() => h.service.updateCredential(credential.id, { label: token })).toThrow("Invalid credential label");
+    expect(JSON.stringify(h.service.listCredentials())).not.toContain(token);
+    expect(JSON.stringify(h.service.configuration())).not.toContain(token);
+    h.db.close();
+  });
+
   it("rejects credential collisions with route-key fields and current config during replacement", async () => {
     for (const [route, token] of [["id", "id"], ["slug", "slug"]] as const) {
       const h = harness();

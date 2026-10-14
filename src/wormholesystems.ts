@@ -173,7 +173,7 @@ export class WormholeSystemsService {
   }
 
   private assertTokenDoesNotMatchConfig(token: string, values: Record<string, unknown>): void {
-    if (Object.values(values).some(value => typeof value === "string" && (value.includes(token) || token.includes(value))))
+    if (Object.values(values).some(value => typeof value === "string" && value === token))
       throw new Error("Credential value cannot match any source configuration field");
   }
 
