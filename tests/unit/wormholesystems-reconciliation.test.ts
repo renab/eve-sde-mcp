@@ -111,14 +111,14 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
     expect(camelCase.blockers).toContain("connections[0]: contains an unsupported field");
   });
 
-  it("mirrors Nexum's fixed snapshot bound and rejects client-selected freshness or generation fields", () => {
+  it("uses the approved runtime default bound and rejects client-selected freshness or generation fields", () => {
     const normalized = completeSourceSnapshot();
     expect(normalized.ok).toBe(true);
     if (!normalized.ok) return;
     const fixture = normalized.fixture;
     const candidate = topologyCandidateFromFixture(fixture);
     expect(validateWormholesystemsTopologyRequest(candidate, now).request).toBeDefined();
-    const stale = { ...candidate, snapshot: { ...(candidate.snapshot as object), fetchedAt: new Date(now - 600_001).toISOString() } };
+    const stale = { ...candidate, snapshot: { ...(candidate.snapshot as object), fetchedAt: new Date(now - 60_001).toISOString() } };
     expect(validateWormholesystemsTopologyRequest(stale, now).blockers)
       .toContain("snapshot.fetchedAt: missing, future-dated, or stale");
     expect(validateWormholesystemsTopologyRequest({ ...candidate,

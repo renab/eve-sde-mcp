@@ -25,7 +25,9 @@ export function registerWormholeSystemsTools(server: McpServer, getService: () =
       canonical_map_id: id, upstream_map_id: id, credential_id: id }, (service, args) => service.configure(args));
   tool("wormholesystems_get_config", "Read safe WormholeSystems source configuration and activation blockers. Never returns credentials or makes network calls.",
     {}, service => service.configuration());
-  tool("wormholesystems_remove_config", "Remove the current WormholeSystems source targeting/configuration. This does not remove the encrypted credential or source snapshots.",
+  tool("wormholesystems_set_max_staleness", "Set the persisted global WormholeSystems and Nexum matching freshness bound in milliseconds. Requires a configured source; performs no network calls or writes.",
+    { max_staleness_ms: z.number().finite() }, (service, args) => service.setMaxStaleness(args.max_staleness_ms));
+  tool("wormholesystems_remove_config", "Remove the current WormholeSystems source configuration and reset freshness policy to the approved 60,000 ms default. This does not remove the encrypted credential or source snapshots.",
     {}, service => service.removeConfiguration());
   tool("wormholesystems_test_connection", "Explicitly test bearer access by listing accessible maps and requesting the explicitly selected map detail. This does not enable sync.",
     {}, service => service.testConnection());

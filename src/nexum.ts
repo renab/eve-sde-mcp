@@ -22,7 +22,7 @@ const presenceCoverage=()=>({
 });
 type Worker={controller:AbortController; task:Promise<void>; credential?:string; stream?:NexumStream};
 export type WormholesystemsSignatureNoteIdentity={connectionId:string;fromSystemId:string;toSystemId:string;
-  fromEveSystemId:number;toEveSystemId:number;signatureCode:string;maxStalenessMs:number};
+  fromEveSystemId:number;toEveSystemId:number;signatureCode:string;maxStalenessMs:number;stalenessPolicyRevision:string};
 export type WormholesystemsSignatureNoteChange={systemId:string;signatureId:string;notes:string;expectedIdentity:WormholesystemsSignatureNoteIdentity};
 export interface NexumOptions { debounceMs?:number; staleMs?:number; retentionMs?:number; retryMs?:number; accessRefreshMs?:number; random?:()=>number; }
 
@@ -530,8 +530,9 @@ export class NexumService {
       if(typeof actual.notes!=="string")return block(itemIndex,["current Nexum signature note is unknown"]);
       if(actual.notes===change.notes){items[itemIndex].status="unchanged";continue;}
       if(actual.notes!=="")return block(itemIndex,["current Nexum note changed after preview; non-empty notes are preserved"]);
-      const map=this.store.map(m.id),mapFetchedAt=Number(map.hydrated_at),resourceFetchedAt=Number(resource.signatures.fetched_at);
-      if(!Number.isSafeInteger(identity.maxStalenessMs)||identity.maxStalenessMs<1||map.health!=="live"||!Number.isFinite(mapFetchedAt)||mapFetchedAt>this.now()||this.now()-mapFetchedAt>identity.maxStalenessMs||
+      const map=this.store.map(m.id),mapFetchedAt=map.hydrated_at===null||map.hydrated_at===undefined?NaN:Number(map.hydrated_at),resourceFetchedAt=resource.signatures.fetched_at===null||resource.signatures.fetched_at===undefined?NaN:Number(resource.signatures.fetched_at);
+      if(!Number.isSafeInteger(identity.maxStalenessMs)||identity.maxStalenessMs<1||typeof identity.stalenessPolicyRevision!=="string"||!identity.stalenessPolicyRevision||
+          map.health!=="live"||!Number.isFinite(mapFetchedAt)||mapFetchedAt>this.now()||this.now()-mapFetchedAt>identity.maxStalenessMs||
           !Number.isFinite(resourceFetchedAt)||resourceFetchedAt>this.now()||this.now()-resourceFetchedAt>identity.maxStalenessMs)
         return block(itemIndex,["current Nexum map or signature cache is stale after alliance-note preview"]);
       try{

@@ -22,7 +22,7 @@ import type { WormholesystemsSignatureNoteIdentity } from "./nexum.js";
 const MAX_SYSTEM_DETAIL_REQUESTS = 100;
 const SYSTEM_DETAIL_PACING_MS = 1_000;
 const MAX_SOURCE_SNAPSHOT_BYTES = 16 * 1024 * 1024;
-const MAX_STALENESS_ENV = "GALAXY_WORMSYSTEMS_MAX_STALENESS_MS";
+const APPROVED_MAX_STALENESS_MS = 60_000;
 const SOURCE_WRITE_BLOCKER = "final-name reconciliation is disabled; source topology and alliance-note write eligibility are evaluated independently";
 const opaqueId = (value: unknown, label: string): string => {
   if (typeof value !== "string" || !value.trim() || value.length > 256 || value.trim() !== value || /[\u0000-\u001f\u007f]/.test(value))
@@ -46,7 +46,12 @@ type SourceConfig = WormholeSystemsConfig & {
   schemaValidatedAt: number | null;
   validatedCredentialId: string | null;
   validatedApiMapId: string | null;
+  max_staleness_ms?: unknown;
+  staleness_policy_origin?: unknown;
+  staleness_policy_revision?: unknown;
 };
+type StalenessPolicy = { max_age_ms: number; origin: "approved_default" | "operator"; revision: string };
+type PolicyState = { policy: StalenessPolicy | null; valid: boolean };
 type SourceNexumWrites = {
   writeWormholesystemsTopology(mapId: string, request: Record<string, unknown>): Promise<Json>;
   writeWormholesystemsSignatureNotes(mapId: string, changes: Array<{ systemId: string; signatureId: string; notes: string;
@@ -93,6 +98,7 @@ export class WormholeSystemsService {
     store.db.exec(`
       CREATE TABLE IF NOT EXISTS wormholesystems_credentials (id TEXT PRIMARY KEY, metadata TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS wormholesystems_config (id TEXT PRIMARY KEY CHECK(id='singleton'), config_json TEXT NOT NULL CHECK(json_valid(config_json)));
+      CREATE TABLE IF NOT EXISTS wormholesystems_policy_state (id TEXT PRIMARY KEY CHECK(id='singleton'), initialized INTEGER NOT NULL CHECK(initialized=1), default_revision TEXT NOT NULL);
        CREATE TABLE IF NOT EXISTS wormholesystems_source_snapshots (
         map_id TEXT PRIMARY KEY REFERENCES nexum_maps(id) ON DELETE CASCADE,
         source_identity TEXT NOT NULL, source_origin TEXT NOT NULL, source_api_map_id TEXT NOT NULL,
@@ -138,15 +144,19 @@ export class WormholeSystemsService {
     if (!runColumns.has("source_calls")) store.db.exec("ALTER TABLE wormholesystems_source_runs ADD COLUMN source_calls INTEGER NOT NULL DEFAULT 0");
     if (!runColumns.has("revision_ordering")) store.db.exec("ALTER TABLE wormholesystems_source_runs ADD COLUMN revision_ordering TEXT NOT NULL DEFAULT 'unknown'");
     if (!runColumns.has("write_outcomes_json")) store.db.exec("ALTER TABLE wormholesystems_source_runs ADD COLUMN write_outcomes_json TEXT");
+    this.initializeStalenessPolicy();
   }
 
   private config(): SourceConfig | undefined {
     const row = this.store.db.prepare("SELECT config_json FROM wormholesystems_config WHERE id='singleton'").get() as { config_json: string } | undefined;
     if (!row) return undefined;
-    const value = JSON.parse(row.config_json) as SourceConfig;
-    return { ...value, configurationRevision: value.configurationRevision ?? `legacy:${value.configuredAt}`,
-      liveSyncEnabled: value.liveSyncEnabled === true, schemaValidatedAt: value.schemaValidatedAt ?? null,
-      validatedCredentialId: value.validatedCredentialId ?? null, validatedApiMapId: value.validatedApiMapId ?? null };
+    let value: unknown;
+    try { value = JSON.parse(row.config_json); } catch { return undefined; }
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    const config = value as SourceConfig;
+    return { ...config, configurationRevision: config.configurationRevision ?? `legacy:${config.configuredAt}`,
+      liveSyncEnabled: config.liveSyncEnabled === true, schemaValidatedAt: config.schemaValidatedAt ?? null,
+      validatedCredentialId: config.validatedCredentialId ?? null, validatedApiMapId: config.validatedApiMapId ?? null };
   }
 
   private saveConfig(value: SourceConfig): void {
@@ -160,11 +170,65 @@ export class WormholeSystemsService {
     return JSON.parse(row.metadata);
   }
 
-  private maxStalenessMs(): number | undefined {
-    const raw = process.env[MAX_STALENESS_ENV];
-    if (typeof raw !== "string" || !/^[1-9]\d*$/.test(raw)) return undefined;
-    const value = Number(raw);
-    return Number.isSafeInteger(value) ? value : undefined;
+  private validPolicyFields(config: SourceConfig): StalenessPolicy | null {
+    const value = config.max_staleness_ms;
+    const origin = config.staleness_policy_origin;
+    const revision = config.staleness_policy_revision;
+    if (!Number.isSafeInteger(value) || Number(value) <= 0 || (origin !== "approved_default" && origin !== "operator") ||
+        (origin === "approved_default" && Number(value) !== APPROVED_MAX_STALENESS_MS) ||
+        typeof revision !== "string" || !revision.trim() || revision !== revision.trim() || revision.length > 256) return null;
+    return { max_age_ms: Number(value), origin, revision };
+  }
+
+  private initializeStalenessPolicy(): void {
+    this.store.db.transaction(() => {
+      const marker = this.store.db.prepare("SELECT initialized,default_revision FROM wormholesystems_policy_state WHERE id='singleton'").get() as
+        { initialized: number; default_revision: string } | undefined;
+      const row = this.store.db.prepare("SELECT config_json FROM wormholesystems_config WHERE id='singleton'").get() as { config_json: string } | undefined;
+      if (marker) return;
+      let defaultRevision: string = crypto.randomUUID();
+      if (row) {
+        let raw: unknown;
+        try { raw = JSON.parse(row.config_json); } catch { return; }
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+        const configValues = raw as Record<string, unknown>;
+        const fieldNames = ["max_staleness_ms", "staleness_policy_origin", "staleness_policy_revision"];
+        const presentCount = fieldNames.filter(field => Object.hasOwn(configValues, field)).length;
+        if (presentCount) {
+          if (presentCount !== fieldNames.length) return;
+          const existing = this.validPolicyFields(configValues as SourceConfig);
+          if (!existing) return;
+          if (existing.origin === "approved_default") defaultRevision = existing.revision;
+        } else {
+          const config = { ...configValues, max_staleness_ms: APPROVED_MAX_STALENESS_MS,
+            staleness_policy_origin: "approved_default", staleness_policy_revision: defaultRevision };
+          this.store.db.prepare("UPDATE wormholesystems_config SET config_json=? WHERE id='singleton'").run(JSON.stringify(config));
+        }
+      }
+      this.store.db.prepare("INSERT INTO wormholesystems_policy_state(id,initialized,default_revision) VALUES ('singleton',1,?)")
+        .run(defaultRevision);
+    })();
+  }
+
+  private policyState(config = this.config()): PolicyState {
+    const marker = this.store.db.prepare("SELECT initialized,default_revision FROM wormholesystems_policy_state WHERE id='singleton'").get() as
+      { initialized: number; default_revision: string } | undefined;
+    if (!marker || marker.initialized !== 1 || typeof marker.default_revision !== "string" || !marker.default_revision.trim() ||
+        marker.default_revision !== marker.default_revision.trim() || marker.default_revision.length > 256)
+      return { policy: null, valid: false };
+    if (!config) {
+      const persistedConfig = this.store.db.prepare("SELECT 1 FROM wormholesystems_config WHERE id='singleton'").get();
+      if (persistedConfig) return { policy: null, valid: false };
+      return { policy: { max_age_ms: APPROVED_MAX_STALENESS_MS, origin: "approved_default", revision: marker.default_revision }, valid: true };
+    }
+    const policy = this.validPolicyFields(config);
+    if (policy?.origin === "approved_default" && policy.revision !== marker.default_revision) return { policy: null, valid: false };
+    return policy ? { policy, valid: true } : { policy: null, valid: false };
+  }
+
+  private resetPolicyState(revision = crypto.randomUUID()): void {
+    this.store.db.prepare("INSERT INTO wormholesystems_policy_state(id,initialized,default_revision) VALUES ('singleton',1,?) ON CONFLICT(id) DO UPDATE SET initialized=1,default_revision=excluded.default_revision")
+      .run(revision);
   }
 
   private withMapBoundarySync<T>(mapIds: string[], operation: () => T): T {
@@ -216,8 +280,14 @@ export class WormholeSystemsService {
   }
 
   private assertTokenDoesNotMatchConfig(token: string, values: Record<string, unknown>): void {
-    if (Object.values(values).some(value => typeof value === "string" && value === token))
+    if (Object.values(values).some(value => typeof value === "string" && value.includes(token)))
       throw new Error("Credential value cannot match any source configuration field");
+  }
+
+  private assertConfigDoesNotContainCredential(config: SourceConfig): void {
+    this.assertTokenDoesNotMatchConfig(this.token(config), { origin: config.origin, apiPathPrefix: config.apiPathPrefix,
+      mapRouteKey: config.mapRouteKey, canonicalMapId: config.canonicalMapId, upstreamMapId: config.upstreamMapId,
+      credentialId: config.credentialId });
   }
 
   configure(input: { origin: string; api_path_prefix: string; map_route_key: "id" | "slug"; canonical_map_id: string; upstream_map_id: string; credential_id: string }): Json {
@@ -236,12 +306,19 @@ export class WormholeSystemsService {
     this.assertTokenDoesNotMatchConfig(token, configFields);
     const existing = this.config();
     if (existing) this.assertTokenDoesNotMatchConfig(this.token(existing), configFields);
-    const config: SourceConfig = { origin, apiPathPrefix, mapRouteKey: input.map_route_key, canonicalMapId,
-      upstreamMapId, credentialId, configuredAt: this.now(), configurationRevision: crypto.randomUUID(),
-      liveSyncEnabled: false, schemaValidatedAt: null, validatedCredentialId: null, validatedApiMapId: null };
     this.withMapBoundarySync([...(existing ? [existing.canonicalMapId] : []), canonicalMapId], () => this.store.db.transaction(() => {
+      const latest = this.config();
+      if (latest?.configurationRevision !== existing?.configurationRevision || latest?.canonicalMapId !== existing?.canonicalMapId)
+        throw new Error("WormholeSystems source configuration changed; retry configuration");
+      const policyState = this.policyState(latest);
+      if (!policyState.valid || !policyState.policy) throw new Error("Persisted WormholeSystems staleness policy is invalid");
+      const config: SourceConfig = { origin, apiPathPrefix, mapRouteKey: input.map_route_key, canonicalMapId,
+        upstreamMapId, credentialId, configuredAt: this.now(), configurationRevision: crypto.randomUUID(),
+        liveSyncEnabled: false, schemaValidatedAt: null, validatedCredentialId: null, validatedApiMapId: null,
+        max_staleness_ms: policyState.policy.max_age_ms, staleness_policy_origin: policyState.policy.origin,
+        staleness_policy_revision: policyState.policy.revision };
       this.saveConfig(config);
-      for (const id of new Set([existing?.canonicalMapId, canonicalMapId].filter((value): value is string => !!value)))
+      for (const id of new Set([latest?.canonicalMapId, canonicalMapId].filter((value): value is string => !!value)))
         this.store.db.prepare("UPDATE wormholesystems_source_snapshots SET eligible_for_matching=0 WHERE map_id=?").run(id);
     })());
     return this.configuration();
@@ -249,15 +326,32 @@ export class WormholeSystemsService {
 
   configuration(): Json {
     const config = this.config();
-    if (!config) return { configured: false, live_sync_enabled: false, eligible_for_matching: false, eligible_for_writes: false };
+    const policyState = this.policyState(config);
+    const stalenessPolicy = policyState.policy ?? { max_age_ms: null, origin: "invalid", revision: null };
+    if (!config) {
+      const blockers = ["source configuration is not configured", ...(!policyState.valid ? ["invalid_persisted_policy"] : [])];
+      return { configured: false, live_sync_enabled: false, eligible_for_matching: false,
+        source_snapshot_eligible_for_matching: false, stored_snapshot_eligible_for_matching: false, eligible_for_writes: false,
+        source_snapshot_blockers: blockers, nexum_matching_blockers: [],
+        full_matching_blockers: blockers,
+        staleness_policy: stalenessPolicy, ...(policyState.valid ? {} : { activation_blockers: ["invalid_persisted_policy"] }) };
+    }
+    this.assertConfigDoesNotContainCredential(config);
     const current = this.status(config.canonicalMapId) as Json;
     return { configured: true, origin: config.origin, api_path_prefix: config.apiPathPrefix, map_route_key: config.mapRouteKey,
       canonical_map_id: config.canonicalMapId, upstream_map_id: config.upstreamMapId, credential_id: config.credentialId,
       configured_at: config.configuredAt, schema_validated_at: config.schemaValidatedAt, live_sync_enabled: config.liveSyncEnabled,
+      staleness_policy: current.staleness_policy ?? stalenessPolicy,
+      stored_snapshot_eligible_for_matching: current.stored_snapshot_eligible_for_matching ?? false,
+      source_snapshot_eligible_for_matching: current.source_snapshot_eligible_for_matching ?? false,
+      source_snapshot_blockers: current.source_snapshot_blockers ?? [],
+      nexum_matching_blockers: current.nexum_matching_blockers ?? [],
+      full_matching_blockers: current.full_matching_blockers ?? current.matching_blockers ?? [],
       eligible_for_matching: current.eligible_for_matching ?? false, eligible_for_writes: current.eligible_for_writes ?? false,
       write_eligibility: current.write_eligibility ?? { topology: { eligible: false }, alliance_notes: { eligible: false } },
       activation_blockers: [...(config.schemaValidatedAt && config.validatedCredentialId === config.credentialId ? [] : ["run a successful connection and selected-map schema test"]),
-        ...(config.liveSyncEnabled ? [] : ["source snapshot synchronization is not operator-enabled"])] };
+        ...(config.liveSyncEnabled ? [] : ["source snapshot synchronization is not operator-enabled"]),
+        ...(policyState.valid ? [] : ["invalid_persisted_policy"])] };
   }
 
   removeConfiguration(): Json {
@@ -266,8 +360,43 @@ export class WormholeSystemsService {
     this.withMapBoundarySync(config ? [config.canonicalMapId] : [], () => this.store.db.transaction(() => {
       this.store.db.prepare("DELETE FROM wormholesystems_config WHERE id='singleton'").run();
       if (config) this.store.db.prepare("UPDATE wormholesystems_source_snapshots SET eligible_for_matching=0 WHERE map_id=?").run(config.canonicalMapId);
+      this.resetPolicyState();
     })());
-    return this.configuration();
+    return { ...(this.configuration() as Json), staleness_policy_reset: true };
+  }
+
+  setMaxStaleness(maxStalenessMs: unknown): Json {
+    if (!Number.isSafeInteger(maxStalenessMs) || Number(maxStalenessMs) <= 0)
+      return { committed: false, error: "max_staleness_ms must be a positive safe integer" };
+    if (this.stopping) return { committed: false, error: "WormholeSystems service is stopping; policy was not changed", retryable: true };
+    const initialConfig = this.config();
+    const initialPolicy = this.policyState(initialConfig);
+    if (!initialPolicy.valid || !initialPolicy.policy)
+      return { committed: false, error: "invalid_persisted_policy; restore durable policy state before retrying" };
+    if (!initialConfig) return { committed: false, error: "Configure a WormholeSystems source before setting the policy" };
+    const result = mapDecisionBoundary.runSync(initialConfig.canonicalMapId, () => {
+      if (this.stopping) return { committed: false, error: "WormholeSystems service is stopping; policy was not changed", retryable: true };
+      try {
+        return this.store.db.transaction(() => {
+          const current = this.config();
+          if (!current || current.canonicalMapId !== initialConfig.canonicalMapId)
+            return { committed: false, error: "WormholeSystems configuration changed; retry after checking get_config", retryable: true };
+          const currentPolicy = this.policyState(current);
+          if (!currentPolicy.valid || !currentPolicy.policy)
+            return { committed: false, error: "invalid_persisted_policy; restore durable policy state before retrying" };
+          try { this.assertConfigDoesNotContainCredential(current); }
+          catch { return { committed: false, error: "source configuration contains credential material; correct it before retrying" }; }
+          const revision = crypto.randomUUID();
+          this.saveConfig({ ...current, max_staleness_ms: Number(maxStalenessMs), staleness_policy_origin: "operator",
+            staleness_policy_revision: revision });
+          return { committed: true, staleness_policy: { max_age_ms: Number(maxStalenessMs), origin: "operator", revision } };
+        })();
+      } catch {
+        return { error: "Policy persistence outcome is indeterminate; call get_config before retrying" };
+      }
+    });
+    if (!result.acquired) return { committed: false, error: "Nexum map decision is currently in progress; retry after it completes", retryable: true };
+    return result.value;
   }
 
   addCredential(input: { api_token: string; label?: string }): Json {
@@ -339,9 +468,12 @@ export class WormholeSystemsService {
       if (config?.credentialId === id) {
         this.store.db.prepare("DELETE FROM wormholesystems_config WHERE id='singleton'").run();
         this.store.db.prepare("UPDATE wormholesystems_source_snapshots SET eligible_for_matching=0 WHERE map_id=?").run(config.canonicalMapId);
+        this.resetPolicyState();
       }
     })());
-    return { removed: true, credential_id: id, source_configuration_removed: this.config() === undefined };
+    const sourceConfigurationRemoved = config?.credentialId === id;
+    return { removed: true, credential_id: id, source_configuration_removed: this.config() === undefined,
+      ...(sourceConfigurationRemoved ? { staleness_policy_reset: true, staleness_policy: this.policyState().policy } : {}) };
   }
 
   private async fetchAccessibleMaps(): Promise<ApiMapRecord[]> {
@@ -353,15 +485,20 @@ export class WormholeSystemsService {
   }
 
   private invalidateActivation(config: SourceConfig): void {
-    this.saveConfig({ ...config, configurationRevision: crypto.randomUUID(), liveSyncEnabled: false, schemaValidatedAt: null,
+    const latest = this.config();
+    if (!latest || latest.canonicalMapId !== config.canonicalMapId || latest.configurationRevision !== config.configurationRevision) return;
+    this.saveConfig({ ...latest, configurationRevision: crypto.randomUUID(), liveSyncEnabled: false, schemaValidatedAt: null,
       validatedCredentialId: null, validatedApiMapId: null });
     this.store.db.prepare("UPDATE wormholesystems_source_snapshots SET eligible_for_matching=0 WHERE map_id=?").run(config.canonicalMapId);
   }
 
-  private snapshotBlockers(mapId: string, row: any, maxStalenessMs = this.maxStalenessMs()): string[] {
+  private snapshotBlockers(mapId: string, row: any): string[] {
     const blockers: string[] = [];
     if (!row?.eligible_for_matching) blockers.push("stored source snapshot is marked ineligible");
     const config = this.config();
+    const policyState = this.policyState(config);
+    if (!policyState.valid || !policyState.policy) blockers.push("invalid_persisted_policy");
+    const maxStalenessMs = policyState.policy?.max_age_ms;
     if (!config || config.canonicalMapId !== mapId) blockers.push("source configuration does not target this canonical map");
     else {
       if (!config.liveSyncEnabled) blockers.push("source synchronization is not currently enabled");
@@ -381,13 +518,15 @@ export class WormholeSystemsService {
         blockers.push("current source credential is unavailable");
       }
     }
-    if (maxStalenessMs === undefined) blockers.push(`maximum matching staleness is not configured (${MAX_STALENESS_ENV})`);
     const fetchedAt = row?.fetched_at ? Date.parse(row.fetched_at) : NaN;
     if (!Number.isFinite(fetchedAt) || fetchedAt > this.now()) blockers.push("source snapshot fetch time is missing or future-dated");
     else if (maxStalenessMs !== undefined && this.now() - fetchedAt > maxStalenessMs)
       blockers.push("source snapshot exceeds the configured maximum matching staleness");
     try {
-      const fixture = JSON.parse(row.payload_json).fixture;
+      const payload = JSON.parse(row.payload_json);
+      const fixture = payload?.fixture;
+      if (payload?.schema !== "wormholesystems-source-v1" || payload?.adapterVersion !== 1 || fixture?.sourceKind !== "wormholesystems")
+        blockers.push("stored snapshot does not match the validated adapter version");
       if (fixture?.revisionOrDigest !== row.revision_or_digest || fixture?.sourceIdentity !== row.source_identity || fixture?.fetchedAt !== row.fetched_at)
         blockers.push("stored source snapshot fields do not match the validated fixture");
     } catch {
@@ -396,12 +535,46 @@ export class WormholeSystemsService {
     return [...new Set(blockers)];
   }
 
-  private allianceNoteSourceBlockers(mapId: string, expected: { revision: string; sourceIdentity: string; configurationRevision: string }): string[] {
+  private targetCacheBlockers(mapId: string, sourceSystems: Json[], maxStalenessMs: number | undefined): string[] {
+    const blockers: string[] = [];
+    const now = this.now();
+    let nexumMap: Json, nexumSystems: Json[];
+    try {
+      nexumMap = this.store.map(mapId);
+      nexumSystems = (this.store.state(mapId).systems ?? []) as Json[];
+    } catch {
+      return ["Nexum target map or system identity is unavailable"];
+    }
+    const mapFetchedAt = nexumMap.hydrated_at === null || nexumMap.hydrated_at === undefined ? NaN : Number(nexumMap.hydrated_at);
+    if (nexumMap.id !== mapId || nexumMap.health !== "live" || !Number.isFinite(mapFetchedAt) || mapFetchedAt > now ||
+        maxStalenessMs === undefined || now - mapFetchedAt > maxStalenessMs)
+      blockers.push("Nexum map cache is not live or exceeds the configured maximum staleness");
+    for (const sourceSystem of sourceSystems) {
+      const identities = nexumSystems.filter(system => Number(system.eveSystemId) === Number(sourceSystem.eveSolarSystemId));
+      if (identities.length !== 1) {
+        blockers.push("required Nexum system identity is missing or ambiguous");
+        continue;
+      }
+      let fetchedAt = NaN;
+      try {
+        const resource = this.store.resources(mapId, String(identities[0].id)).signatures;
+        fetchedAt = resource?.fetched_at === null || resource?.fetched_at === undefined ? NaN : Number(resource.fetched_at);
+      } catch { /* malformed cache data is unavailable evidence */ }
+      if (!Number.isFinite(fetchedAt) || fetchedAt > now || maxStalenessMs === undefined || now - fetchedAt > maxStalenessMs)
+        blockers.push("Nexum signature cache is missing, future-dated or exceeds the configured maximum staleness");
+    }
+    return [...new Set(blockers)];
+  }
+
+  private allianceNoteSourceBlockers(mapId: string, expected: { revision: string; sourceIdentity: string; configurationRevision: string;
+    policyRevision: string }): string[] {
     const config = this.config();
     const snapshot = this.store.db.prepare("SELECT * FROM wormholesystems_source_snapshots WHERE map_id=?").get(mapId) as any;
     const blockers = snapshot ? this.snapshotBlockers(mapId, snapshot) : ["no current source snapshot is stored"];
+    const policy = this.policyState(config).policy;
     if (!config || config.canonicalMapId !== mapId || config.configurationRevision !== expected.configurationRevision)
       blockers.push("source configuration changed after alliance-note preview");
+    if (!policy || policy.revision !== expected.policyRevision) blockers.push("staleness policy changed after alliance-note preview");
     if (!snapshot || snapshot.revision_or_digest !== expected.revision || snapshot.source_identity !== expected.sourceIdentity)
       blockers.push("source snapshot revision or identity changed after alliance-note preview");
     return [...new Set(blockers)];
@@ -448,9 +621,13 @@ export class WormholeSystemsService {
         if (!schemaCheck.ok) throw new WormholeSystemsError(0, 0,
           `Unsupported WormholeSystems selected-system schema: ${schemaCheck.issues.slice(0, 5).map(issue => issue.path).join(", ")}`);
         await mapDecisionBoundary.run(currentConfig.canonicalMapId, () => {
+          const latest = this.config();
+          if (!latest || latest.canonicalMapId !== currentConfig.canonicalMapId || latest.configurationRevision !== currentConfig.configurationRevision ||
+              latest.credentialId !== currentConfig.credentialId || latest.origin !== currentConfig.origin || latest.upstreamMapId !== currentConfig.upstreamMapId)
+            throw new WormholeSystemsError(0, 0, "WormholeSystems source configuration changed during connection test");
           this.store.db.prepare("UPDATE wormholesystems_credentials SET metadata=json_set(metadata,'$.validation_status','maps_detail_schema_ok','$.last_test_at',?) WHERE id=?")
             .run(this.now(), currentConfig.credentialId);
-          this.saveConfig({ ...currentConfig, schemaValidatedAt: this.now(), validatedCredentialId: currentConfig.credentialId,
+          this.saveConfig({ ...latest, schemaValidatedAt: this.now(), validatedCredentialId: currentConfig.credentialId,
             validatedApiMapId: selected.id });
         });
         return { status: "maps_detail_schema_ok", authenticated: true, accessible_map_count: maps.length,
@@ -509,6 +686,7 @@ export class WormholeSystemsService {
     const mapId = this.canonicalMap(canonicalMapId);
     const config = this.config();
     if (!config || config.canonicalMapId !== mapId) throw new Error("WormholeSystems sync target is not the explicitly configured canonical map");
+    this.assertConfigDoesNotContainCredential(config);
     const pending = this.syncs.get(mapId);
     if (pending) return pending;
     const task = this.track(() => this.syncConfiguredMap(mapId, config));
@@ -519,6 +697,7 @@ export class WormholeSystemsService {
 
   private async syncConfiguredMap(mapId: string, config: SourceConfig): Promise<Json> {
     const attemptedAt = this.now();
+    const initialPolicy = this.policyState(config).policy ?? { max_age_ms: null, origin: "invalid", revision: null };
     let revisionOrdering: "unknown" | "observed_at" = "unknown";
     const snapshot = this.store.db.prepare("SELECT source_identity,source_origin,source_api_map_id,revision_or_digest,fetched_at,observed_at,payload_json FROM wormholesystems_source_snapshots WHERE map_id=?").get(mapId) as any;
     const credentialVersion = Number(this.metadata(config.credentialId).credential_version) || 1;
@@ -526,6 +705,10 @@ export class WormholeSystemsService {
       this.store.db.prepare("INSERT INTO wormholesystems_source_runs(map_id,status,attempted_at,error_status,error_message,source_calls) VALUES (?,'disabled',?,0,?,0)")
         .run(mapId, attemptedAt, "Source synchronization has not been operator-enabled after a successful schema test.");
       return { map_id: mapId, status: "disabled", fetched: false, source_calls: 0,
+        staleness_policy: initialPolicy,
+        stored_snapshot_eligible_for_matching: !!snapshot?.eligible_for_matching,
+        source_snapshot_eligible_for_matching: false,
+        ...(initialPolicy.origin === "invalid" ? { full_matching_blockers: ["invalid_persisted_policy"] } : {}),
         eligible_for_matching: false, eligible_for_writes: false, nexum_writes_attempted: false,
         last_good_snapshot_retained: !!snapshot, revision_or_digest: snapshot?.revision_or_digest ?? null,
         error: "Source sync is disabled; complete a successful connection test and explicit operator enable action." };
@@ -544,7 +727,10 @@ export class WormholeSystemsService {
           this.store.db.prepare("INSERT INTO wormholesystems_source_runs(map_id,status,attempted_at,error_status,error_message,source_calls) VALUES (?,'inaccessible_or_not_listed',?,404,?,?)")
             .run(mapId, attemptedAt, "Selected upstream map is not in the accessible map list.", sourceCalls);
         })());
-        return { map_id: mapId, status: "inaccessible_or_not_listed", fetched: false, source_calls: 1, eligible_for_matching: false,
+        const policy = this.policyState().policy ?? { max_age_ms: null, origin: "invalid", revision: null };
+        return { map_id: mapId, status: "inaccessible_or_not_listed", fetched: false, source_calls: 1, staleness_policy: policy,
+          stored_snapshot_eligible_for_matching: false, source_snapshot_eligible_for_matching: false,
+          ...(policy.origin === "invalid" ? { full_matching_blockers: ["invalid_persisted_policy"] } : {}), eligible_for_matching: false,
           eligible_for_writes: false, nexum_writes_attempted: false, last_good_snapshot_retained: !!snapshot };
       }
       if (selected.id !== config.validatedApiMapId)
@@ -589,7 +775,6 @@ export class WormholeSystemsService {
       if (Buffer.byteLength(payloadJson, "utf8") > MAX_SOURCE_SNAPSHOT_BYTES)
         throw new WormholeSystemsError(0, 0, "WormholeSystems normalized snapshot exceeded the size limit");
       await mapDecisionBoundary.run(mapId, () => {
-        const matchingStalenessConfigured = this.maxStalenessMs() !== undefined;
         const currentConfig = this.config();
         const currentCredentialVersion = Number(this.metadata(config.credentialId).credential_version) || 1;
         if (!currentConfig || currentConfig.canonicalMapId !== mapId || currentConfig.origin !== config.origin ||
@@ -606,7 +791,7 @@ export class WormholeSystemsService {
           credential_id=excluded.credential_id,credential_version=excluded.credential_version,source_configured_at=excluded.source_configured_at,
           source_config_revision=excluded.source_config_revision`)
           .run(mapId, sourceIdentity, config.origin, selected.id, revision, fetchedAt,
-            normalized.fixture.observedAt, payloadJson, matchingStalenessConfigured ? 1 : 0, config.credentialId, credentialVersion, config.configuredAt,
+             normalized.fixture.observedAt, payloadJson, 1, config.credentialId, credentialVersion, config.configuredAt,
             config.configurationRevision);
          const insertedRun = this.store.db.prepare("INSERT INTO wormholesystems_source_runs(map_id,status,attempted_at,succeeded_at,revision_or_digest,error_status,error_message,source_calls,revision_ordering) VALUES (?,'snapshot_validated',?,?,?,0,NULL,?,?)")
            .run(mapId, attemptedAt, fetchedAtMs, revision, sourceCalls, revisionOrdering);
@@ -614,7 +799,8 @@ export class WormholeSystemsService {
         })();
       });
       const topologyCandidate = topologyCandidateFromFixture(normalized.fixture);
-      const topologyValidation = validateWormholesystemsTopologyRequest(topologyCandidate, this.now());
+      const topologyPolicy = this.policyState().policy;
+      const topologyValidation = validateWormholesystemsTopologyRequest(topologyCandidate, this.now(), topologyPolicy?.max_age_ms ?? 0);
       const topologyBlockers = [...topologyValidation.blockers];
       let topologyEligible = false, topologyAttempted = false, notesAttempted = false;
       let topologyWriteStatus: "blocked" | "completed" | "failed" = "blocked";
@@ -628,9 +814,13 @@ export class WormholeSystemsService {
           const latestConfig = this.config();
           const latestSnapshot = this.store.db.prepare("SELECT * FROM wormholesystems_source_snapshots WHERE map_id=?").get(mapId) as any;
           const blockers = this.snapshotBlockers(mapId, latestSnapshot);
+          const latestPolicy = this.policyState(latestConfig).policy;
+          if (!topologyPolicy || !latestPolicy || latestPolicy.revision !== topologyPolicy.revision)
+            blockers.push("staleness policy changed before topology apply");
           if (!latestConfig || latestConfig.canonicalMapId !== mapId || latestConfig.configurationRevision !== config.configurationRevision ||
               latestSnapshot?.revision_or_digest !== revision || latestSnapshot?.source_identity !== sourceIdentity)
             blockers.push("current source identity, configuration, or snapshot revision changed before topology apply");
+          blockers.push(...this.targetCacheBlockers(mapId, normalized.fixture.systems as unknown as Json[], latestPolicy?.max_age_ms));
           if (blockers.length) { topologyBlockers.push(...blockers); return; }
           topologyEligible = true;
           topologyAttempted = true;
@@ -650,6 +840,7 @@ export class WormholeSystemsService {
       // cache path; it does not depend on topology PUT eligibility or success.
       const nexumWrites = this.nexumWrites ?? getNexum();
       const notePreview = await mapDecisionBoundary.run(mapId, () => this.previewLocked(mapId) as any);
+      const notePolicyRevision = notePreview.staleness_policy?.revision;
       const noteRows: any[] = notePreview.preview?.alliance_notes ?? [];
       const eligibleNoteCount = noteRows.filter((note: any) => note.eligible_for_write).length;
       const noteChangeEntries = noteRows.flatMap((note: any, index: number) => note.eligible_for_write &&
@@ -690,7 +881,8 @@ export class WormholeSystemsService {
         notesAttempted = true;
         try {
           const writeResult = await nexumWrites.writeWormholesystemsSignatureNotes(mapId, noteChanges, () =>
-            this.allianceNoteSourceBlockers(mapId, { revision, sourceIdentity, configurationRevision: config.configurationRevision }));
+            this.allianceNoteSourceBlockers(mapId, { revision, sourceIdentity, configurationRevision: config.configurationRevision,
+              policyRevision: notePolicyRevision }));
           finalizeNoteOutcomes((writeResult as any)?.items);
           if (typeof (writeResult as any)?.local_cache_status === "string") allianceNoteLocalCacheStatus = (writeResult as any).local_cache_status;
           if (Array.isArray((writeResult as any)?.warnings)) allianceNoteWarnings = (writeResult as any).warnings.filter((warning: unknown) => typeof warning === "string");
@@ -729,11 +921,17 @@ export class WormholeSystemsService {
           ...(allianceNoteWarnings.length ? { warnings: allianceNoteWarnings } : {}) } };
       if (sourceRunId !== null) await mapDecisionBoundary.run(mapId, () => this.store.db.prepare(
         "UPDATE wormholesystems_source_runs SET write_outcomes_json=? WHERE id=?").run(JSON.stringify(writeOutcomes), sourceRunId));
-      const finalStatus = await mapDecisionBoundary.run(mapId, () => this.status(mapId) as Json);
-      return { map_id: mapId, status: "snapshot_validated", fetched: true, source_calls: sourceCalls,
+       const finalStatus = await mapDecisionBoundary.run(mapId, () => this.statusLocked(mapId) as Json);
+       return { map_id: mapId, status: "snapshot_validated", fetched: true, source_calls: sourceCalls,
         source_identity: sourceIdentity, source_api_map_id: selected.id, revision_or_digest: revision, revision_ordering: revisionOrdering,
         fetched_at: fetchedAt, observed_at: normalized.fixture.observedAt,
-        ...normalized.diagnostics, eligible_for_matching: finalStatus.eligible_for_matching ?? false,
+         ...normalized.diagnostics, staleness_policy: finalStatus.staleness_policy,
+         stored_snapshot_eligible_for_matching: finalStatus.stored_snapshot_eligible_for_matching ?? false,
+         source_snapshot_eligible_for_matching: finalStatus.source_snapshot_eligible_for_matching ?? false,
+         eligible_for_matching: finalStatus.eligible_for_matching ?? false,
+         source_snapshot_blockers: finalStatus.source_snapshot_blockers ?? [],
+         nexum_matching_blockers: finalStatus.nexum_matching_blockers ?? [],
+         full_matching_blockers: finalStatus.full_matching_blockers ?? [],
         eligible_for_topology_write: finalStatus.eligible_for_topology_write ?? false,
         eligible_for_alliance_note_writes: finalStatus.eligible_for_alliance_note_writes ?? false,
         eligible_for_writes: finalStatus.eligible_for_writes ?? false, write_eligibility: finalStatus.write_eligibility,
@@ -747,12 +945,16 @@ export class WormholeSystemsService {
             "Validated source snapshot stored locally. Nexum writes remain blocked by the concrete source fields listed in the path-specific blockers." };
     } catch (error) {
       const failure = safeError(error);
+      const policy = this.policyState().policy ?? { max_age_ms: null, origin: "invalid", revision: null };
       await mapDecisionBoundary.run(mapId, () => this.store.db.transaction(() => {
         this.store.db.prepare("UPDATE wormholesystems_source_snapshots SET eligible_for_matching=0 WHERE map_id=?").run(mapId);
         this.store.db.prepare("INSERT INTO wormholesystems_source_runs(map_id,status,attempted_at,error_status,error_message,source_calls,revision_ordering) VALUES (?,'fetch_failed',?,?,?,?,?)")
           .run(mapId, attemptedAt, failure.status, failure.message, sourceCalls, revisionOrdering);
       })());
       return { map_id: mapId, status: "fetch_failed", fetched: false, source_calls: sourceCalls,
+        staleness_policy: policy,
+        stored_snapshot_eligible_for_matching: false, source_snapshot_eligible_for_matching: false,
+        ...(policy.origin === "invalid" ? { full_matching_blockers: ["invalid_persisted_policy"] } : {}),
         eligible_for_matching: false, eligible_for_writes: false, nexum_writes_attempted: false,
         last_good_snapshot_retained: !!snapshot, last_good_revision_or_digest: snapshot?.revision_or_digest ?? null,
         error_status: failure.status, error: failure.message };
@@ -763,13 +965,18 @@ export class WormholeSystemsService {
     const snapshot = this.store.db.prepare("SELECT * FROM wormholesystems_source_snapshots WHERE map_id=?").get(mapId) as any;
     const run = this.store.db.prepare("SELECT status,attempted_at,succeeded_at,revision_or_digest,error_status,error_message,source_calls,revision_ordering,write_outcomes_json FROM wormholesystems_source_runs WHERE map_id=? ORDER BY id DESC LIMIT 1").get(mapId) as any;
     const config = this.config();
-    const payload = snapshot ? JSON.parse(snapshot.payload_json) as Json : undefined;
+    if (config) this.assertConfigDoesNotContainCredential(config);
+    let payload: Json | undefined;
+    if (snapshot) try { payload = JSON.parse(snapshot.payload_json) as Json; } catch { payload = undefined; }
     const fixture = payload?.fixture as Json | undefined;
     const adapterDiagnostics = payload?.adapterDiagnostics as Json | undefined;
     const sourceMetadata = fixture?.sourceMetadata as Json | undefined;
     const sourceMap = sourceMetadata?.map as Json | undefined;
-    const maxStalenessMs = this.maxStalenessMs();
-    const matchBlockers = snapshot ? this.snapshotBlockers(mapId, snapshot, maxStalenessMs) : ["no source snapshot is stored"];
+    const policyState = this.policyState(config);
+    const sourceBlockers = snapshot ? this.snapshotBlockers(mapId, snapshot) : ["no source snapshot is stored"];
+    if (!policyState.valid && !sourceBlockers.includes("invalid_persisted_policy")) sourceBlockers.push("invalid_persisted_policy");
+    const storedEligible = !!snapshot?.eligible_for_matching;
+    const sourceEligible = !!snapshot && sourceBlockers.length === 0;
     return { map_id: mapId, configured: config?.canonicalMapId === mapId,
        integration_mode: config?.liveSyncEnabled ? "operator_enabled_source_sync" : "source_sync_disabled",
        live_sync_enabled: !!config?.liveSyncEnabled,
@@ -779,8 +986,9 @@ export class WormholeSystemsService {
            revision_ordering: payload?.revisionOrdering ?? "unknown",
            fetched_at: snapshot.fetched_at, fetched_age_ms: this.now() - Date.parse(snapshot.fetched_at),
            observed_at: snapshot.observed_at, observed_age_ms: snapshot.observed_at ? this.now() - Date.parse(snapshot.observed_at) : null,
-            eligible_for_matching: matchBlockers.length === 0, stored_snapshot_eligible_for_matching: !!snapshot.eligible_for_matching,
-            matching_blockers: matchBlockers,
+             eligible_for_matching: false, stored_snapshot_eligible_for_matching: storedEligible,
+             source_snapshot_eligible_for_matching: sourceEligible, source_snapshot_blockers: sourceBlockers,
+             matching_blockers: sourceBlockers,
            adapter_version: payload?.adapterVersion ?? null, system_count: fixture?.systems?.length ?? 0,
            signature_count: fixture?.signatures?.length ?? 0, connection_count: fixture?.connections?.length ?? 0,
            opaque_map_connection_count: adapterDiagnostics?.opaqueMapConnectionCount ?? null,
@@ -790,10 +998,11 @@ export class WormholeSystemsService {
            source_freshness_evidence: { system_observations: ((fixture?.systems ?? []) as Json[]).filter(system => !!system.observedAt).length,
              signature_observations: ((fixture?.signatures ?? []) as Json[]).filter(signature => !!signature.observedAt).length,
              signature_freshness_deadlines: ((fixture?.signatures ?? []) as Json[]).filter(signature => !!signature.freshUntil).length,
-             connection_observations: ((fixture?.connections ?? []) as Json[]).filter(connection => !!connection.observedAt).length,
-             connection_freshness_deadlines: ((fixture?.connections ?? []) as Json[]).filter(connection => !!connection.freshUntil).length } } : { eligible_for_matching: false }),
-        staleness_policy: { configuration_key: MAX_STALENESS_ENV, max_age_ms: maxStalenessMs ?? null,
-          configured: maxStalenessMs !== undefined, status: maxStalenessMs === undefined ? "blocked_missing_or_invalid" : "configured" },
+              connection_observations: ((fixture?.connections ?? []) as Json[]).filter(connection => !!connection.observedAt).length,
+              connection_freshness_deadlines: ((fixture?.connections ?? []) as Json[]).filter(connection => !!connection.freshUntil).length } } : {
+                eligible_for_matching: false, stored_snapshot_eligible_for_matching: false,
+                source_snapshot_eligible_for_matching: false, source_snapshot_blockers: sourceBlockers, matching_blockers: sourceBlockers }),
+         staleness_policy: policyState.policy ?? { max_age_ms: null, origin: "invalid", revision: null },
          eligible_for_writes: false, last_attempt: run ? { status: run.status, attempted_at: run.attempted_at,
            succeeded_at: run.succeeded_at, source_calls: run.source_calls, revision_or_digest: run.revision_or_digest,
            revision_ordering: run.revision_ordering,
@@ -802,8 +1011,7 @@ export class WormholeSystemsService {
         preview: { local_only: true, upstream_calls: 0, authority_dependent_bookmark_notes: "blocked_unknown_source_aliases_or_status_annotations", writes_enabled: false } };
   }
 
-  status(canonicalMapId: string): Json {
-    const mapId = this.canonicalMap(canonicalMapId);
+  private statusLocked(mapId: string): Json {
     const current = this.statusBase(mapId);
     const checked = this.previewLocked(mapId, current) as any;
     const preview = checked.preview ?? {};
@@ -818,7 +1026,14 @@ export class WormholeSystemsService {
       source_signature_key: note.source_signature_key, system_id: note.system_id, signature_id: note.signature_id,
       eligible: note.eligible_for_write === true, pending: note.eligible_for_write === true && note.actual_note !== note.desired_note,
       blocking_fields: note.blocking_fields ?? [] }));
-    return { ...current, eligible_for_topology_write: topologyEligible,
+    const previewFullEligible = preview.full_matching_eligible === true;
+    const fullBlockers = Array.isArray(preview.full_matching_blockers) ? preview.full_matching_blockers : current.source_snapshot_blockers ?? [];
+    return { ...current, eligible_for_matching: previewFullEligible,
+      matching_blockers: fullBlockers,
+      full_matching_blockers: fullBlockers,
+      nexum_matching_blockers: preview.nexum_cache?.matching_evidence_blockers ?? [],
+      source_snapshot_eligible_for_matching: preview.source_snapshot_eligible_for_matching === true,
+      eligible_for_topology_write: topologyEligible,
       eligible_for_alliance_note_writes: allianceNotesEligible, eligible_for_writes: eligibleForWrites,
       write_eligibility: { topology: { eligible: topologyEligible, blockers: topology.blockers ?? [] },
         alliance_notes: { eligible: allianceNotesEligible, rendered_eligible_count: renderedEligibleCount,
@@ -829,15 +1044,31 @@ export class WormholeSystemsService {
           "blocked_or_unchanged_for_current_source_and_nexum_state" } };
   }
 
+  status(canonicalMapId: string): Json {
+    const mapId = this.canonicalMap(canonicalMapId);
+    const locked = mapDecisionBoundary.runSync(mapId, () => this.statusLocked(mapId));
+    if (locked.acquired) return locked.value;
+    const current = this.statusBase(mapId);
+    const reason = "Nexum map decision boundary is busy; status eligibility is unavailable until state is coherent";
+    return { ...current, eligible_for_matching: false, source_snapshot_eligible_for_matching: false,
+      matching_blockers: [reason], full_matching_blockers: [reason], nexum_matching_blockers: [reason],
+      source_snapshot_blockers: [reason], status_blockers: [reason], eligible_for_topology_write: false,
+      eligible_for_alliance_note_writes: false, eligible_for_writes: false,
+      write_eligibility: { topology: { eligible: false, blockers: [reason] }, alliance_notes: { eligible: false, blockers: [reason], notes: [] } } };
+  }
+
   preview(canonicalMapId: string): Json {
     const mapId = this.canonicalMap(canonicalMapId);
     const locked = mapDecisionBoundary.runSync(mapId, () => this.previewLocked(mapId));
     if (!locked.acquired) {
       const current = this.status(mapId) as Json;
       const reason = "Nexum map decision boundary is busy; preview is blocked until a coherent state is available";
-      return { ...current, eligible_for_topology_write: false, eligible_for_alliance_note_writes: false, eligible_for_writes: false,
+      return { ...current, eligible_for_matching: false, source_snapshot_eligible_for_matching: false,
+        eligible_for_topology_write: false, eligible_for_alliance_note_writes: false, eligible_for_writes: false,
+        full_matching_blockers: [reason], nexum_matching_blockers: [reason], source_snapshot_blockers: [reason],
         write_eligibility: { topology: { eligible: false, blockers: [reason] }, alliance_notes: { eligible: false, blockers: [reason], notes: [] } },
         preview: { local_only: true, upstream_calls: 0, matching_performed: false,
+          source_snapshot_eligible_for_matching: false, full_matching_eligible: false, full_matching_blockers: [reason],
           matched: [], unmatched: [], conflicts: [{ reason }], final_names: "blocked_unknown_source_aliases_or_status_annotations",
           writes_enabled: false, nexum_writes_attempted: false } };
     }
@@ -847,22 +1078,35 @@ export class WormholeSystemsService {
   private previewLocked(mapId: string, status?: Json): Json {
     const current = status ?? this.statusBase(mapId);
     const row = this.store.db.prepare("SELECT * FROM wormholesystems_source_snapshots WHERE map_id=?").get(mapId) as any;
-    if (!row) return { ...current, preview: { local_only: true, upstream_calls: 0, matching_performed: false,
+    if (!row) return { ...current, eligible_for_matching: false, source_snapshot_eligible_for_matching: false,
+      source_snapshot_blockers: current.source_snapshot_blockers ?? ["no source snapshot is stored"],
+      full_matching_blockers: current.source_snapshot_blockers ?? ["no source snapshot is stored"],
+      nexum_matching_blockers: [], preview: { local_only: true, upstream_calls: 0, matching_performed: false,
+       stored_snapshot_eligible_for_matching: false, source_snapshot_eligible_for_matching: false,
+       full_matching_eligible: false, full_matching_blockers: current.source_snapshot_blockers ?? ["no source snapshot is stored"],
        matched: [], unmatched: [], conflicts: [], alliance_notes: [],
        topology_apply: { endpoint: "PUT /api/v1/maps/:mapId/wormholesystems/topology", eligible: false, blockers: ["no source snapshot is stored"] },
        final_names: "blocked_unknown_source_aliases_or_status_annotations", writes_enabled: false, nexum_writes_attempted: false } };
-    const payload = JSON.parse(row.payload_json) as Json;
-    if (payload?.schema !== "wormholesystems-source-v1" || payload?.adapterVersion !== 1 || !payload.fixture || payload.fixture.sourceKind !== "wormholesystems")
-      return { ...current, preview: { local_only: true, upstream_calls: 0, matching_performed: false, matched: [], unmatched: [],
-        conflicts: [{ reason: "stored snapshot does not match the validated adapter version" }],
-         final_names: "blocked_unknown_source_aliases_or_status_annotations", writes_enabled: false } };
+     let payload: Json | undefined;
+     try { payload = JSON.parse(row.payload_json) as Json; } catch { payload = undefined; }
+     if (payload?.schema !== "wormholesystems-source-v1" || payload?.adapterVersion !== 1 || !payload.fixture || payload.fixture.sourceKind !== "wormholesystems") {
+       const reason = "stored snapshot does not match the validated adapter version";
+       return { ...current, eligible_for_matching: false, source_snapshot_eligible_for_matching: false,
+         source_snapshot_blockers: [reason], matching_blockers: [reason], preview: { local_only: true, upstream_calls: 0,
+           matching_performed: false, stored_snapshot_eligible_for_matching: !!row.eligible_for_matching,
+           source_snapshot_eligible_for_matching: false, full_matching_eligible: false,
+           full_matching_blockers: [reason], matched: [], unmatched: [], conflicts: [{ reason }],
+           final_names: "blocked_unknown_source_aliases_or_status_annotations", writes_enabled: false } };
+     }
     const source = payload.fixture as Json;
     const sourceFixture = payload.fixture as unknown as WormholeSystemsFixture;
     const state = this.store.state(mapId) as Json;
     const nexumMap = this.store.map(mapId);
-    const maxStalenessMs = this.maxStalenessMs();
-    const snapshotReasons = this.snapshotBlockers(mapId, row, maxStalenessMs);
-    const mapFetchedAt = Number(nexumMap.hydrated_at);
+    const policyState = this.policyState();
+    const policy = policyState.policy;
+    const maxStalenessMs = policy?.max_age_ms;
+    const snapshotReasons = this.snapshotBlockers(mapId, row);
+    const mapFetchedAt = nexumMap.hydrated_at === null || nexumMap.hydrated_at === undefined ? NaN : Number(nexumMap.hydrated_at);
     const mapCacheFresh = maxStalenessMs !== undefined && Number.isFinite(mapFetchedAt) && mapFetchedAt <= this.now() &&
       this.now() - mapFetchedAt <= maxStalenessMs;
     const sourceSystems = new Map<number, Json[]>([]);
@@ -870,12 +1114,32 @@ export class WormholeSystemsService {
     const nexumSystems = (state.systems ?? []) as Json[];
     const nexumSignatures: Json[] = [];
     const resourceFetchTimes: number[] = [];
+    const signatureResources = new Map<string, { fetchedAt: number }>();
     for (const system of nexumSystems) {
       const resource = this.store.resources(mapId, String(system.id));
       if (Number.isFinite(resource.signatures?.fetched_at)) resourceFetchTimes.push(Number(resource.signatures.fetched_at));
+      signatureResources.set(String(system.id), { fetchedAt: resource.signatures?.fetched_at === null || resource.signatures?.fetched_at === undefined
+        ? NaN : Number(resource.signatures.fetched_at) });
       for (const signature of (resource.signatures?.items ?? []) as Json[])
         nexumSignatures.push({ ...signature, _systemId: String(system.id), _resourceFetchedAt: resource.signatures?.fetched_at ?? null });
     }
+    const nexumEvidenceBlockers: string[] = [];
+    if (!policy) nexumEvidenceBlockers.push("invalid_persisted_policy");
+    if (nexumMap.health !== "live" || !mapCacheFresh)
+      nexumEvidenceBlockers.push("Nexum map cache is not live or exceeds the configured maximum staleness");
+    for (const sourceSystem of (source.systems ?? []) as Json[]) {
+      const identities = nexumSystems.filter(system => Number(system.eveSystemId) === Number(sourceSystem.eveSolarSystemId));
+      if (identities.length !== 1) {
+        nexumEvidenceBlockers.push("required Nexum system identity is missing or ambiguous");
+        continue;
+      }
+      const resource = signatureResources.get(String(identities[0].id));
+      if (!resource || !Number.isFinite(resource.fetchedAt) || resource.fetchedAt > this.now() || maxStalenessMs === undefined ||
+          this.now() - resource.fetchedAt > maxStalenessMs)
+        nexumEvidenceBlockers.push("Nexum signature cache is missing, future-dated or exceeds the configured maximum staleness");
+    }
+    const uniqueNexumEvidenceBlockers = [...new Set([...nexumEvidenceBlockers,
+      ...this.targetCacheBlockers(mapId, (source.systems ?? []) as Json[], maxStalenessMs)])];
     const matched: Json[] = [], unmatched: Json[] = [], conflicts: Json[] = [];
     const signatures = new Map<string, Json>(((source.signatures ?? []) as Json[]).map(signature => [signature.signatureKey, signature]));
     const pushIssue = (target: Json[], connection: Json, reason: string, keys: (string | null)[] = []) => {
@@ -916,8 +1180,7 @@ export class WormholeSystemsService {
       const nexumStateKnown = candidate.edge.broken === false && typeof candidate.edge.timeStatus === "string" &&
         !!candidate.edge.timeStatus && !["unknown", "unavailable"].includes(candidate.edge.timeStatus.toLowerCase()) &&
         candidate.fromRow.status === "active" && candidate.toRow.status === "active";
-      const reasons = [...snapshotReasons, !resourceFresh && (maxStalenessMs === undefined ? `maximum matching staleness is not configured (${MAX_STALENESS_ENV})` : "Nexum signature cache is missing, future-dated or exceeds the configured maximum staleness"),
-        (nexumMap.health !== "live" || !mapCacheFresh) && "Nexum map cache is not live or exceeds the configured maximum staleness",
+      const reasons = [...snapshotReasons, ...uniqueNexumEvidenceBlockers, !resourceFresh && "Nexum signature cache is missing, future-dated or exceeds the configured maximum staleness",
         !nexumStateKnown && "Nexum connection or signature status is unknown", nexumBroken && "Nexum connection is broken or expired"].filter(Boolean);
       matched.push({ source_connection_id: connection.sourceConnectionId, source_signature_keys: keys,
         nexum_connection_id: candidate.edge.id, nexum_signature_row_ids: [candidate.fromRow.id, candidate.toRow.id],
@@ -927,8 +1190,17 @@ export class WormholeSystemsService {
       if (reasons.length) pushIssue(conflicts, connection, reasons.join("; "), keys);
     }
     const allSourceConnectionIds = new Set(((source.connections ?? []) as Json[]).map(connection => connection.sourceConnectionId));
-    for (const signature of (source.signatures ?? []) as Json[]) if (signature.sourceConnectionId && !allSourceConnectionIds.has(signature.sourceConnectionId))
-      unmatched.push({ source_connection_id: signature.sourceConnectionId, source_signature_keys: [signature.signatureKey], reason: "source signature has no normalized connection record" });
+    const emittedUnconnectedIds = new Set<string>();
+    for (const signature of (source.signatures ?? []) as Json[]) {
+      if (signature.sourceConnectionId && allSourceConnectionIds.has(signature.sourceConnectionId)) continue;
+      const sourceSignatureId = typeof signature.sourceSignatureId === "string" ? signature.sourceSignatureId : "";
+      if (sourceSignatureId && emittedUnconnectedIds.has(sourceSignatureId)) continue;
+      if (sourceSignatureId) emittedUnconnectedIds.add(sourceSignatureId);
+      unmatched.push({ source_signature_id: sourceSignatureId || null,
+        scanner_eve_system_id: Number.isSafeInteger(signature.scannerEveSystemId) ? signature.scannerEveSystemId : null,
+        ...(typeof signature.signatureCode === "string" && signature.signatureCode ? { signature_code: signature.signatureCode } : {}),
+        reason: "no_source_connection_reference" });
+    }
     const allianceNotes: Json[] = [];
     const nexumSignatureById = new Map(nexumSignatures.map(signature => [String(signature.id), signature]));
     const noteEvidence = sourceFixture.allianceNoteEvidence;
@@ -973,10 +1245,10 @@ export class WormholeSystemsService {
         if (directionalCandidates.length === 1) {
           targetRow = directionalCandidates[0].row;
           targetEdge = directionalCandidates[0].edge;
-          expectedIdentity = { connectionId: String(targetEdge.id), fromSystemId: String(directionalCandidates[0].fromSystem.id),
-            toSystemId: String(directionalCandidates[0].toSystem.id), fromEveSystemId: Number(direction.from.eveSolarSystemId),
-            toEveSystemId: Number(direction.to.eveSolarSystemId), signatureCode: String(signature!.signatureCode),
-            maxStalenessMs: maxStalenessMs! };
+          if (policy && maxStalenessMs !== undefined) expectedIdentity = { connectionId: String(targetEdge.id),
+            fromSystemId: String(directionalCandidates[0].fromSystem.id), toSystemId: String(directionalCandidates[0].toSystem.id),
+            fromEveSystemId: Number(direction.from.eveSolarSystemId), toEveSystemId: Number(direction.to.eveSolarSystemId),
+            signatureCode: String(signature!.signatureCode), maxStalenessMs, stalenessPolicyRevision: policy.revision };
         } else if (directionalCandidates.length > 1) directionBlockers.push("multiple Nexum connections match this directional signature identity");
         else if (signature && !directionBlockers.length) directionBlockers.push("no exact cached Nexum connection and directional signature match");
         if (targetRow) {
@@ -985,10 +1257,8 @@ export class WormholeSystemsService {
           const nexumStateKnown = targetEdge?.broken === false && typeof targetEdge?.timeStatus === "string" &&
             !!targetEdge.timeStatus && !["unknown", "unavailable"].includes(targetEdge.timeStatus.toLowerCase()) && targetRow.status === "active";
           const nexumBroken = targetEdge?.broken === true || ["broken", "expired"].includes(String(targetEdge?.timeStatus ?? "").toLowerCase());
-          if (!resourceFresh) directionBlockers.push(maxStalenessMs === undefined
-            ? `maximum matching staleness is not configured (${MAX_STALENESS_ENV})`
-            : "Nexum signature cache is missing, future-dated or exceeds the configured maximum staleness");
-          if (!mapCacheFresh) directionBlockers.push("Nexum map cache is not live or exceeds the configured maximum staleness");
+          if (!resourceFresh) directionBlockers.push("Nexum signature cache is missing, future-dated or exceeds the configured maximum staleness");
+          if (!mapCacheFresh || nexumMap.health !== "live") directionBlockers.push("Nexum map cache is not live or exceeds the configured maximum staleness");
           if (!nexumStateKnown) directionBlockers.push("Nexum connection or signature status is unknown");
           if (nexumBroken) directionBlockers.push("Nexum connection is broken or expired");
         }
@@ -1030,21 +1300,33 @@ export class WormholeSystemsService {
           actual_note: targetRow?.notes ?? null, eligible_for_write: eligibility.eligible,
           blocking_fields: [...new Set(eligibility.blockers)] });
     }
-    const topologyCheck = validateWormholesystemsTopologyRequest(topologyCandidateFromFixture(sourceFixture), this.now());
-    const topologyBlockers = [...new Set([...snapshotReasons, ...topologyCheck.blockers])];
+    const topologyCheck = validateWormholesystemsTopologyRequest(topologyCandidateFromFixture(sourceFixture), this.now(), maxStalenessMs ?? 0);
+    const topologyBlockers = [...new Set([...snapshotReasons, ...topologyCheck.blockers, ...uniqueNexumEvidenceBlockers])];
+    const sourceSnapshotEligible = snapshotReasons.length === 0;
+    const fullMatchingBlockers = [...snapshotReasons, ...uniqueNexumEvidenceBlockers];
+    if (conflicts.length) fullMatchingBlockers.push("one or more source/Nexum identity or edge conflicts prevent full matching eligibility");
+    const unmatchedConnections = unmatched.some(item => typeof item.source_connection_id === "string");
+    if (unmatchedConnections) fullMatchingBlockers.push("one or more source connections lack a complete Nexum identity match");
+    const fullMatchingEligible = sourceSnapshotEligible && uniqueNexumEvidenceBlockers.length === 0 && conflicts.length === 0 && !unmatchedConnections;
     const resourceFreshness = { nexum_map_health: nexumMap.health ?? "unknown", map_hydrated_at: nexumMap.hydrated_at ?? null,
       map_cache_fresh: mapCacheFresh, maximum_staleness_ms: maxStalenessMs ?? null, signature_resource_count: resourceFetchTimes.length,
       oldest_signature_resource_fetched_at: resourceFetchTimes.length ? Math.min(...resourceFetchTimes) : null,
-      newest_signature_resource_fetched_at: resourceFetchTimes.length ? Math.max(...resourceFetchTimes) : null };
-    const topologyEligible = !!topologyCheck.request && snapshotReasons.length === 0;
+      newest_signature_resource_fetched_at: resourceFetchTimes.length ? Math.max(...resourceFetchTimes) : null,
+      matching_evidence_blockers: uniqueNexumEvidenceBlockers };
+    const topologyEligible = !!topologyCheck.request && snapshotReasons.length === 0 && uniqueNexumEvidenceBlockers.length === 0;
     const pendingAllianceNotes = allianceNotes.filter(note => note.eligible_for_write && note.actual_note !== note.desired_note);
     const allianceNotesEligible = pendingAllianceNotes.length > 0;
     const writesEnabled = topologyEligible || allianceNotesEligible;
-    return { ...current, eligible_for_topology_write: topologyEligible,
+    return { ...current, source_snapshot_eligible_for_matching: sourceSnapshotEligible,
+      source_snapshot_blockers: snapshotReasons, nexum_matching_blockers: uniqueNexumEvidenceBlockers,
+      full_matching_blockers: [...new Set(fullMatchingBlockers)], eligible_for_matching: fullMatchingEligible,
+      eligible_for_topology_write: topologyEligible,
       eligible_for_alliance_note_writes: allianceNotesEligible, eligible_for_writes: writesEnabled,
       preview: { local_only: true, upstream_calls: 0, source_revision: row.revision_or_digest,
-       matching_performed: true, snapshot_eligible_for_matching: snapshotReasons.length === 0,
-       stored_snapshot_eligible_for_matching: !!row.eligible_for_matching, snapshot_blockers: snapshotReasons, nexum_cache: resourceFreshness,
+       matching_performed: true, stored_snapshot_eligible_for_matching: !!row.eligible_for_matching,
+        source_snapshot_eligible_for_matching: sourceSnapshotEligible, snapshot_eligible_for_matching: sourceSnapshotEligible,
+        full_matching_eligible: fullMatchingEligible, full_matching_blockers: [...new Set(fullMatchingBlockers)],
+        snapshot_blockers: snapshotReasons, nexum_cache: resourceFreshness,
         matched, unmatched, conflicts, counts: { matched: matched.length, identity_matches_without_conflict: matched.filter(item => item.identity_match_complete).length,
           unmatched: unmatched.length, conflicts: conflicts.length },
          alliance_notes: allianceNotes,

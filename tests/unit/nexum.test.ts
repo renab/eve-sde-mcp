@@ -52,7 +52,7 @@ beforeEach(()=>{
 afterEach(async()=>{await service.stop();store.db.close();fs.rmSync(tmp,{recursive:true,force:true});vi.restoreAllMocks();delete process.env.NEXUM_BASE_URL;});
 async function enroll(label="McGreggor",api_key=key){const c=await service.addCredential({api_key,label});await until(()=>store.map(mapId).health==="live");return c;}
 const noteIdentity=(signatureCode="ABC-123")=>({connectionId:"note-edge",fromSystemId:"s1",toSystemId:"s2",
-  fromEveSystemId:31000001,toEveSystemId:31000002,signatureCode,maxStalenessMs:30_000});
+  fromEveSystemId:31000001,toEveSystemId:31000002,signatureCode,maxStalenessMs:30_000,stalenessPolicyRevision:"test-policy-revision"});
 function prepareNoteRow(signatureId:string,notes=""){
   store.saveState(mapId,{systems:[{id:"s1",eveSystemId:31000001},{id:"s2",eveSystemId:31000002}],
     connections:[{id:"note-edge",sourceId:"s1",targetId:"s2",sourceSignatureId:signatureId,targetSignatureId:"partner-row",broken:false,timeStatus:"stable"}],routes:[]});

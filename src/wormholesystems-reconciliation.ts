@@ -15,7 +15,7 @@ const safeId = (value: unknown): value is string => typeof value === "string" &&
 const validTime = (value: unknown): value is string => typeof value === "string" &&
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/.test(value) && Number.isFinite(Date.parse(value));
 const coordinate = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= 1_000_000;
-const maxSnapshotAgeMs = 10 * 60 * 1000;
+const approvedMaxSnapshotAgeMs = 60_000;
 
 function validSourceIdentity(value: unknown): value is string {
   if (!safeId(value) || !value.startsWith("wormholesystems:")) return false;
@@ -29,10 +29,12 @@ function validSourceIdentity(value: unknown): value is string {
 }
 
 /** Validate the exact Nexum topology request contract without interpreting raw source fields. */
-export function validateWormholesystemsTopologyRequest(input: unknown, now = Date.now()): {
+export function validateWormholesystemsTopologyRequest(input: unknown, now = Date.now(), maxSnapshotAgeMs = approvedMaxSnapshotAgeMs): {
   request?: WormholesystemsTopologyRequest; blockers: string[];
 } {
   const blockers: string[] = [];
+  if (!Number.isSafeInteger(maxSnapshotAgeMs) || maxSnapshotAgeMs <= 0)
+    blockers.push("snapshot.fetchedAt: valid runtime staleness policy is unavailable");
   if (!record(input)) return { blockers: ["request: expected an object"] };
   if (Object.keys(input).some(key => !["sourceIdentity", "snapshot", "systems", "connections"].includes(key)))
     blockers.push("request: contains an unsupported field");
