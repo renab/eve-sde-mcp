@@ -2,7 +2,7 @@
 
 ## Objective
 
-Make WormholeSystems-derived chain/bookmark authority available to Galaxy for **one explicitly enabled Nexum map**, then reconcile that map's topology and alliance-formatted signature notes in Nexum without assuming an undocumented upstream deployment contract. This is the prerequisite for [02-wormholesystems-nexum-reconciliation.md](02-wormholesystems-nexum-reconciliation.md).
+Make WormholeSystems-derived chain/bookmark authority available to Galaxy for **one explicitly enabled Nexum map**, then reconcile that map's topology and alliance-formatted signature notes in Nexum without assuming an undocumented upstream deployment contract. This is the prerequisite for [02-wormholesystems-nexum-reconciliation.md](02-wormholesystems-nexum-reconciliation.md) and [04-wormholesystems-standalone-signature-sync.md](04-wormholesystems-standalone-signature-sync.md); standalone source signatures do not require source connections, but their Nexum writes have separate ownership/idempotency gates.
 
 ## Authority
 
@@ -59,7 +59,7 @@ Fixture-first tests use the exact cited source resource names: scoped `{data:[..
 
 ## Out of scope
 
-Live rollout, source writes, schedule/webhook invention, Nexum signature matching/writes (unit 02), topology mutation, user-facing bookmark-spec invention.
+Live rollout, source writes, schedule/webhook invention, Nexum linked-signature note matching/writes (unit 02), standalone signature creation/update (unit 04), topology mutation, user-facing bookmark-spec invention.
 
 ## Open issue — upstream adapter and deployment
 
