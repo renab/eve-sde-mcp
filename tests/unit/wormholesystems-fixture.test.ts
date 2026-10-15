@@ -105,6 +105,54 @@ describe("offline WormholeSystems canonical fixture boundary", () => {
     expect(validateWormholeSystemsFixture(contradiction)).toMatchObject({ ok: false });
   });
 
+  it("validates version-2 allowlisted classification identities and preserves absent versus null", () => {
+    const version2 = () => {
+      const fixture = structuredClone(sourceFixture()) as any;
+      fixture.sourceKind = "wormholesystems";
+      fixture.sourceIdentity = "wormholesystems:synthetic-source";
+      fixture.schemaVersion = 2;
+      fixture.sourceSignatureEvidence = fixture.signatures.map((signature: any, index: number) => ({
+        sourceSignatureId: signature.sourceSignatureId, scannerEveSystemId: signature.scannerEveSystemId,
+        signatureCode: signature.signatureCode,
+        ...(index === 0 ? { signatureTypeId: "synthetic-type-id", signatureCategoryId: null,
+          wormholeId: "synthetic-wormhole-id", nestedWormholeId: "synthetic-wormhole-id", wormholeName: "synthetic-label-not-a-wh-code" } : {}),
+      }));
+      return fixture;
+    };
+    const valid = normalizeWormholeSystemsFixture(version2());
+    expect(valid.ok).toBe(true);
+    if (valid.ok) {
+      expect(valid.value.sourceSignatureEvidence?.[0]).toMatchObject({ signatureTypeId: "synthetic-type-id", signatureCategoryId: null,
+        wormholeId: "synthetic-wormhole-id", nestedWormholeId: "synthetic-wormhole-id", wormholeName: "synthetic-label-not-a-wh-code" });
+      expect(valid.value.sourceSignatureEvidence?.[1]).not.toHaveProperty("signatureTypeId");
+      expect(valid.value.sourceSignatureEvidence?.[1]).not.toHaveProperty("signatureCategoryId");
+    }
+
+    const legacy = sourceFixture() as any;
+    legacy.sourceKind = "wormholesystems";
+    legacy.sourceIdentity = "wormholesystems:legacy-source";
+    legacy.sourceMetadata = { solarSystemDetails: [{ signatures: [{ signature_type_id: "untrusted-legacy-field" }] }] };
+    expect(validateWormholeSystemsFixture(legacy).ok).toBe(true);
+    legacy.sourceSignatureEvidence = version2().sourceSignatureEvidence;
+    expect(validateWormholeSystemsFixture(legacy)).toMatchObject({ ok: false });
+
+    const contradictory = version2();
+    contradictory.sourceSignatureEvidence[0].nestedWormholeId = "different-synthetic-wormhole-id";
+    expect(validateWormholeSystemsFixture(contradictory)).toMatchObject({ ok: false });
+    const wrongScanner = version2();
+    wrongScanner.sourceSignatureEvidence[0].scannerEveSystemId = 31_000_002;
+    expect(validateWormholeSystemsFixture(wrongScanner)).toMatchObject({ ok: false });
+    const malformed = version2();
+    malformed.sourceSignatureEvidence[0].signatureTypeId = { invalid: true };
+    expect(validateWormholeSystemsFixture(malformed)).toMatchObject({ ok: false });
+    const oversized = version2();
+    oversized.sourceSignatureEvidence[0].wormholeName = "x".repeat(129);
+    expect(validateWormholeSystemsFixture(oversized)).toMatchObject({ ok: false });
+    const contradictedCode = version2();
+    contradictedCode.sourceSignatureEvidence[0].signatureCode = "OTHER-999";
+    expect(validateWormholeSystemsFixture(contradictedCode)).toMatchObject({ ok: false });
+  });
+
   it("matches both directions by EVE IDs, connection references and full signature codes", () => {
     const result = preview();
     expect(result).toMatchObject({ fixtureOnly: true, writeEligible: false, canonicalMapId: mapId, sourceRevision: "synthetic-revision-1", skipped: [] });

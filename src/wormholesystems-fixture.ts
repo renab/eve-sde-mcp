@@ -17,11 +17,23 @@ export type ValidatedAllianceNoteEvidence = {
   connections: Array<{ sourceConnectionId: string; size: string | null }>;
   signatures: Array<{ sourceSignatureId: string; statusAnnotation: string | null }>;
 };
+export type SourceClassificationScalar = string | number | null;
+export type ValidatedSourceSignatureEvidence = {
+  sourceSignatureId: string;
+  scannerEveSystemId: number;
+  /** Omitted/null source scan codes are represented without inventing a code. */
+  signatureCode?: string | null;
+  signatureTypeId?: SourceClassificationScalar;
+  signatureCategoryId?: SourceClassificationScalar;
+  wormholeId?: SourceClassificationScalar;
+  nestedWormholeId?: SourceClassificationScalar;
+  wormholeName?: SourceClassificationScalar;
+};
 
 export type WormholeSystemsFixture = {
   fixtureOnly: true;
   sourceKind?: "synthetic" | "wormholesystems";
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   sourceIdentity: string;
   revisionOrDigest: string;
   fetchedAt: string;
@@ -36,7 +48,7 @@ export type WormholeSystemsFixture = {
   signatures: Array<{
     signatureKey: string;
     scannerEveSystemId: number;
-    signatureCode: string;
+    signatureCode: string | null;
     sourceSignatureId: string | null;
     sourceConnectionId: string | null;
     connectedEveSystemId: number | null;
@@ -59,6 +71,8 @@ export type WormholeSystemsFixture = {
   topologyEvidence?: ValidatedTopologyEvidence;
   /** Present only after aliases and explicit alliance annotations have validated source semantics. */
   allianceNoteEvidence?: ValidatedAllianceNoteEvidence;
+  /** Version-2 source snapshot's allowlisted full-detail classification evidence. */
+  sourceSignatureEvidence?: ValidatedSourceSignatureEvidence[];
   authorityMetadata: { confirmed: false; fields: null };
   /** Raw validated source fields are retained as opaque JSON, never interpreted as authority. */
   sourceMetadata?: unknown;
@@ -154,7 +168,7 @@ const identity = (scanner: number, code: string, sourceId: string | null) => `${
 export function validateWormholeSystemsFixture(input: unknown): FixtureValidationResult {
   const issues: FixtureValidationIssue[] = [];
   if (!isRecord(input)) return { ok: false, issues: [{ path: "$", reason: "expected an object" }] };
-  const fixtureKeys = ["fixtureOnly", "sourceKind", "schemaVersion", "sourceIdentity", "revisionOrDigest", "fetchedAt", "observedAt", "scope", "systems", "signatures", "connections", "topologyEvidence", "allianceNoteEvidence", "authorityMetadata", "sourceMetadata"];
+  const fixtureKeys = ["fixtureOnly", "sourceKind", "schemaVersion", "sourceIdentity", "revisionOrDigest", "fetchedAt", "observedAt", "scope", "systems", "signatures", "connections", "topologyEvidence", "allianceNoteEvidence", "sourceSignatureEvidence", "authorityMetadata", "sourceMetadata"];
   for (const key of ["fixtureOnly", "schemaVersion", "sourceIdentity", "revisionOrDigest", "fetchedAt", "observedAt", "scope", "systems", "signatures", "connections", "authorityMetadata"])
     if (!(key in input)) issues.push({ path: `$.${key}`, reason: "required field is missing" });
   for (const key of Object.keys(input)) if (!fixtureKeys.includes(key)) issues.push({ path: `$.${key}`, reason: "unrecognized field" });
@@ -163,7 +177,11 @@ export function validateWormholeSystemsFixture(input: unknown): FixtureValidatio
     issues.push({ path: "$.sourceKind", reason: "unsupported source kind" });
   if (input.sourceKind === "wormholesystems" && nonempty(input.sourceIdentity, "$.sourceIdentity", issues) && !input.sourceIdentity.startsWith("wormholesystems:"))
     issues.push({ path: "$.sourceIdentity", reason: "source snapshot identity must be labeled wormholesystems:" });
-  if (input.schemaVersion !== 1) issues.push({ path: "$.schemaVersion", reason: "unsupported fixture schema version" });
+  if (input.schemaVersion !== 1 && input.schemaVersion !== 2) issues.push({ path: "$.schemaVersion", reason: "unsupported fixture schema version" });
+  if (input.schemaVersion === 2 && input.sourceKind !== "wormholesystems")
+    issues.push({ path: "$.schemaVersion", reason: "version 2 is reserved for validated WormholeSystems source snapshots" });
+  if (input.schemaVersion === 1 && input.sourceSignatureEvidence !== undefined)
+    issues.push({ path: "$.sourceSignatureEvidence", reason: "classification evidence requires a version-2 source snapshot" });
   if (input.sourceKind !== "wormholesystems" && nonempty(input.sourceIdentity, "$.sourceIdentity", issues) && !input.sourceIdentity.startsWith("synthetic:"))
     issues.push({ path: "$.sourceIdentity", reason: "offline fixture identity must be labeled synthetic:" });
   nonempty(input.revisionOrDigest, "$.revisionOrDigest", issues);
@@ -196,7 +214,7 @@ export function validateWormholeSystemsFixture(input: unknown): FixtureValidatio
     strictKeys(row, ["signatureKey", "scannerEveSystemId", "signatureCode", "sourceSignatureId", "sourceConnectionId", "connectedEveSystemId", "status", "size", "observedAt", "freshUntil"], p, issues);
     nonempty(row.signatureKey, `${p}.signatureKey`, issues);
     eveId(row.scannerEveSystemId, `${p}.scannerEveSystemId`, issues);
-    nonempty(row.signatureCode, `${p}.signatureCode`, issues, 64);
+    if (row.signatureCode !== null) nonempty(row.signatureCode, `${p}.signatureCode`, issues, 64);
     nullableString(row.sourceSignatureId, `${p}.sourceSignatureId`, issues);
     nullableString(row.sourceConnectionId, `${p}.sourceConnectionId`, issues);
     if (row.connectedEveSystemId !== null) eveId(row.connectedEveSystemId, `${p}.connectedEveSystemId`, issues);
@@ -205,6 +223,56 @@ export function validateWormholeSystemsFixture(input: unknown): FixtureValidatio
     timestamp(row.observedAt, `${p}.observedAt`, issues, true);
     timestamp(row.freshUntil, `${p}.freshUntil`, issues, true);
   });
+
+  if (input.sourceSignatureEvidence !== undefined || input.schemaVersion === 2) {
+    if (!Array.isArray(input.sourceSignatureEvidence)) issues.push({ path: "$.sourceSignatureEvidence", reason: "expected versioned source signature evidence" });
+    else {
+      if (input.sourceSignatureEvidence.length > 200_000) issues.push({ path: "$.sourceSignatureEvidence", reason: "source signature evidence exceeds its bound" });
+      input.sourceSignatureEvidence.forEach((row, index) => {
+        const p = `$.sourceSignatureEvidence[${index}]`;
+        if (!isRecord(row)) { issues.push({ path: p, reason: "expected a source signature evidence record" }); return; }
+        const allowed = ["sourceSignatureId", "scannerEveSystemId", "signatureCode", "signatureTypeId", "signatureCategoryId", "wormholeId", "nestedWormholeId", "wormholeName"];
+        for (const key of ["sourceSignatureId", "scannerEveSystemId"]) if (!(key in row)) issues.push({ path: `${p}.${key}`, reason: "required field is missing" });
+        for (const key of Object.keys(row)) if (!allowed.includes(key)) issues.push({ path: `${p}.${key}`, reason: "unrecognized field" });
+        nonempty(row.sourceSignatureId, `${p}.sourceSignatureId`, issues);
+        eveId(row.scannerEveSystemId, `${p}.scannerEveSystemId`, issues);
+        if ("signatureCode" in row && row.signatureCode !== null) nonempty(row.signatureCode, `${p}.signatureCode`, issues, 64);
+        for (const key of ["signatureTypeId", "signatureCategoryId", "wormholeId", "nestedWormholeId", "wormholeName"] as const) {
+          if (!(key in row) || row[key] === null) continue;
+          const value = row[key];
+          const valid = key === "wormholeName"
+            ? typeof value === "string" && value.length <= 128 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value)
+            : (typeof value === "string" && !!value.trim() && value.length <= 128 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value)) ||
+              (typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
+          if (!valid) issues.push({ path: `${p}.${key}`, reason: "expected a bounded exact source scalar or null" });
+        }
+        if (row.wormholeId !== undefined && row.nestedWormholeId !== undefined && row.wormholeId !== null && row.nestedWormholeId !== null &&
+            String(row.wormholeId) !== String(row.nestedWormholeId))
+          issues.push({ path: p, reason: "direct and nested wormhole IDs disagree" });
+        if (row.wormholeId === null && row.nestedWormholeId !== undefined && row.nestedWormholeId !== null)
+          issues.push({ path: p, reason: "direct null wormhole ID contradicts the nested wormhole ID" });
+      });
+      if (input.schemaVersion === 2 && input.sourceKind === "wormholesystems" && Array.isArray(input.signatures)) {
+        const evidenceRows = input.sourceSignatureEvidence as Array<Record<string, unknown>>;
+        if (evidenceRows.length !== input.signatures.length)
+          issues.push({ path: "$.sourceSignatureEvidence", reason: "classification evidence must cover every full-detail source signature" });
+        const evidenceById = new Map<string, Record<string, unknown>>();
+        evidenceRows.forEach((row, index) => {
+          if (!isRecord(row) || typeof row.sourceSignatureId !== "string") return;
+          if (evidenceById.has(row.sourceSignatureId)) issues.push({ path: `$.sourceSignatureEvidence[${index}].sourceSignatureId`, reason: "duplicate source signature evidence identity" });
+          evidenceById.set(row.sourceSignatureId, row);
+        });
+        for (const [index, row] of (input.signatures as Array<Record<string, unknown>>).entries()) {
+          const sourceId = row.sourceSignatureId;
+          const evidence = typeof sourceId === "string" ? evidenceById.get(sourceId) : undefined;
+          const hasEvidenceCode = !!evidence && Object.prototype.hasOwnProperty.call(evidence, "signatureCode");
+          if (!evidence || evidence.scannerEveSystemId !== row.scannerEveSystemId ||
+              (hasEvidenceCode ? evidence.signatureCode !== row.signatureCode : row.signatureCode !== null))
+            issues.push({ path: `$.sourceSignatureEvidence[${index}]`, reason: "classification evidence contradicts normalized source signature identity" });
+        }
+      }
+    }
+  }
 
   if (!Array.isArray(input.connections)) issues.push({ path: "$.connections", reason: "expected an array" });
   else input.connections.forEach((row, i) => {
@@ -331,7 +399,7 @@ export function validateWormholeSystemsFixture(input: unknown): FixtureValidatio
   for (const [i, signature] of value.signatures.entries()) {
     if (signatureByKey.has(signature.signatureKey)) issues.push({ path: `$.signatures[${i}].signatureKey`, reason: "duplicate signature key" });
     signatureByKey.set(signature.signatureKey, signature);
-    const key = identity(signature.scannerEveSystemId, signature.signatureCode, signature.sourceSignatureId);
+    const key = identity(signature.scannerEveSystemId, signature.signatureCode ?? "", signature.sourceSignatureId);
     if (identitySet.has(key)) issues.push({ path: `$.signatures[${i}]`, reason: "duplicate directional signature identity" });
     identitySet.add(key);
     if (!systemSet.has(signature.scannerEveSystemId)) issues.push({ path: `$.signatures[${i}].scannerEveSystemId`, reason: "scanner system is outside map scope" });
@@ -423,7 +491,7 @@ export function normalizeWormholeSystemsFixture(input: unknown): FixtureValidati
   value.scope.eveSolarSystemIds.sort((a, b) => a - b);
   value.systems.sort((a, b) => a.eveSolarSystemId - b.eveSolarSystemId);
   for (const system of value.systems) system.observedAt = canonicalTime(system.observedAt);
-  value.signatures.sort((a, b) => a.scannerEveSystemId - b.scannerEveSystemId || a.signatureCode.localeCompare(b.signatureCode) || String(a.sourceSignatureId).localeCompare(String(b.sourceSignatureId)) || a.signatureKey.localeCompare(b.signatureKey));
+  value.signatures.sort((a, b) => a.scannerEveSystemId - b.scannerEveSystemId || String(a.signatureCode ?? "").localeCompare(String(b.signatureCode ?? "")) || String(a.sourceSignatureId).localeCompare(String(b.sourceSignatureId)) || a.signatureKey.localeCompare(b.signatureKey));
   for (const signature of value.signatures) {
     signature.observedAt = canonicalTime(signature.observedAt);
     signature.freshUntil = canonicalTime(signature.freshUntil);
@@ -443,6 +511,7 @@ export function normalizeWormholeSystemsFixture(input: unknown): FixtureValidati
     value.allianceNoteEvidence.connections.sort((a, b) => a.sourceConnectionId.localeCompare(b.sourceConnectionId));
     value.allianceNoteEvidence.signatures.sort((a, b) => a.sourceSignatureId.localeCompare(b.sourceSignatureId));
   }
+  value.sourceSignatureEvidence?.sort((a, b) => a.sourceSignatureId.localeCompare(b.sourceSignatureId));
   return { ok: true, value };
 }
 

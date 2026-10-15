@@ -16,7 +16,7 @@ import {
 } from "./wormholesystems-client.js";
 import { allianceNoteWriteEligibility, renderAllianceNote, summarizeTopologyWriteResponse, topologyCandidateFromFixture,
   validateWormholesystemsTopologyRequest } from "./wormholesystems-reconciliation.js";
-import type { WormholeSystemsFixture } from "./wormholesystems-fixture.js";
+import { validateWormholeSystemsFixture, type ValidatedSourceSignatureEvidence, type WormholeSystemsFixture } from "./wormholesystems-fixture.js";
 import type { WormholesystemsSignatureNoteIdentity } from "./nexum.js";
 
 const MAX_SYSTEM_DETAIL_REQUESTS = 100;
@@ -525,8 +525,12 @@ export class WormholeSystemsService {
     try {
       const payload = JSON.parse(row.payload_json);
       const fixture = payload?.fixture;
-      if (payload?.schema !== "wormholesystems-source-v1" || payload?.adapterVersion !== 1 || fixture?.sourceKind !== "wormholesystems")
+      const supportedSnapshotVersion = (payload?.schema === "wormholesystems-source-v1" && payload?.adapterVersion === 1 && fixture?.schemaVersion === 1) ||
+        (payload?.schema === "wormholesystems-source-v2" && payload?.adapterVersion === 2 && fixture?.schemaVersion === 2);
+      if (!supportedSnapshotVersion || fixture?.sourceKind !== "wormholesystems")
         blockers.push("stored snapshot does not match the validated adapter version");
+      if (payload?.schema === "wormholesystems-source-v1" && payload?.adapterVersion === 1)
+        blockers.push("source signature classification was not captured in this legacy v1 snapshot");
       if (fixture?.revisionOrDigest !== row.revision_or_digest || fixture?.sourceIdentity !== row.source_identity || fixture?.fetchedAt !== row.fetched_at)
         blockers.push("stored source snapshot fields do not match the validated fixture");
     } catch {
@@ -567,11 +571,16 @@ export class WormholeSystemsService {
   }
 
   private allianceNoteSourceBlockers(mapId: string, expected: { revision: string; sourceIdentity: string; configurationRevision: string;
-    policyRevision: string }): string[] {
+    policyRevision: string; nexumMapId: string }): string[] {
     const config = this.config();
     const snapshot = this.store.db.prepare("SELECT * FROM wormholesystems_source_snapshots WHERE map_id=?").get(mapId) as any;
     const blockers = snapshot ? this.snapshotBlockers(mapId, snapshot) : ["no current source snapshot is stored"];
     const policy = this.policyState(config).policy;
+    try {
+      const currentMap = this.store.map(mapId);
+      if (currentMap.id !== mapId || currentMap.nexum_map_id !== expected.nexumMapId)
+        blockers.push("Nexum target map identity changed after alliance-note preview");
+    } catch { blockers.push("Nexum target map identity is unavailable"); }
     if (!config || config.canonicalMapId !== mapId || config.configurationRevision !== expected.configurationRevision)
       blockers.push("source configuration changed after alliance-note preview");
     if (!policy || policy.revision !== expected.policyRevision) blockers.push("staleness policy changed after alliance-note preview");
@@ -713,7 +722,7 @@ export class WormholeSystemsService {
         last_good_snapshot_retained: !!snapshot, revision_or_digest: snapshot?.revision_or_digest ?? null,
         error: "Source sync is disabled; complete a successful connection test and explicit operator enable action." };
     }
-    let sourceCalls = 0, sourceRunId: number | null = null;
+    let sourceCalls = 0;
     try {
       const client = this.client(config);
       const token = this.token(config);
@@ -769,7 +778,7 @@ export class WormholeSystemsService {
           throw new WormholeSystemsError(0, 0, "WormholeSystems returned an older observed snapshot");
       }
       if (containsSecretValue(normalized.fixture.sourceMetadata, token)) throw new WormholeSystemsError(0, 0, "Malformed WormholeSystems source response");
-      const payload = { schema: "wormholesystems-source-v1", adapterVersion: 1, revisionOrdering,
+      const payload = { schema: "wormholesystems-source-v2", adapterVersion: 2, revisionOrdering,
         adapterDiagnostics: normalized.diagnostics, fixture: normalized.fixture };
       const payloadJson = JSON.stringify(payload);
       if (Buffer.byteLength(payloadJson, "utf8") > MAX_SOURCE_SNAPSHOT_BYTES)
@@ -793,156 +802,18 @@ export class WormholeSystemsService {
           .run(mapId, sourceIdentity, config.origin, selected.id, revision, fetchedAt,
              normalized.fixture.observedAt, payloadJson, 1, config.credentialId, credentialVersion, config.configuredAt,
             config.configurationRevision);
-         const insertedRun = this.store.db.prepare("INSERT INTO wormholesystems_source_runs(map_id,status,attempted_at,succeeded_at,revision_or_digest,error_status,error_message,source_calls,revision_ordering) VALUES (?,'snapshot_validated',?,?,?,0,NULL,?,?)")
-           .run(mapId, attemptedAt, fetchedAtMs, revision, sourceCalls, revisionOrdering);
-         sourceRunId = Number(insertedRun.lastInsertRowid);
-        })();
+          this.store.db.prepare("INSERT INTO wormholesystems_source_runs(map_id,status,attempted_at,succeeded_at,revision_or_digest,error_status,error_message,source_calls,revision_ordering) VALUES (?,'snapshot_validated',?,?,?,0,NULL,?,?)")
+            .run(mapId, attemptedAt, fetchedAtMs, revision, sourceCalls, revisionOrdering);
+         })();
       });
-      const topologyCandidate = topologyCandidateFromFixture(normalized.fixture);
-      const topologyPolicy = this.policyState().policy;
-      const topologyValidation = validateWormholesystemsTopologyRequest(topologyCandidate, this.now(), topologyPolicy?.max_age_ms ?? 0);
-      const topologyBlockers = [...topologyValidation.blockers];
-      let topologyEligible = false, topologyAttempted = false, notesAttempted = false;
-      let topologyWriteStatus: "blocked" | "completed" | "failed" = "blocked";
-      let topologyWriteError: string | null = null;
-      let topologyWriteDiagnostics: Record<string, unknown> = { request_status: "not_attempted", reconciliation_status: "unknown",
-        created_systems: null, updated_systems: null, deleted_systems: null, preserved_systems: null,
-        created_connections: null, updated_connections: null, deleted_connections: null, preserved_connections: null, conflict_count: null };
-      let allianceNoteWriteError: string | null = null;
-      if (topologyValidation.request) {
-        await mapDecisionBoundary.run(mapId, async () => {
-          const latestConfig = this.config();
-          const latestSnapshot = this.store.db.prepare("SELECT * FROM wormholesystems_source_snapshots WHERE map_id=?").get(mapId) as any;
-          const blockers = this.snapshotBlockers(mapId, latestSnapshot);
-          const latestPolicy = this.policyState(latestConfig).policy;
-          if (!topologyPolicy || !latestPolicy || latestPolicy.revision !== topologyPolicy.revision)
-            blockers.push("staleness policy changed before topology apply");
-          if (!latestConfig || latestConfig.canonicalMapId !== mapId || latestConfig.configurationRevision !== config.configurationRevision ||
-              latestSnapshot?.revision_or_digest !== revision || latestSnapshot?.source_identity !== sourceIdentity)
-            blockers.push("current source identity, configuration, or snapshot revision changed before topology apply");
-          blockers.push(...this.targetCacheBlockers(mapId, normalized.fixture.systems as unknown as Json[], latestPolicy?.max_age_ms));
-          if (blockers.length) { topologyBlockers.push(...blockers); return; }
-          topologyEligible = true;
-          topologyAttempted = true;
-          const nexumWrites = this.nexumWrites ?? getNexum();
-          try {
-            const topologyResponse = await nexumWrites.writeWormholesystemsTopology(mapId, topologyValidation.request as unknown as Record<string, unknown>);
-            topologyWriteDiagnostics = summarizeTopologyWriteResponse(topologyResponse);
-            topologyWriteStatus = "completed";
-          } catch {
-            topologyWriteStatus = "failed";
-            topologyWriteDiagnostics = { ...topologyWriteDiagnostics, request_status: "failed" };
-            topologyWriteError = "Nexum source-owned topology write failed; details omitted";
-          }
-        });
-      }
-      // Alliance-note reconciliation has its own Nexum per-map serialization and
-      // cache path; it does not depend on topology PUT eligibility or success.
-      const nexumWrites = this.nexumWrites ?? getNexum();
-      const notePreview = await mapDecisionBoundary.run(mapId, () => this.previewLocked(mapId) as any);
-      const notePolicyRevision = notePreview.staleness_policy?.revision;
-      const noteRows: any[] = notePreview.preview?.alliance_notes ?? [];
-      const eligibleNoteCount = noteRows.filter((note: any) => note.eligible_for_write).length;
-      const noteChangeEntries = noteRows.flatMap((note: any, index: number) => note.eligible_for_write &&
-        typeof note.system_id === "string" && typeof note.signature_id === "string" && typeof note.desired_note === "string" &&
-        note.expected_identity && note.actual_note !== note.desired_note
-        ? [{ index, change: { systemId: note.system_id, signatureId: note.signature_id, notes: note.desired_note,
-          expectedIdentity: note.expected_identity as WormholesystemsSignatureNoteIdentity } }]
-        : []);
-      const noteChanges = noteChangeEntries.map(entry => entry.change);
-      const noteItemStatuses: Array<"blocked" | "skipped" | "pending" | "written" | "failed" | "not_attempted"> = noteRows.map((note: any) =>
-        !note.eligible_for_write ? "blocked" : note.actual_note === note.desired_note ? "skipped" : "blocked");
-      for (const entry of noteChangeEntries) noteItemStatuses[entry.index] = "pending";
-      let allianceNoteWriteStatus: "blocked" | "unchanged" | "completed" | "failed" = eligibleNoteCount ? "unchanged" : "blocked";
-      let allianceNoteWritten = 0;
-      let allianceNoteWriteBlockers: string[] = eligibleNoteCount ? [] : ["no alliance-note direction has all required validated source and Nexum fields"];
-      let allianceNoteLocalCacheStatus: string | undefined;
-      let allianceNoteWarnings: string[] = [];
-      let stoppedAt: "blocked" | "failed" | null = null;
-      const finalizeNoteOutcomes = (reportedItems?: unknown) => {
-        if (Array.isArray(reportedItems)) for (const outcome of reportedItems) {
-          const changeIndex = Number((outcome as any)?.item_index);
-          const entry = Number.isSafeInteger(changeIndex) ? noteChangeEntries[changeIndex] : undefined;
-          if (!entry || noteItemStatuses[entry.index] !== "pending") continue;
-          const status = (outcome as any)?.status;
-          if (status === "written") noteItemStatuses[entry.index] = "written";
-          else if (status === "unchanged") noteItemStatuses[entry.index] = "skipped";
-          else if (status === "blocked" || status === "failed" || status === "not_attempted") noteItemStatuses[entry.index] = status;
-        }
-        const pending = noteChangeEntries.filter(entry => noteItemStatuses[entry.index] === "pending");
-        if (stoppedAt && pending.length) {
-          noteItemStatuses[pending[0].index] = stoppedAt;
-          for (const entry of pending.slice(1)) noteItemStatuses[entry.index] = "not_attempted";
-        } else for (const entry of pending) noteItemStatuses[entry.index] = "skipped";
-        allianceNoteWritten = noteItemStatuses.filter(status => status === "written").length;
-      };
-      if (noteChanges.length) {
-        allianceNoteWriteStatus = "failed";
-        notesAttempted = true;
-        try {
-          const writeResult = await nexumWrites.writeWormholesystemsSignatureNotes(mapId, noteChanges, () =>
-            this.allianceNoteSourceBlockers(mapId, { revision, sourceIdentity, configurationRevision: config.configurationRevision,
-              policyRevision: notePolicyRevision }));
-          finalizeNoteOutcomes((writeResult as any)?.items);
-          if (typeof (writeResult as any)?.local_cache_status === "string") allianceNoteLocalCacheStatus = (writeResult as any).local_cache_status;
-          if (Array.isArray((writeResult as any)?.warnings)) allianceNoteWarnings = (writeResult as any).warnings.filter((warning: unknown) => typeof warning === "string");
-          if ((writeResult as any)?.status === "blocked") {
-            allianceNoteWriteStatus = "blocked";
-            allianceNoteWriteBlockers = Array.isArray((writeResult as any)?.blockers) ? (writeResult as any).blockers : ["final source or Nexum identity validation failed"];
-            notesAttempted = allianceNoteWritten > 0;
-          } else if ((writeResult as any)?.status === "unchanged") {
-            allianceNoteWriteStatus = "unchanged";
-            notesAttempted = false;
-          } else if ((writeResult as any)?.status === "failed") {
-            allianceNoteWriteStatus = "failed";
-            notesAttempted = true;
-            allianceNoteWriteError = "Nexum alliance-note PATCH failed; details omitted";
-          } else allianceNoteWriteStatus = "completed";
-        }
-        catch {
-          stoppedAt = "failed";
-          finalizeNoteOutcomes();
-          allianceNoteWriteError = "Nexum alliance-note PATCH failed; details omitted";
-        }
-      }
-      if (!noteChanges.length) finalizeNoteOutcomes();
-      const allianceNoteItems = noteItemStatuses.map((status, index) => ({ item_index: index, status }));
-      const allianceNoteCounts = { written: allianceNoteWritten,
-        skipped: noteItemStatuses.filter(status => status === "skipped").length,
-        failed: noteItemStatuses.filter(status => status === "failed").length,
-        blocked: noteItemStatuses.filter(status => status === "blocked").length,
-        not_attempted: noteItemStatuses.filter(status => status === "not_attempted").length };
-      const writeOutcomes = { topology: { eligible: topologyEligible, attempted: topologyAttempted,
-          status: topologyWriteStatus, ...topologyWriteDiagnostics, blockers: [...new Set(topologyBlockers)], error: topologyWriteError },
-        alliance_notes: { eligible: eligibleNoteCount > 0, eligible_note_count: eligibleNoteCount,
-          pending_note_count: noteChanges.length, attempted: notesAttempted, ...allianceNoteCounts, items: allianceNoteItems,
-          status: allianceNoteWriteStatus, blockers: allianceNoteWriteBlockers, error: allianceNoteWriteError,
-          ...(allianceNoteLocalCacheStatus ? { local_cache_status: allianceNoteLocalCacheStatus } : {}),
-          ...(allianceNoteWarnings.length ? { warnings: allianceNoteWarnings } : {}) } };
-      if (sourceRunId !== null) await mapDecisionBoundary.run(mapId, () => this.store.db.prepare(
-        "UPDATE wormholesystems_source_runs SET write_outcomes_json=? WHERE id=?").run(JSON.stringify(writeOutcomes), sourceRunId));
-       const finalStatus = await mapDecisionBoundary.run(mapId, () => this.statusLocked(mapId) as Json);
-       return { map_id: mapId, status: "snapshot_validated", fetched: true, source_calls: sourceCalls,
+      const finalStatus = await mapDecisionBoundary.run(mapId, () => this.statusLocked(mapId) as Json);
+      return { map_id: mapId, status: "snapshot_validated", fetched: true, source_calls: sourceCalls,
         source_identity: sourceIdentity, source_api_map_id: selected.id, revision_or_digest: revision, revision_ordering: revisionOrdering,
-        fetched_at: fetchedAt, observed_at: normalized.fixture.observedAt,
-         ...normalized.diagnostics, staleness_policy: finalStatus.staleness_policy,
-         stored_snapshot_eligible_for_matching: finalStatus.stored_snapshot_eligible_for_matching ?? false,
-         source_snapshot_eligible_for_matching: finalStatus.source_snapshot_eligible_for_matching ?? false,
-         eligible_for_matching: finalStatus.eligible_for_matching ?? false,
-         source_snapshot_blockers: finalStatus.source_snapshot_blockers ?? [],
-         nexum_matching_blockers: finalStatus.nexum_matching_blockers ?? [],
-         full_matching_blockers: finalStatus.full_matching_blockers ?? [],
-        eligible_for_topology_write: finalStatus.eligible_for_topology_write ?? false,
-        eligible_for_alliance_note_writes: finalStatus.eligible_for_alliance_note_writes ?? false,
-        eligible_for_writes: finalStatus.eligible_for_writes ?? false, write_eligibility: finalStatus.write_eligibility,
-        nexum_writes_attempted: topologyAttempted || notesAttempted,
-        topology_apply: { endpoint: "PUT /api/v1/maps/:mapId/wormholesystems/topology", status: topologyWriteStatus,
-          ...topologyWriteDiagnostics, blockers: [...new Set(topologyBlockers)], error: topologyWriteError },
-        alliance_note_apply: writeOutcomes.alliance_notes,
-        alliance_note_writes_attempted: notesAttempted, alliance_note_write_error: allianceNoteWriteError,
-        note: topologyEligible ? "Validated source snapshot stored; source topology apply was eligible and submitted to Nexum." :
-          eligibleNoteCount > 0 ? "Validated source snapshot stored; alliance-note writes were independently eligible and evaluated." :
-            "Validated source snapshot stored locally. Nexum writes remain blocked by the concrete source fields listed in the path-specific blockers." };
+        fetched_at: fetchedAt, observed_at: normalized.fixture.observedAt, snapshot_stored: true,
+        ...normalized.diagnostics, staleness_policy: finalStatus.staleness_policy,
+        source_snapshot_blockers: finalStatus.source_snapshot_blockers ?? [],
+        nexum_writes_attempted: false, data_writes_enabled: false, fetch_only: true,
+        note: "Validated source snapshot stored locally. This fetch-only sync performs no Nexum data or note writes; inspect the stored evidence with local preview." };
     } catch (error) {
       const failure = safeError(error);
       const policy = this.policyState().policy ?? { max_age_ms: null, origin: "invalid", revision: null };
@@ -1017,14 +888,14 @@ export class WormholeSystemsService {
     const preview = checked.preview ?? {};
     const topology = preview.topology_apply ?? { eligible: false, blockers: current.matching_blockers ?? ["no source snapshot is stored"] };
     const allianceNotes = (preview.alliance_notes ?? []) as Array<Record<string, any>>;
-    const pendingNotes = allianceNotes.filter(note => note.eligible_for_write && note.actual_note !== note.desired_note);
     const renderedEligibleCount = allianceNotes.filter(note => note.eligible_for_write).length;
+    const pendingNotes = allianceNotes.filter(note => note.eligible_for_write && note.pending);
     const topologyEligible = topology.eligible === true;
     const allianceNotesEligible = pendingNotes.length > 0;
     const eligibleForWrites = topologyEligible || allianceNotesEligible;
     const noteDiagnostics = allianceNotes.map(note => ({ source_connection_id: note.source_connection_id,
       source_signature_key: note.source_signature_key, system_id: note.system_id, signature_id: note.signature_id,
-      eligible: note.eligible_for_write === true, pending: note.eligible_for_write === true && note.actual_note !== note.desired_note,
+      eligible: note.eligible_for_write === true, pending: note.pending === true,
       blocking_fields: note.blocking_fields ?? [] }));
     const previewFullEligible = preview.full_matching_eligible === true;
     const fullBlockers = Array.isArray(preview.full_matching_blockers) ? preview.full_matching_blockers : current.source_snapshot_blockers ?? [];
@@ -1037,11 +908,11 @@ export class WormholeSystemsService {
       eligible_for_alliance_note_writes: allianceNotesEligible, eligible_for_writes: eligibleForWrites,
       write_eligibility: { topology: { eligible: topologyEligible, blockers: topology.blockers ?? [] },
         alliance_notes: { eligible: allianceNotesEligible, rendered_eligible_count: renderedEligibleCount,
-          pending_count: pendingNotes.length, notes: noteDiagnostics,
+         pending_count: pendingNotes.length, notes: noteDiagnostics,
           blockers: allianceNotesEligible ? [] : [...new Set(allianceNotes.flatMap(note => note.blocking_fields ?? []))] } },
-      preview: { ...current.preview, topology_eligible: topologyEligible, alliance_note_eligible: allianceNotesEligible,
-        writes_enabled: eligibleForWrites, authority_dependent_bookmark_notes: allianceNotesEligible ? "eligible_for_selected_directional_notes" :
-          "blocked_or_unchanged_for_current_source_and_nexum_state" } };
+        preview: { ...current.preview, topology_eligible: topologyEligible, alliance_note_eligible: allianceNotesEligible,
+          writes_enabled: false, authority_dependent_bookmark_notes: "explicit linked-note operation required; status and preview do not write notes",
+         data_write_gate: "not_implemented_in_diagnostic_milestone" } };
   }
 
   status(canonicalMapId: string): Json {
@@ -1054,7 +925,69 @@ export class WormholeSystemsService {
       matching_blockers: [reason], full_matching_blockers: [reason], nexum_matching_blockers: [reason],
       source_snapshot_blockers: [reason], status_blockers: [reason], eligible_for_topology_write: false,
       eligible_for_alliance_note_writes: false, eligible_for_writes: false,
-      write_eligibility: { topology: { eligible: false, blockers: [reason] }, alliance_notes: { eligible: false, blockers: [reason], notes: [] } } };
+       write_eligibility: { topology: { eligible: false, blockers: [reason] }, alliance_notes: { eligible: false, blockers: [reason], notes: [] } } };
+  }
+
+  async reconcileLinkedNotes(canonicalMapId: string): Promise<Json> {
+    const mapId = this.canonicalMap(canonicalMapId);
+    return this.track(async () => {
+      const planned = mapDecisionBoundary.runSync(mapId, () => {
+        const config = this.config();
+        const targetMap = this.store.map(mapId);
+        return { config, targetMapId: targetMap.nexum_map_id, preview: this.previewLocked(mapId, undefined, true) as any };
+      });
+      if (!planned.acquired) return { map_id: mapId, status: "blocked", attempted_direction_count: 0,
+        blockers: ["Nexum map decision boundary is busy; linked-note reconciliation was not started"] };
+
+      const { config, targetMapId, preview } = planned.value;
+      const noteRows = (preview.preview?.alliance_notes ?? []) as Array<Record<string, any>>;
+      const eligible = noteRows.filter(note => note.eligible_for_write === true);
+      const changes = eligible.filter(note => note.pending === true && typeof note.system_id === "string" &&
+        typeof note.signature_id === "string" && typeof note.desired_note === "string" && note.expected_identity)
+        .map(note => ({ systemId: note.system_id as string, signatureId: note.signature_id as string,
+          notes: note.desired_note as string, expectedIdentity: note.expected_identity as WormholesystemsSignatureNoteIdentity }));
+      if (!changes.length) {
+        const blockers = [...new Set([
+          ...noteRows.flatMap(note => Array.isArray(note.blocking_fields) ? note.blocking_fields : []),
+          ...(!noteRows.length ? preview.source_snapshot_blockers ?? [] : []),
+        ])].filter((item): item is string => typeof item === "string").slice(0, 20);
+        return { map_id: mapId, status: eligible.length ? "unchanged" : "blocked",
+          eligible_direction_count: eligible.length, attempted_direction_count: 0, written_count: 0,
+          outcomes: [], blockers: eligible.length ? [] : blockers.length ? blockers : ["No linked note direction is currently eligible for PATCH"] };
+      }
+      if (!config || config.canonicalMapId !== mapId || typeof preview.preview?.source_revision !== "string" ||
+          typeof preview.preview?.source_snapshot?.source_identity !== "string" || typeof preview.staleness_policy?.revision !== "string")
+        return { map_id: mapId, status: "blocked", eligible_direction_count: eligible.length,
+          attempted_direction_count: 0, written_count: 0, outcomes: [],
+          blockers: ["Current source identity, configuration or freshness policy is unavailable"] };
+
+      const expected = { revision: preview.preview.source_revision as string,
+        sourceIdentity: preview.preview.source_snapshot.source_identity as string,
+        configurationRevision: config.configurationRevision, policyRevision: preview.staleness_policy.revision as string,
+        nexumMapId: String(targetMapId) };
+      try {
+        const writer = this.nexumWrites ?? getNexum();
+        const writeResult = await writer.writeWormholesystemsSignatureNotes(mapId, changes,
+          () => this.allianceNoteSourceBlockers(mapId, expected)) as any;
+        const items = Array.isArray(writeResult?.items) ? writeResult.items : [];
+        const outcomes = items.slice(0, 500).map((item: any, item_index: number) => ({
+          item_index: Number.isSafeInteger(item?.item_index) ? item.item_index : item_index,
+          status: ["written", "unchanged", "blocked", "failed", "not_attempted"].includes(item?.status) ? item.status : "unknown",
+        }));
+        const blockers = Array.isArray(writeResult?.blockers) ? writeResult.blockers.filter((item: unknown): item is string =>
+          typeof item === "string").slice(0, 20) : [];
+        return { map_id: mapId, status: ["blocked", "unchanged", "completed", "failed"].includes(writeResult?.status)
+            ? writeResult.status : "unknown",
+          eligible_direction_count: eligible.length, attempted_direction_count: changes.length,
+          written_count: Number.isSafeInteger(writeResult?.written) && writeResult.written >= 0 ? writeResult.written : 0,
+          outcomes, outcomes_total: items.length, outcomes_omitted: Math.max(0, items.length - outcomes.length),
+          ...(blockers.length ? { blockers } : {}) };
+      } catch {
+        return { map_id: mapId, status: "failed", eligible_direction_count: eligible.length,
+          attempted_direction_count: changes.length, written_count: 0, outcomes: [],
+          error: "Nexum linked-note reconciliation failed; details omitted" };
+      }
+    });
   }
 
   preview(canonicalMapId: string): Json {
@@ -1075,7 +1008,7 @@ export class WormholeSystemsService {
     return locked.value;
   }
 
-  private previewLocked(mapId: string, status?: Json): Json {
+  private previewLocked(mapId: string, status?: Json, includeNoteWriteDetails = false): Json {
     const current = status ?? this.statusBase(mapId);
     const row = this.store.db.prepare("SELECT * FROM wormholesystems_source_snapshots WHERE map_id=?").get(mapId) as any;
     if (!row) return { ...current, eligible_for_matching: false, source_snapshot_eligible_for_matching: false,
@@ -1084,22 +1017,56 @@ export class WormholeSystemsService {
       nexum_matching_blockers: [], preview: { local_only: true, upstream_calls: 0, matching_performed: false,
        stored_snapshot_eligible_for_matching: false, source_snapshot_eligible_for_matching: false,
        full_matching_eligible: false, full_matching_blockers: current.source_snapshot_blockers ?? ["no source snapshot is stored"],
-       matched: [], unmatched: [], conflicts: [], alliance_notes: [],
-       topology_apply: { endpoint: "PUT /api/v1/maps/:mapId/wormholesystems/topology", eligible: false, blockers: ["no source snapshot is stored"] },
-       final_names: "blocked_unknown_source_aliases_or_status_annotations", writes_enabled: false, nexum_writes_attempted: false } };
-     let payload: Json | undefined;
-     try { payload = JSON.parse(row.payload_json) as Json; } catch { payload = undefined; }
-     if (payload?.schema !== "wormholesystems-source-v1" || payload?.adapterVersion !== 1 || !payload.fixture || payload.fixture.sourceKind !== "wormholesystems") {
-       const reason = "stored snapshot does not match the validated adapter version";
+        matched: [], unmatched: [], conflicts: [], alliance_notes: [],
+        source_signature_classification: { status: "unavailable", total: 0, omitted: 0, signatures: [] },
+        topology_apply: { eligible: false, blockers: ["no source snapshot is stored", "data writes are not implemented in this diagnostic milestone"] },
+        final_names: "blocked_unknown_source_aliases_or_status_annotations", writes_enabled: false, nexum_writes_attempted: false } };
+      let payload: Json | undefined;
+      try { payload = JSON.parse(row.payload_json) as Json; } catch { payload = undefined; }
+      const supportedSnapshotVersion = (payload?.schema === "wormholesystems-source-v1" && payload?.adapterVersion === 1 && payload.fixture?.schemaVersion === 1) ||
+        (payload?.schema === "wormholesystems-source-v2" && payload?.adapterVersion === 2 && payload.fixture?.schemaVersion === 2);
+      if (!payload || !supportedSnapshotVersion || !payload.fixture || payload.fixture.sourceKind !== "wormholesystems") {
+        const reason = "stored snapshot does not match the validated adapter version";
        return { ...current, eligible_for_matching: false, source_snapshot_eligible_for_matching: false,
          source_snapshot_blockers: [reason], matching_blockers: [reason], preview: { local_only: true, upstream_calls: 0,
            matching_performed: false, stored_snapshot_eligible_for_matching: !!row.eligible_for_matching,
            source_snapshot_eligible_for_matching: false, full_matching_eligible: false,
-           full_matching_blockers: [reason], matched: [], unmatched: [], conflicts: [{ reason }],
-           final_names: "blocked_unknown_source_aliases_or_status_annotations", writes_enabled: false } };
-     }
-    const source = payload.fixture as Json;
-    const sourceFixture = payload.fixture as unknown as WormholeSystemsFixture;
+            full_matching_blockers: [reason], matched: [], unmatched: [], conflicts: [{ reason }],
+            source_signature_classification: { status: "unavailable", total: 0, omitted: 0, signatures: [] },
+            final_names: "blocked_unknown_source_aliases_or_status_annotations", writes_enabled: false } };
+      }
+      const validatedFixture = validateWormholeSystemsFixture(payload.fixture);
+      if (!validatedFixture.ok) {
+        const reason = "stored source snapshot failed canonical fixture validation";
+        return { ...current, eligible_for_matching: false, source_snapshot_eligible_for_matching: false,
+          source_snapshot_blockers: [reason], matching_blockers: [reason], preview: { local_only: true, upstream_calls: 0,
+            matching_performed: false, stored_snapshot_eligible_for_matching: !!row.eligible_for_matching,
+            source_snapshot_eligible_for_matching: false, full_matching_eligible: false, full_matching_blockers: [reason],
+            source_signature_classification: { status: "unavailable", total: 0, omitted: 0, signatures: [] },
+            matched: [], unmatched: [], conflicts: [{ reason }], writes_enabled: false, nexum_writes_attempted: false } };
+      }
+      const sourceFixture = validatedFixture.value;
+      const source = sourceFixture as unknown as Json;
+      const classificationCaptured = sourceFixture.schemaVersion === 2 && Array.isArray(sourceFixture.sourceSignatureEvidence);
+      const classificationRows: ValidatedSourceSignatureEvidence[] = classificationCaptured
+        ? sourceFixture.sourceSignatureEvidence!
+        : sourceFixture.signatures.filter(signature => signature.sourceSignatureId !== null).map(signature => ({
+            sourceSignatureId: signature.sourceSignatureId!, scannerEveSystemId: signature.scannerEveSystemId,
+            signatureCode: signature.signatureCode,
+          }));
+      const signatureEvidenceCap = 500;
+      const sourceSignatureEvidence = classificationRows.slice(0, signatureEvidenceCap).map(signature => ({
+        source_signature_id: signature.sourceSignatureId,
+        ...(Object.prototype.hasOwnProperty.call(signature, "signatureCode") ? { signature_code: signature.signatureCode } : {}),
+        scanner_eve_system_id: signature.scannerEveSystemId,
+        classification_status: classificationCaptured ? "captured" : "not_captured_in_snapshot",
+        ...(classificationCaptured && Object.prototype.hasOwnProperty.call(signature, "signatureTypeId") ? { signature_type_id: signature.signatureTypeId } : {}),
+        ...(classificationCaptured && Object.prototype.hasOwnProperty.call(signature, "signatureCategoryId") ? { signature_category_id: signature.signatureCategoryId } : {}),
+        ...(classificationCaptured && Object.prototype.hasOwnProperty.call(signature, "wormholeId") ? { wormhole_id: signature.wormholeId } : {}),
+        ...(classificationCaptured && Object.prototype.hasOwnProperty.call(signature, "nestedWormholeId") ? { nested_wormhole_id: signature.nestedWormholeId } : {}),
+        ...(classificationCaptured && Object.prototype.hasOwnProperty.call(signature, "wormholeName") ? { wormhole_name: signature.wormholeName } : {}),
+      }));
+      const classificationStatus = classificationCaptured ? "captured" : "not_captured_in_snapshot";
     const state = this.store.state(mapId) as Json;
     const nexumMap = this.store.map(mapId);
     const policyState = this.policyState();
@@ -1294,14 +1261,17 @@ export class WormholeSystemsService {
           snapshotFresh: snapshotReasons.length === 0,
           identityMatched, targetRowAvailable: !!targetRow,
           currentNote: targetRow?.notes, decisionBoundaryHeld: true });
+        const pending = eligibility.eligible && typeof rendered.note === "string" && targetRow?.notes !== rendered.note;
         allianceNotes.push({ source_connection_id: connection.sourceConnectionId, source_signature_key: direction.key,
-          system_id: targetRow?._systemId ?? null, signature_id: targetRow?.id ?? null, desired_note: rendered.note ?? null,
+          system_id: targetRow?._systemId ?? null, signature_id: targetRow?.id ?? null,
           ...(expectedIdentity ? { expected_identity: expectedIdentity } : {}),
-          actual_note: targetRow?.notes ?? null, eligible_for_write: eligibility.eligible,
+          eligible_for_write: eligibility.eligible, pending,
+          ...(includeNoteWriteDetails ? { desired_note: rendered.note ?? null, actual_note: targetRow?.notes ?? null } : {}),
           blocking_fields: [...new Set(eligibility.blockers)] });
     }
-    const topologyCheck = validateWormholesystemsTopologyRequest(topologyCandidateFromFixture(sourceFixture), this.now(), maxStalenessMs ?? 0);
-    const topologyBlockers = [...new Set([...snapshotReasons, ...topologyCheck.blockers, ...uniqueNexumEvidenceBlockers])];
+     const topologyCheck = validateWormholesystemsTopologyRequest(topologyCandidateFromFixture(sourceFixture), this.now(), maxStalenessMs ?? 0);
+     const topologyBlockers = [...new Set([...snapshotReasons, ...topologyCheck.blockers,
+       "data writes are not implemented in this diagnostic milestone", ...uniqueNexumEvidenceBlockers])];
     const sourceSnapshotEligible = snapshotReasons.length === 0;
     const fullMatchingBlockers = [...snapshotReasons, ...uniqueNexumEvidenceBlockers];
     if (conflicts.length) fullMatchingBlockers.push("one or more source/Nexum identity or edge conflicts prevent full matching eligibility");
@@ -1313,25 +1283,28 @@ export class WormholeSystemsService {
       oldest_signature_resource_fetched_at: resourceFetchTimes.length ? Math.min(...resourceFetchTimes) : null,
       newest_signature_resource_fetched_at: resourceFetchTimes.length ? Math.max(...resourceFetchTimes) : null,
       matching_evidence_blockers: uniqueNexumEvidenceBlockers };
-    const topologyEligible = !!topologyCheck.request && snapshotReasons.length === 0 && uniqueNexumEvidenceBlockers.length === 0;
-    const pendingAllianceNotes = allianceNotes.filter(note => note.eligible_for_write && note.actual_note !== note.desired_note);
-    const allianceNotesEligible = pendingAllianceNotes.length > 0;
-    const writesEnabled = topologyEligible || allianceNotesEligible;
+     const topologyEligible = false;
+      const allianceNotesEligible = allianceNotes.some(note => note.eligible_for_write && note.pending);
+     const writesEnabled = false;
     return { ...current, source_snapshot_eligible_for_matching: sourceSnapshotEligible,
       source_snapshot_blockers: snapshotReasons, nexum_matching_blockers: uniqueNexumEvidenceBlockers,
       full_matching_blockers: [...new Set(fullMatchingBlockers)], eligible_for_matching: fullMatchingEligible,
       eligible_for_topology_write: topologyEligible,
       eligible_for_alliance_note_writes: allianceNotesEligible, eligible_for_writes: writesEnabled,
       preview: { local_only: true, upstream_calls: 0, source_revision: row.revision_or_digest,
-       matching_performed: true, stored_snapshot_eligible_for_matching: !!row.eligible_for_matching,
+        source_snapshot: { source_identity: row.source_identity, source_api_map_id: row.source_api_map_id,
+          revision_or_digest: row.revision_or_digest, fetched_at: row.fetched_at,
+          fresh_for_matching: snapshotReasons.length === 0, blockers: snapshotReasons },
+        source_signature_classification: { status: classificationStatus, total: classificationRows.length,
+          omitted: Math.max(0, classificationRows.length - sourceSignatureEvidence.length), signatures: sourceSignatureEvidence },
+        matching_performed: true, stored_snapshot_eligible_for_matching: !!row.eligible_for_matching,
         source_snapshot_eligible_for_matching: sourceSnapshotEligible, snapshot_eligible_for_matching: sourceSnapshotEligible,
         full_matching_eligible: fullMatchingEligible, full_matching_blockers: [...new Set(fullMatchingBlockers)],
         snapshot_blockers: snapshotReasons, nexum_cache: resourceFreshness,
         matched, unmatched, conflicts, counts: { matched: matched.length, identity_matches_without_conflict: matched.filter(item => item.identity_match_complete).length,
           unmatched: unmatched.length, conflicts: conflicts.length },
          alliance_notes: allianceNotes,
-         topology_apply: { endpoint: "PUT /api/v1/maps/:mapId/wormholesystems/topology", eligible: topologyEligible,
-           request_shape: topologyCheck.request ? "validated" : "blocked", blockers: topologyBlockers },
+          topology_apply: { eligible: topologyEligible, blockers: topologyBlockers },
          final_names: "alliance_note_renderer", writes_enabled: writesEnabled, nexum_writes_attempted: false } };
   }
 }

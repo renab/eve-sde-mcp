@@ -7,4 +7,10 @@ dist/
 *.gz
 .env
 galaxy-secret.key
+nexum-sync.key
 artifacts/entity-backfill-*
+
+# BEGIN oh-my-opencode-slim worktrees
+.slim/worktrees/
+.slim/worktrees.json
+# END oh-my-opencode-slim worktrees
