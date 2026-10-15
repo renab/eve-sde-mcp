@@ -37,10 +37,12 @@ export function registerWormholeSystemsTools(server: McpServer, getService: () =
     {}, service => service.disableSync());
   tool("wormholesystems_list_maps", "List accessible WormholeSystems API map IDs and slugs using the configured origin and credential. Explicit upstream GET; no sync or writes.",
     {}, service => service.listAccessibleMaps());
-  tool("wormholesystems_sync_map", "Fetch and validate one explicitly enabled map snapshot. Eligible source-owned topology and signature notes may be applied to Nexum after final serialized revalidation; names and custom labels remain disabled.",
+  tool("wormholesystems_sync_map", "Fetch and store one complete validated snapshot for the explicitly enabled selected map using source GETs only. This fetch-only diagnostic milestone never writes Nexum topology, signatures, or notes. Use the subsequent local-only preview to inspect allowlisted source signature classification evidence; preview makes zero upstream calls and performs no writes.",
     { map_id: id }, (service, args) => service.syncMap(args.map_id));
   tool("wormholesystems_map_sync_status", "Read local source snapshot/run status and a local-only preview summary. No upstream calls or Nexum writes.",
     { map_id: id }, (service, args) => service.status(args.map_id));
-  tool("wormholesystems_preview_map_sync", "Local-only preview diagnostics. Makes zero upstream requests and reports independent topology and alliance-note eligibility; does not write.",
+  tool("wormholesystems_preview_map_sync", "Local-only preview of the stored source snapshot, freshness/blockers, and bounded allowlisted full-detail signature classification fields. Makes zero upstream requests and performs no Nexum writes; legacy v1 snapshots report classification as not_captured_in_snapshot.",
     { map_id: id }, (service, args) => service.preview(args.map_id));
+  tool("wormholesystems_reconcile_linked_notes", "Deliberately PATCH eligible linked-direction alliance notes on the configured canonical map only. Requires a fresh validated source snapshot and exact fresh Nexum linked-signature matches; skips non-empty manual/unknown notes. Does not write topology or signatures, and never acts on unconnected signatures.",
+    { map_id: id }, (service, args) => service.reconcileLinkedNotes(args.map_id));
 }

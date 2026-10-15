@@ -1,5 +1,6 @@
 import {
   normalizeWormholeSystemsFixture,
+  type ValidatedSourceSignatureEvidence,
   type WormholeSystemsFixture,
 } from "./wormholesystems-fixture.js";
 
@@ -32,6 +33,13 @@ const eveId = (value: unknown, path: string, issues: AdapterIssue[]): number | n
   return parsed as number;
 };
 const nullableOpaque = (value: unknown, path: string, issues: AdapterIssue[]): string | null => value == null ? null : opaque(value, path, issues);
+const sourceClassificationScalar = (value: unknown, path: string, issues: AdapterIssue[], allowEmpty = false): string | number | null => {
+  if (value === null) return null;
+  if (typeof value === "string" && value.length <= 128 && value.trim() === value && (allowEmpty || !!value) && !/[\u0000-\u001f\u007f]/.test(value)) return value;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value;
+  issues.push({ path, reason: "expected a bounded exact source scalar or null" });
+  return null;
+};
 const observedTime = (value: unknown, path: string, issues: AdapterIssue[]): string | null => {
   if (value === undefined || value === null) return null;
   if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
@@ -147,7 +155,8 @@ export function normalizeSourceSnapshot(input: {
   const systems: WormholeSystemsFixture["systems"] = [];
   const sourceDetails: unknown[] = [];
   const signatures: WormholeSystemsFixture["signatures"] = [];
-  const signatureBySourceId = new Map<string, { key: string; mapSystemId: string; signatureCode: string; sourceConnectionId: string | null }>();
+  const sourceSignatureEvidence: ValidatedSourceSignatureEvidence[] = [];
+  const signatureBySourceId = new Map<string, { key: string; mapSystemId: string; signatureCode: string | null; sourceConnectionId: string | null }>();
   const signatureRowByKey = new Map<string, string>();
   const auditRecordCountByDetail: number[] = [];
   for (let index = 0; index < input.systemDetails.length; index++) {
@@ -195,13 +204,32 @@ export function normalizeSourceSnapshot(input: {
       const signaturePath = `${path}.data.signatures[${signatureIndex}]`;
       if (!record(value)) { issues.push({ path: signaturePath, reason: "expected signature source record" }); return; }
       const sourceId = opaque(value.id, `${signaturePath}.id`, issues);
-      const signatureCode = typeof value.signature_id === "string" && value.signature_id.trim() === value.signature_id &&
-        value.signature_id.length > 0 && value.signature_id.length <= 64 ? value.signature_id : null;
-      if (!signatureCode) issues.push({ path: `${signaturePath}.signature_id`, reason: "expected exact source signature identity" });
+      if (Object.prototype.hasOwnProperty.call(value, "signature_code"))
+        issues.push({ path: `${signaturePath}.signature_code`, reason: "unexpected source signature field; expected signature_id" });
+      let signatureCode: string | null = null;
+      if (value.signature_id !== undefined && value.signature_id !== null) {
+        if (typeof value.signature_id === "string" && value.signature_id.trim() === value.signature_id && value.signature_id.length > 0 &&
+            value.signature_id.length <= 64 && !/[\u0000-\u001f\u007f]/.test(value.signature_id)) signatureCode = value.signature_id;
+        else issues.push({ path: `${signaturePath}.signature_id`, reason: "expected an exact assigned source signature code or null" });
+      }
       const signatureRowId = opaque(value.map_solarsystem_id, `${signaturePath}.map_solarsystem_id`, issues);
       if (signatureRowId !== mapSystemId) issues.push({ path: `${signaturePath}.map_solarsystem_id`, reason: "signature is outside its selected system" });
       const connectionId = nullableOpaque(value.map_connection_id, `${signaturePath}.map_connection_id`, issues);
       const wormholeId = nullableOpaque(value.wormhole_id, `${signaturePath}.wormhole_id`, issues);
+      const evidence: ValidatedSourceSignatureEvidence = { sourceSignatureId: sourceId ?? "", scannerEveSystemId: detailEveId ?? 0 };
+      if (Object.prototype.hasOwnProperty.call(value, "signature_id")) evidence.signatureCode = signatureCode;
+      if (Object.prototype.hasOwnProperty.call(value, "signature_type_id"))
+        evidence.signatureTypeId = sourceClassificationScalar(value.signature_type_id, `${signaturePath}.signature_type_id`, issues);
+      if (Object.prototype.hasOwnProperty.call(value, "signature_category_id"))
+        evidence.signatureCategoryId = sourceClassificationScalar(value.signature_category_id, `${signaturePath}.signature_category_id`, issues);
+      if (Object.prototype.hasOwnProperty.call(value, "wormhole_id"))
+        evidence.wormholeId = sourceClassificationScalar(value.wormhole_id, `${signaturePath}.wormhole_id`, issues);
+      if (record(value.wormhole)) {
+        if (Object.prototype.hasOwnProperty.call(value.wormhole, "id"))
+          evidence.nestedWormholeId = sourceClassificationScalar(value.wormhole.id, `${signaturePath}.wormhole.id`, issues);
+        if (Object.prototype.hasOwnProperty.call(value.wormhole, "name"))
+          evidence.wormholeName = sourceClassificationScalar(value.wormhole.name, `${signaturePath}.wormhole.name`, issues, true);
+      }
       const signatureObservedAt = observedTime(value.observed_at, `${signaturePath}.observed_at`, issues);
       if (connectionId && !connectionById.has(connectionId))
         issues.push({ path: `${signaturePath}.map_connection_id`, reason: "signature references an unknown map connection" });
@@ -218,17 +246,22 @@ export function normalizeSourceSnapshot(input: {
       if (value.wormhole !== undefined && value.wormhole !== null && !record(value.wormhole))
         issues.push({ path: `${signaturePath}.wormhole`, reason: "expected nullable wormhole relationship" });
       if (record(value.wormhole)) {
-        if (value.wormhole_id === null)
-          issues.push({ path: `${signaturePath}.wormhole`, reason: "nested wormhole conflicts with a null wormhole_id" });
-        const nestedWormholeId = opaque(value.wormhole.id, `${signaturePath}.wormhole.id`, issues);
-        if (wormholeId !== null && nestedWormholeId !== wormholeId)
+        const hasDirectWormholeId = Object.prototype.hasOwnProperty.call(value, "wormhole_id");
+        const hasNestedWormholeId = Object.prototype.hasOwnProperty.call(value.wormhole, "id");
+        const nestedWormholeId = hasNestedWormholeId && value.wormhole.id !== null
+          ? opaque(value.wormhole.id, `${signaturePath}.wormhole.id`, issues) : value.wormhole.id === null ? null : undefined;
+        if (hasDirectWormholeId && hasNestedWormholeId &&
+            (wormholeId === null ? value.wormhole.id !== null : nestedWormholeId !== wormholeId))
           issues.push({ path: `${signaturePath}.wormhole`, reason: "nested wormhole identity mismatch" });
       }
-      if (!sourceId || !signatureCode || !mapSystemId) return;
+      if (!sourceId || !mapSystemId) return;
       if (signatures.some(signature => signature.sourceSignatureId === sourceId)) issues.push({ path: `${signaturePath}.id`, reason: "duplicate source signature identity" });
       const key = `source-signature:${mapSystemId}:${sourceId}`;
       signatureBySourceId.set(sourceId, { key, mapSystemId, signatureCode, sourceConnectionId: connectionId });
       signatureRowByKey.set(key, mapSystemId);
+      evidence.sourceSignatureId = sourceId;
+      evidence.scannerEveSystemId = detailEveId!;
+      sourceSignatureEvidence.push(evidence);
       signatures.push({ signatureKey: key, scannerEveSystemId: detailEveId, signatureCode,
         sourceSignatureId: sourceId, sourceConnectionId: connectionId, connectedEveSystemId: null,
         status: "unknown", size: null, observedAt: signatureObservedAt, freshUntil: null });
@@ -280,16 +313,22 @@ export function normalizeSourceSnapshot(input: {
       const seenSignatureIds = new Set<string>();
       connectionSignatures.forEach((value, index) => {
         const path = `${relationship.path}.signatures[${index}]`;
-        if (!record(value)) { issues.push({ path, reason: "expected a connection-signature source record" }); return; }
-        const sourceId = opaque(value.id, `${path}.id`, issues);
-        const owningConnectionId = sourceId ? signatureConnectionByResourceId.get(sourceId) : undefined;
+         if (!record(value)) { issues.push({ path, reason: "expected a connection-signature source record" }); return; }
+         const sourceId = opaque(value.id, `${path}.id`, issues);
+         if (Object.prototype.hasOwnProperty.call(value, "signature_code"))
+           issues.push({ path: `${path}.signature_code`, reason: "unexpected source signature field; expected signature_id" });
+         const owningConnectionId = sourceId ? signatureConnectionByResourceId.get(sourceId) : undefined;
         if (sourceId && owningConnectionId && owningConnectionId !== connection.id)
           issues.push({ path: `${path}.id`, reason: "connection signature resource is reused under a different map connection" });
         else if (sourceId) signatureConnectionByResourceId.set(sourceId, connection.id);
         if (sourceId && seenSignatureIds.has(sourceId)) issues.push({ path: `${path}.id`, reason: "duplicate connection signature resource reference" });
         if (sourceId) seenSignatureIds.add(sourceId);
-        const code = typeof value.signature_id === "string" && value.signature_id.trim() === value.signature_id && value.signature_id.length > 0 && value.signature_id.length <= 64 ? value.signature_id : null;
-        if (!code) issues.push({ path: `${path}.signature_id`, reason: "expected exact source signature identity" });
+        let code: string | null = null;
+        if (value.signature_id !== undefined && value.signature_id !== null) {
+          if (typeof value.signature_id === "string" && value.signature_id.trim() === value.signature_id && value.signature_id.length > 0 &&
+              value.signature_id.length <= 64 && !/[\u0000-\u001f\u007f]/.test(value.signature_id)) code = value.signature_id;
+          else issues.push({ path: `${path}.signature_id`, reason: "expected an exact assigned source signature code or null" });
+        }
         const rowId = opaque(value.map_solarsystem_id, `${path}.map_solarsystem_id`, issues);
         if (rowId !== connection.fromRowId && rowId !== connection.toRowId)
           issues.push({ path: `${path}.map_solarsystem_id`, reason: "connection signature is outside connection endpoints" });
@@ -298,7 +337,7 @@ export function normalizeSourceSnapshot(input: {
         const fullSignature = sourceId ? signatureBySourceId.get(sourceId) : undefined;
         if (fullSignature && (fullSignature.mapSystemId !== rowId || fullSignature.signatureCode !== code))
           issues.push({ path, reason: "connection signature reference contradicts its full signature resource" });
-        if (code && rowId && (rowId === connection.fromRowId || rowId === connection.toRowId)) {
+        if (rowId && (rowId === connection.fromRowId || rowId === connection.toRowId)) {
           // A slim signature with no selected-system counterpart is valid
           // source evidence but cannot render that direction's note.
           if (sourceId) {
@@ -414,10 +453,10 @@ export function normalizeSourceSnapshot(input: {
   }));
 
   if (issues.length) return { ok: false, issues: issues.slice(0, 40) };
-  const canonical = normalizeWormholeSystemsFixture({ fixtureOnly: true, sourceKind: "wormholesystems", schemaVersion: 1,
+  const canonical = normalizeWormholeSystemsFixture({ fixtureOnly: true, sourceKind: "wormholesystems", schemaVersion: 2,
     sourceIdentity: input.sourceIdentity, revisionOrDigest: input.revisionOrDigest, fetchedAt: input.fetchedAt,
     observedAt, scope: { canonicalMapId: input.canonicalMapId, eveSolarSystemIds: systems.map(system => system.eveSolarSystemId) },
-    systems, signatures, connections,
+    systems, signatures, connections, sourceSignatureEvidence,
     topologyEvidence: { complete: true, systems: topologySystems, connections: topologyConnections },
     allianceNoteEvidence: { knownStatusAnnotations, systems: allianceSystems, connections: allianceConnections, signatures: allianceSignatures },
     authorityMetadata: { confirmed: false, fields: null },
