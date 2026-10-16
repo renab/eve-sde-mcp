@@ -613,7 +613,8 @@ describe("WormholeSystems service and MCP controls", () => {
       snapshot: { complete: true, fetchedAt: sync.fetched_at },
       systems: [{ sourceSystemId: "map-system-test", eveSystemId: 31_000_001, positionX: 12, positionY: 34 }],
       connections: [],
-      signatures: [{ sourceSignatureId: "source-signature-1", sourceSystemId: "map-system-test", sigId: "", sigType: "unknown", whType: "" }] });
+      signatures: [{ sourceSignatureId: "source-signature-1", sourceSystemId: "map-system-test", sourceConnectionId: null,
+        sigId: "", sigType: "unknown", whType: "" }] });
     expect(Object.isFrozen(request)).toBe(true);
     expect(JSON.stringify(request)).not.toContain("must-not-be-used");
     expect(h.nexumWrites.writeWormholesystemsSignatureNotes).not.toHaveBeenCalled();
@@ -767,7 +768,7 @@ describe("WormholeSystems service and MCP controls", () => {
     expect(h.nexumWrites.writeWormholesystemsTopology).toHaveBeenCalledTimes(1);
     const request = h.nexumWrites.writeWormholesystemsTopology.mock.calls[0][1] as any;
     expect(request.signatures).toEqual([{ sourceSignatureId: "source-signature-1", sourceSystemId: "map-system-test",
-      sigId: "QRS-123", sigType: "unknown", whType: "" }]);
+      sourceConnectionId: null, sigId: "QRS-123", sigType: "unknown", whType: "" }]);
     expect(h.db.prepare("SELECT eligible_for_matching FROM wormholesystems_source_snapshots WHERE map_id=?").get(h.targetMap))
       .toMatchObject({ eligible_for_matching: 1 });
     h.db.close();
@@ -802,7 +803,7 @@ describe("WormholeSystems service and MCP controls", () => {
       topology_sync: { status: "succeeded", attempted: true } });
     const request = h.nexumWrites.writeWormholesystemsTopology.mock.calls[0][1] as any;
     expect(request.signatures).toEqual([{ sourceSignatureId: "source-signature-bcm-579", sourceSystemId: "map-system-test",
-      sigId: "BCM-579", sigType: "wormhole", whType: "B274" }]);
+      sourceConnectionId: null, sigId: "BCM-579", sigType: "wormhole", whType: "B274" }]);
     h.db.close();
   });
 
@@ -857,12 +858,15 @@ describe("WormholeSystems service and MCP controls", () => {
       { sourceSystemId: "map-system-b", eveSystemId: 31_000_002, positionX: 56, positionY: 78 },
     ]);
     expect(request.connections).toEqual([{ sourceConnectionId: "source-edge", fromSourceSystemId: "map-system-a",
-      toSourceSystemId: "map-system-b", fromSourceSignatureId: "source-signature-a", toSourceSignatureId: "source-signature-b",
+      toSourceSystemId: "map-system-b", sourceSignatureId: "source-signature-a", targetSignatureId: "source-signature-b",
       connection_type: "standard", ship_size: "medium" }]);
     expect(request.signatures).toEqual([
-      { sourceSignatureId: "source-signature-a", sourceSystemId: "map-system-a", sigId: "BCM-579", sigType: "wormhole", whType: "B274" },
-      { sourceSignatureId: "source-signature-b", sourceSystemId: "map-system-b", sigId: "DEF-456", sigType: "wormhole", whType: "" },
-      { sourceSignatureId: "source-signature-unassigned", sourceSystemId: "map-system-a", sigId: "", sigType: "unknown", whType: "" },
+      { sourceSignatureId: "source-signature-a", sourceSystemId: "map-system-a", sourceConnectionId: "source-edge",
+        sigId: "BCM-579", sigType: "wormhole", whType: "B274" },
+      { sourceSignatureId: "source-signature-b", sourceSystemId: "map-system-b", sourceConnectionId: "source-edge",
+        sigId: "DEF-456", sigType: "wormhole", whType: "" },
+      { sourceSignatureId: "source-signature-unassigned", sourceSystemId: "map-system-a", sourceConnectionId: null,
+        sigId: "", sigType: "unknown", whType: "" },
     ]);
     expect(sync.topology_sync.diagnostics).toContain(
       "signatures[source-signature-b]: validated wormhole relation has no non-empty name; projected with empty whType");
