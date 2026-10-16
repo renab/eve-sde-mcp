@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import {
   allianceNoteWriteEligibility, renderAllianceNote, summarizeTopologyWriteResponse, topologyCandidateFromFixture,
+  topologyProjectionFromFixture,
   validateWormholesystemsTopologyRequest,
 } from "../../src/wormholesystems-reconciliation.js";
 import { normalizeSourceSnapshot } from "../../src/wormholesystems-adapter.js";
@@ -69,7 +70,16 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     const fixture = result.fixture;
-    const request = validateWormholesystemsTopologyRequest(topologyCandidateFromFixture(fixture), now);
+    const projection = topologyProjectionFromFixture(fixture);
+    expect(projection.blockers).toEqual([]);
+    expect(projection.candidate.connections).toEqual([{ sourceConnectionId: "edge-a", fromSourceSystemId: "member-home",
+      toSourceSystemId: "member-branch", sourceSignatureId: "signature-resource-a", targetSignatureId: "signature-resource-b",
+      connection_type: "standard", ship_size: "medium" }]);
+    expect(projection.candidate.signatures).toEqual([
+      { sourceSignatureId: "signature-resource-a", sourceSystemId: "member-home", sourceConnectionId: "edge-a", sigId: "ABC-123", sigType: "unknown", whType: "" },
+      { sourceSignatureId: "signature-resource-b", sourceSystemId: "member-branch", sourceConnectionId: "edge-a", sigId: "DEF-456", sigType: "unknown", whType: "" },
+    ]);
+    const request = validateWormholesystemsTopologyRequest(projection.candidate, now);
     expect(request).toEqual({ request: {
       schemaVersion: 2,
       sourceIdentity: `wormholesystems:${JSON.stringify(["https://source.example", "source-map"])}`,
@@ -79,15 +89,16 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
         { sourceSystemId: "member-home", eveSystemId: 31_000_001, positionX: 10, positionY: 20 },
       ],
       connections: [{ sourceConnectionId: "edge-a", fromSourceSystemId: "member-home", toSourceSystemId: "member-branch",
-        fromSourceSignatureId: "signature-resource-a", toSourceSignatureId: "signature-resource-b",
+        sourceSignatureId: "signature-resource-a", targetSignatureId: "signature-resource-b",
         connection_type: "standard", ship_size: "medium" }],
       signatures: [
-        { sourceSignatureId: "signature-resource-a", sourceSystemId: "member-home", sigId: "ABC-123", sigType: "unknown", whType: "" },
-        { sourceSignatureId: "signature-resource-b", sourceSystemId: "member-branch", sigId: "DEF-456", sigType: "unknown", whType: "" },
+        { sourceSignatureId: "signature-resource-a", sourceSystemId: "member-home", sourceConnectionId: "edge-a", sigId: "ABC-123", sigType: "unknown", whType: "" },
+        { sourceSignatureId: "signature-resource-b", sourceSystemId: "member-branch", sourceConnectionId: "edge-a", sigId: "DEF-456", sigType: "unknown", whType: "" },
       ],
     }, blockers: [] });
     expect(Object.keys(request.request!.snapshot).sort()).toEqual(["complete", "fetchedAt"]);
-    expect(Object.keys(request.request!.connections[0]).sort()).toEqual(["connection_type", "fromSourceSignatureId", "fromSourceSystemId", "ship_size", "sourceConnectionId", "toSourceSignatureId", "toSourceSystemId"]);
+    expect(Object.keys(request.request!.connections[0]).sort()).toEqual(["connection_type", "fromSourceSystemId", "ship_size", "sourceConnectionId", "sourceSignatureId", "targetSignatureId", "toSourceSystemId"]);
+    expect(Object.keys(request.request!.signatures[0]).sort()).toEqual(["sigId", "sigType", "sourceConnectionId", "sourceSignatureId", "sourceSystemId", "whType"]);
     expect(fixture.connections).toMatchObject([{ sourceConnectionId: "edge-a", state: "unknown" }]);
     expect(fixture.topologyEvidence?.connections).toEqual([{ sourceConnectionId: "edge-a", fromSourceSystemId: "member-home",
       toSourceSystemId: "member-branch", connectionType: "wormhole", size: "medium" }]);
@@ -100,6 +111,74 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
     // Expired mass/lifetime annotations and inactive visual signature status do
     // not remove a connection that is present in the complete map list.
     expect(request.request?.connections).toHaveLength(1);
+  });
+
+  it("requires signature-side connection references to match a present edge and its scanner endpoint", () => {
+    const normalized = completeSourceSnapshot();
+    expect(normalized.ok).toBe(true);
+    if (!normalized.ok) return;
+    const candidate = topologyProjectionFromFixture(normalized.fixture).candidate as any;
+    expect(validateWormholesystemsTopologyRequest(candidate, now).request).toBeDefined();
+
+    const missingEdgeAssociation = structuredClone(candidate);
+    missingEdgeAssociation.connections[0].sourceSignatureId = null;
+    const missing = validateWormholesystemsTopologyRequest(missingEdgeAssociation, now);
+    expect(missing.request).toBeUndefined();
+    expect(missing.blockers).toContain("signatures[0].sourceConnectionId: source-side edge signature reference contradicts the explicit source association");
+
+    const absentEdge = structuredClone(candidate);
+    absentEdge.signatures[0].sourceConnectionId = "absent-edge";
+    const absent = validateWormholesystemsTopologyRequest(absentEdge, now);
+    expect(absent.request).toBeUndefined();
+    expect(absent.blockers).toContain("signatures[0].sourceConnectionId: source connection is absent from the complete snapshot projection");
+
+    const wrongScanner = structuredClone(candidate);
+    wrongScanner.systems.push({ sourceSystemId: "member-other", eveSystemId: 31_000_003 });
+    wrongScanner.signatures[0].sourceSystemId = "member-other";
+    const scanner = validateWormholesystemsTopologyRequest(wrongScanner, now);
+    expect(scanner.request).toBeUndefined();
+    expect(scanner.blockers).toContain("signatures[0].sourceConnectionId: scanner member is not an endpoint of the source connection");
+
+    const mismatchedEdgeAssociation = structuredClone(candidate);
+    mismatchedEdgeAssociation.connections[0].sourceSignatureId = "signature-resource-b";
+    const mismatched = validateWormholesystemsTopologyRequest(mismatchedEdgeAssociation, now);
+    expect(mismatched.request).toBeUndefined();
+    expect(mismatched.blockers).toEqual(expect.arrayContaining([
+      "connections[0].sourceSignatureId: source signature scanner member contradicts the connection endpoint",
+      "signatures[0].sourceConnectionId: source-side edge signature reference contradicts the explicit source association",
+    ]));
+
+    const oldFields = structuredClone(candidate);
+    oldFields.connections[0].fromSourceSignatureId = oldFields.connections[0].sourceSignatureId;
+    oldFields.connections[0].toSourceSignatureId = oldFields.connections[0].targetSignatureId;
+    delete oldFields.connections[0].sourceSignatureId;
+    delete oldFields.connections[0].targetSignatureId;
+    const unsupported = validateWormholesystemsTopologyRequest(oldFields, now);
+    expect(unsupported.request).toBeUndefined();
+    expect(unsupported.blockers).toEqual(expect.arrayContaining([
+      "connections[0]: contains an unsupported field",
+      "connections[0].sourceSignatureId: expected a validated source signature ID or null",
+      "connections[0].targetSignatureId: expected a validated source signature ID or null",
+    ]));
+  });
+
+  it("projects unassociated signatures with a null source connection and accepts them independently", () => {
+    const normalized = completeSourceSnapshot();
+    expect(normalized.ok).toBe(true);
+    if (!normalized.ok) return;
+    normalized.fixture.signatures.push({ signatureKey: "source-signature:31000001:signature-standalone",
+      scannerEveSystemId: 31_000_001, signatureCode: null, sourceSignatureId: "signature-standalone",
+      sourceConnectionId: null, connectedEveSystemId: null, status: "unknown", size: null, observedAt: null, freshUntil: null });
+    normalized.fixture.sourceSignatureEvidence!.push({ sourceSignatureId: "signature-standalone", scannerEveSystemId: 31_000_001,
+      signatureCode: null });
+
+    const projection = topologyProjectionFromFixture(normalized.fixture);
+    expect(projection.blockers).toEqual([]);
+    expect(projection.candidate.signatures).toContainEqual({ sourceSignatureId: "signature-standalone", sourceSystemId: "member-home",
+      sourceConnectionId: null, sigId: "", sigType: "unknown", whType: "" });
+    const checked = validateWormholesystemsTopologyRequest(projection.candidate, now);
+    expect(checked.request?.signatures).toContainEqual({ sourceSignatureId: "signature-standalone", sourceSystemId: "member-home",
+      sourceConnectionId: null, sigId: "", sigType: "unknown", whType: "" });
   });
 
   it("omits unavailable coordinate pairs and rejects partial or malformed pairs", () => {
