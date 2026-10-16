@@ -555,8 +555,8 @@ describe("WormholeSystems service and MCP controls", () => {
     expect(stored.revision_or_digest).toBe(result.revision_or_digest);
     expect(stored.revision_or_digest).not.toBe("old-digest");
     expect(stored.eligible_for_matching).toBe(1);
-    expect(JSON.parse(stored.payload_json)).toMatchObject({ schema: "wormholesystems-source-v2", adapterVersion: 2,
-      fixture: { sourceKind: "wormholesystems", schemaVersion: 2, sourceSignatureEvidence: [],
+    expect(JSON.parse(stored.payload_json)).toMatchObject({ schema: "wormholesystems-source-v3", adapterVersion: 3,
+      fixture: { sourceKind: "wormholesystems", schemaVersion: 3, sourceSignatureEvidence: [],
         scope: { canonicalMapId: h.targetMap }, systems: [{ eveSolarSystemId: 31_000_001 }], signatures: [], connections: [] } });
     expect(transport.mock.calls.map(call => (call[1] as RequestInit).method)).toEqual(["GET", "GET", "GET", "GET", "GET", "GET"]);
     expect(transport.mock.calls.every(call => (call[1] as RequestInit).method !== "PATCH")).toBe(true);
@@ -763,7 +763,7 @@ describe("WormholeSystems service and MCP controls", () => {
     const sync = await h.service.syncMap(h.targetMap) as any;
     expect(sync).toMatchObject({ status: "snapshot_validated", fetched: true, nexum_writes_attempted: true,
       topology_sync: { status: "succeeded", attempted: true, diagnostics: [
-        'signatures[source-signature-1]: source classification is unmapped or unavailable; projected as sigType "unknown" with empty whType',
+        'signatures[source-signature-1]: source category is absent or unsupported; projected as sigType "unknown" with empty whType (type_unmapped)',
       ] } });
     expect(h.nexumWrites.writeWormholesystemsTopology).toHaveBeenCalledTimes(1);
     const request = h.nexumWrites.writeWormholesystemsTopology.mock.calls[0][1] as any;
@@ -779,7 +779,8 @@ describe("WormholeSystems service and MCP controls", () => {
     const mapDetail = { ...selectedMapDetail(), map_solarsystems: [{ id: "map-system-test", map_id: "api-map-7",
       solarsystem_id: 31_000_001, position: { x: 12, y: 34 } }] };
     const detail = systemDetail("map-system-test", 31_000_001, [{ id: "source-signature-bcm-579", signature_id: "BCM-579",
-      map_solarsystem_id: "map-system-test", signature_type_id: 197, signature_category_id: 1, wormhole_id: 26,
+      map_solarsystem_id: "map-system-test", signature_type_id: 197, signature_category_id: 1,
+      signature_category: { id: 1, name: "Wormhole" }, signature_type: { id: 197, signature_category_id: 1 }, wormhole_id: 26,
       wormhole: { id: 26, name: "B274" } }]);
     const transport = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
@@ -807,6 +808,46 @@ describe("WormholeSystems service and MCP controls", () => {
     h.db.close();
   });
 
+  it("blocks a name-only wormhole classification before Nexum writes or checkpoint/deletion effects", async () => {
+    vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
+    const mapDetail = { ...selectedMapDetail(), map_solarsystems: [{ id: "map-system-test", map_id: "api-map-7",
+      solarsystem_id: 31_000_001, position: { x: 12, y: 34 } }] };
+    const detail = systemDetail("map-system-test", 31_000_001, [{ id: "source-signature-name-only", signature_id: "BGT-001",
+      map_solarsystem_id: "map-system-test", signature_category_id: 1,
+      signature_category: { id: 1, name: "Wormhole" }, wormhole: { name: "B274" } }]);
+    let currentDetail: unknown = testSystemDetail();
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: mapDetail });
+      return response(currentDetail);
+    });
+    const h = harness(transport as typeof fetch);
+    await configured(h.service, h.targetMap);
+    await enableAfterTest(h.service);
+    currentDetail = detail;
+    h.service.bindNexumTopologyWriter("nexum-test", true);
+    const previouslyOwnedSignatures = new Set(["previously-owned-signature"]);
+    let mockCheckpoint: unknown = { revision: "previously-accepted-snapshot" };
+    h.nexumWrites.writeWormholesystemsTopology.mockImplementation(async (_map, request) => {
+      previouslyOwnedSignatures.clear();
+      for (const signature of (request as any).signatures) previouslyOwnedSignatures.add(signature.sourceSignatureId);
+      mockCheckpoint = (request as any).snapshot.fetchedAt;
+      return { checkpoint: { accepted: true, replayed: false, partial: false } } as any;
+    });
+    const checkpointBefore = mockCheckpoint;
+
+    const sync = await h.service.syncMap(h.targetMap) as any;
+    expect(sync.topology_sync).toMatchObject({ status: "blocked", attempted: false, accepted: false,
+      blockers: expect.arrayContaining([
+        "signatures[source-signature-name-only].wormhole_id: Wormhole classification has a partial or contradictory relation/name",
+      ]) });
+    expect(h.nexumWrites.writeWormholesystemsTopology).not.toHaveBeenCalled();
+    expect([...previouslyOwnedSignatures]).toEqual(["previously-owned-signature"]);
+    expect(mockCheckpoint).toBe(checkpointBefore);
+    h.db.close();
+  });
+
   it("sends every source signature, connection link, and system in the same complete snapshot sync", async () => {
     vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
     const edge = { id: "source-edge", from_map_solarsystem_id: "map-system-a", to_map_solarsystem_id: "map-system-b",
@@ -822,12 +863,15 @@ describe("WormholeSystems service and MCP controls", () => {
       solarsystem_id: eveId, signatures, map_connections: [edge], audits: [] } });
     const detailA = detailFor("map-system-a", 31_000_001, [
       { id: "source-signature-a", signature_id: "BCM-579", map_solarsystem_id: "map-system-a", map_connection_id: "source-edge",
-        map_connection: { id: "source-edge" }, wormhole_id: 26, wormhole: { id: 26, name: "B274" } },
+        map_connection: { id: "source-edge" }, signature_category_id: 1, signature_category: { id: 1, name: "Wormhole" },
+        signature_type_id: 197, signature_type: { id: 197, signature_category_id: 1 }, wormhole_id: 26, wormhole: { id: 26, name: "B274" } },
       { id: "source-signature-unassigned", signature_id: null, map_solarsystem_id: "map-system-a", map_connection_id: null },
     ]);
     const detailB = detailFor("map-system-b", 31_000_002, [
       { id: "source-signature-b", signature_id: "DEF-456", map_solarsystem_id: "map-system-b", map_connection_id: "source-edge",
-        map_connection: { id: "source-edge" }, wormhole_id: "wormhole-27", wormhole: { id: "wormhole-27" } },
+        map_connection: { id: "source-edge" }, signature_category_id: 1, signature_category: { id: 1, name: "Wormhole" },
+        signature_type_id: 197, signature_type: { id: 197, signature_category_id: 1 },
+        wormhole_id: "wormhole-27", wormhole: { id: "wormhole-27" } },
     ]);
     const transport = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
@@ -869,7 +913,7 @@ describe("WormholeSystems service and MCP controls", () => {
         sigId: "", sigType: "unknown", whType: "" },
     ]);
     expect(sync.topology_sync.diagnostics).toContain(
-      "signatures[source-signature-b]: validated wormhole relation has no non-empty name; projected with empty whType");
+      "signatures[source-signature-b]: validated Wormhole category has no non-empty related name; projected with empty whType");
     h.db.close();
   });
 
@@ -1021,10 +1065,12 @@ describe("WormholeSystems service and MCP controls", () => {
       solarsystem_id: system.solarsystem_id, signatures: [{ id: `source-signature-${index}`,
         signature_id: index === 0 ? "RZQ-108" : index === 1 ? "VGC-572" : `X${String(index).padStart(2, "0")}-A${String(index).padStart(2, "0")}`,
         map_solarsystem_id: system.id,
-        ...(index === 0 ? { signature_type_id: "synthetic-type-id", signature_category_id: null,
+        ...(index === 0 ? { signature_type_id: "synthetic-type-id", signature_type: { id: "synthetic-type-id", signature_category_id: null },
+          signature_category_id: null, signature_category: { id: null, name: "Homefront Operations" },
           wormhole_id: "synthetic-wormhole-id", wormhole: { id: "synthetic-wormhole-id", name: "synthetic-label-not-a-wh-code",
             leads_to: "private-leads-to-do-not-output" }, notes: "private-note-do-not-output" } : {}),
-        ...(index === 2 ? { signature_type_id: null, signature_category_id: null, wormhole_id: null,
+        ...(index === 2 ? { signature_type_id: null, signature_type: { id: null, signature_category_id: null },
+          signature_category_id: null, signature_category: { id: null, name: null }, wormhole_id: null,
           wormhole: { id: null, name: null } } : {}) }], map_connections: [], audits: [] } }]));
     const transport = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
@@ -1052,16 +1098,21 @@ describe("WormholeSystems service and MCP controls", () => {
     const evidence = preview.preview.source_signature_classification.signatures;
     expect(evidence.find((row: any) => row.signature_code === "RZQ-108")).toMatchObject({
       source_signature_id: "source-signature-0", scanner_eve_system_id: 31_000_001,
-      signature_type_id: "synthetic-type-id", signature_category_id: null, wormhole_id: "synthetic-wormhole-id",
+      signature_type_id: "synthetic-type-id", signature_category_id: null, signature_category_name: "Homefront Operations",
+      signature_category_name_status: "source_value", nested_signature_category_id: null, nested_signature_type_id: "synthetic-type-id",
+      signature_type_category_id: null, wormhole_id: "synthetic-wormhole-id",
       nested_wormhole_id: "synthetic-wormhole-id", wormhole_name: "synthetic-label-not-a-wh-code",
     });
     const absent = evidence.find((row: any) => row.signature_code === "VGC-572");
-    expect(absent).toMatchObject({ source_signature_id: "source-signature-1", classification_status: "captured" });
+    expect(absent).toMatchObject({ source_signature_id: "source-signature-1", classification_status: "captured",
+      signature_category_name_status: "source_absent" });
     expect(absent).not.toHaveProperty("signature_type_id");
     expect(absent).not.toHaveProperty("signature_category_id");
     expect(absent).not.toHaveProperty("wormhole_id");
     expect(evidence.find((row: any) => row.source_signature_id === "source-signature-2")).toMatchObject({
       signature_type_id: null, signature_category_id: null, wormhole_id: null, nested_wormhole_id: null, wormhole_name: null,
+      signature_category_name: null, signature_category_name_status: "source_null", nested_signature_category_id: null,
+      nested_signature_type_id: null, signature_type_category_id: null,
     });
     expect(preview.preview).toMatchObject({ matched: [], writes_enabled: false, nexum_writes_attempted: false });
     expect(preview.preview.alliance_notes).toEqual([]);
@@ -1083,6 +1134,25 @@ describe("WormholeSystems service and MCP controls", () => {
     expect(stalePreview.preview.source_snapshot).toMatchObject({ fresh_for_matching: false,
       blockers: expect.arrayContaining(["source snapshot exceeds the configured maximum matching staleness"]) });
 
+    stalePayload.schema = "wormholesystems-source-v2";
+    stalePayload.adapterVersion = 2;
+    stalePayload.fixture.schemaVersion = 2;
+    for (const evidenceRow of stalePayload.fixture.sourceSignatureEvidence) {
+      delete evidenceRow.signatureCategoryName;
+      delete evidenceRow.nestedSignatureCategoryId;
+      delete evidenceRow.nestedSignatureTypeId;
+      delete evidenceRow.signatureTypeCategoryId;
+    }
+    h.db.prepare("UPDATE wormholesystems_source_snapshots SET payload_json=? WHERE map_id=?").run(JSON.stringify(stalePayload), h.targetMap);
+    const legacyV2Preview = h.service.preview(h.targetMap) as any;
+    expect(legacyV2Preview.preview.source_signature_classification.signatures[0]).toMatchObject({
+      classification_status: "captured", signature_category_name_status: "not_captured_in_snapshot",
+    });
+    expect(legacyV2Preview.preview.source_signature_classification.signatures[0]).not.toHaveProperty("signature_category_name");
+    expect(legacyV2Preview.preview.source_signature_classification.signatures[0]).not.toHaveProperty("signature_type_category_id");
+    expect(legacyV2Preview.preview.topology_apply).toMatchObject({ eligible: false });
+    expect(legacyV2Preview.source_snapshot_blockers).toContain("stored v1/v2 source snapshot is read-only; a fresh validated v3 snapshot is required for writes");
+
     stalePayload.schema = "wormholesystems-source-v1";
     stalePayload.adapterVersion = 1;
     stalePayload.fixture.schemaVersion = 1;
@@ -1091,7 +1161,8 @@ describe("WormholeSystems service and MCP controls", () => {
     const legacyPreview = h.service.preview(h.targetMap) as any;
     expect(legacyPreview.preview.source_signature_classification).toMatchObject({ status: "not_captured_in_snapshot", total: 12, omitted: 0 });
     expect(legacyPreview.preview.source_signature_classification.signatures[0]).not.toHaveProperty("signature_type_id");
-    expect(legacyPreview.preview.snapshot_blockers).toContain("source signature classification was not captured in this legacy v1 snapshot");
+    expect(legacyPreview.preview.source_signature_classification.signatures[0].signature_category_name_status).toBe("not_captured_in_snapshot");
+    expect(legacyPreview.preview.snapshot_blockers).toContain("stored v1/v2 source snapshot is read-only; a fresh validated v3 snapshot is required for writes");
     expect(transport).toHaveBeenCalledTimes(callsAfterFetch);
     h.db.close();
   });
@@ -1304,15 +1375,18 @@ describe("WormholeSystems service and MCP controls", () => {
         signatures: [{ id: "opaque-signature-resource", signature_id: "RZQ-108", map_solarsystem_id: "member-row", ...signature }],
         map_connections: [], audits: [] } }],
     });
-    const valid = sourceSignature({ signature_type_id: "synthetic-type-id", signature_category_id: null,
+    const valid = sourceSignature({ signature_type_id: "synthetic-type-id", signature_type: { id: "synthetic-type-id", signature_category_id: null },
+      signature_category_id: null, signature_category: { id: null, name: "Wormhole" },
       wormhole_id: "synthetic-wormhole-id", wormhole: { id: "synthetic-wormhole-id", name: "synthetic-label-not-a-wh-code",
         leads_to: "must-not-be-projected" }, notes: "private-source-note" });
     expect(valid.ok).toBe(true);
     if (valid.ok) {
-      expect(valid.fixture.schemaVersion).toBe(2);
+      expect(valid.fixture.schemaVersion).toBe(3);
       expect(valid.fixture.sourceSignatureEvidence).toEqual([{
         sourceSignatureId: "opaque-signature-resource", scannerEveSystemId: 31_000_001, signatureCode: "RZQ-108",
-        signatureTypeId: "synthetic-type-id", signatureCategoryId: null, wormholeId: "synthetic-wormhole-id",
+        signatureTypeId: "synthetic-type-id", signatureCategoryId: null, signatureCategoryName: "Wormhole",
+        nestedSignatureCategoryId: null, nestedSignatureTypeId: "synthetic-type-id", signatureTypeCategoryId: null,
+        wormholeId: "synthetic-wormhole-id",
         nestedWormholeId: "synthetic-wormhole-id", wormholeName: "synthetic-label-not-a-wh-code",
       }]);
       expect(JSON.stringify(valid.fixture.sourceSignatureEvidence)).not.toContain("must-not-be-projected");
@@ -1331,17 +1405,29 @@ describe("WormholeSystems service and MCP controls", () => {
     }
 
     const unassigned = sourceSignature({ signature_id: null, signature_type_id: null, signature_category_id: null,
+      signature_type: { id: null, signature_category_id: null }, signature_category: { id: null, name: null },
       wormhole_id: null, wormhole: { id: null, name: null } });
     // `signature_id` is supplied by the base object above; the source adapter
     // preserves a null assigned-code state rather than fabricating a code.
     expect(unassigned.ok).toBe(true);
     if (unassigned.ok) expect(unassigned.fixture.sourceSignatureEvidence![0]).toMatchObject({
-      signatureCode: null, signatureTypeId: null, signatureCategoryId: null, wormholeId: null, nestedWormholeId: null, wormholeName: null,
+      signatureCode: null, signatureTypeId: null, signatureCategoryId: null, signatureCategoryName: null,
+      nestedSignatureCategoryId: null, nestedSignatureTypeId: null, signatureTypeCategoryId: null,
+      wormholeId: null, nestedWormholeId: null, wormholeName: null,
     });
 
     for (const malformed of [
       { signature_type_id: { unexpected: true } },
       { signature_category_id: "x".repeat(129) },
+      { signature_category: "malformed" },
+      { signature_category: { id: 1, name: "x".repeat(129) } },
+      { signature_category: { id: 1, name: " Data Site" } },
+      { signature_category: { id: 1, name: "Data\u0000Site" } },
+      { signature_category: { id: 1, name: "Data\u0085Site" } },
+      { signature_category_id: 1, signature_category: { id: 2, name: "Data Site" } },
+      { signature_category_id: null, signature_category: { id: 1, name: "Data Site" } },
+      { signature_type_id: 1, signature_type: { id: 2 } },
+      { signature_category_id: 1, signature_type: { signature_category_id: 2 } },
       { wormhole_id: "synthetic-wormhole-id", wormhole: { id: "contradictory-wormhole-id" } },
       { wormhole: { name: "x".repeat(129) } },
     ]) expect(sourceSignature(malformed).ok).toBe(false);
@@ -1707,7 +1793,7 @@ describe("WormholeSystems service and MCP controls", () => {
       "wormholesystems_reconcile_linked_notes",
       "wormholesystems_set_max_staleness"])
       expect(registered.has(name)).toBe(true);
-    expect(descriptions.get("wormholesystems_sync_map")).toMatch(/complete eligible v2 topology\/signature snapshot.*same invocation/i);
+    expect(descriptions.get("wormholesystems_sync_map")).toMatch(/fresh complete v3.*Nexum schema-v2 topology\/signature request.*same invocation/i);
     expect(descriptions.get("wormholesystems_bind_nexum_topology_writer")).toMatch(/confirms.*wormholesystems_sync scope.*v2 endpoint/i);
     expect(descriptions.get("wormholesystems_preview_map_sync")).toMatch(/local-only.*classification.*zero upstream/i);
     expect(descriptions.get("wormholesystems_reconcile_linked_notes")).toMatch(/PATCH.*linked-direction.*never acts on unconnected/i);

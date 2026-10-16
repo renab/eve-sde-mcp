@@ -113,6 +113,159 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
     expect(request.request?.connections).toHaveLength(1);
   });
 
+  it.each([
+    ["Wormhole", "wormhole", "B274"],
+    ["Data Site", "data", ""],
+    ["Relic Site", "relic", ""],
+    ["Combat Site", "combat", ""],
+    ["Gas Site", "gas", ""],
+    ["Ore Site", "ore", ""],
+  ])("maps exact source category %s without numeric or type-name inference", (name, expectedType, expectedWhType) => {
+    const result = completeSourceSnapshot();
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const evidence = result.fixture.sourceSignatureEvidence![0];
+    Object.assign(evidence, { signatureCategoryName: name, signatureCategoryId: 17, nestedSignatureCategoryId: 17,
+      signatureTypeCategoryId: 17, signatureTypeId: 197, nestedSignatureTypeId: 197 });
+    if (name === "Wormhole") Object.assign(evidence, { wormholeId: 26, nestedWormholeId: 26, wormholeName: "B274" });
+    const projection = topologyProjectionFromFixture(result.fixture);
+    expect(projection.blockers).toEqual([]);
+    expect((projection.candidate.signatures as any[]).find(row => row.sourceSignatureId === "signature-resource-a"))
+      .toMatchObject({ sigType: expectedType, whType: expectedWhType });
+  });
+
+  it("retains unsupported, absent and null categories as unknown and blocks contradictory wormhole relations", () => {
+    const project = (name: string | null | undefined, wormhole: boolean | "name-only" = false) => {
+      const result = completeSourceSnapshot();
+      if (!result.ok) throw new Error("source fixture failed to normalize");
+      const evidence = result.fixture.sourceSignatureEvidence![0];
+      Object.assign(evidence, { signatureCategoryId: 1, nestedSignatureCategoryId: 1,
+        signatureTypeCategoryId: 1, signatureTypeId: 197, nestedSignatureTypeId: 197 });
+      if (name !== undefined) evidence.signatureCategoryName = name;
+      if (wormhole === true) Object.assign(evidence, { wormholeId: 26, nestedWormholeId: 26, wormholeName: "B274" });
+      if (wormhole === "name-only") Object.assign(evidence, { wormholeName: "B274" });
+      return topologyProjectionFromFixture(result.fixture);
+    };
+    for (const name of ["Homefront Operations", "Factional Warfare Site", "Future Site", ""] as const) {
+      const projection = project(name, true);
+      expect(projection.blockers).toEqual([]);
+      expect((projection.candidate.signatures as any[])[0]).toMatchObject({ sigType: "unknown", whType: "" });
+      expect(projection.diagnostics.join(" ")).toContain("type_unmapped");
+    }
+    for (const name of [null, undefined] as const) {
+      const projection = project(name, true);
+      expect(projection.blockers).toEqual([]);
+      expect((projection.candidate.signatures as any[])[0]).toMatchObject({ sigType: "unknown", whType: "" });
+    }
+    const contradictory = project("Data Site", true);
+    expect(contradictory.blockers).toContain(
+      "signatures[signature-resource-a].wormhole_id: wormhole relation contradicts the validated non-wormhole category");
+    const contradictoryNameOnly = project("Relic Site", "name-only");
+    expect(contradictoryNameOnly.blockers).toContain(
+      "signatures[signature-resource-a].wormhole_id: wormhole relation contradicts the validated non-wormhole category");
+    const noCategoryDespiteTypeEvidence = project(undefined, true);
+    expect((noCategoryDespiteTypeEvidence.candidate.signatures as any[])[0]).toMatchObject({ sigType: "unknown", whType: "" });
+  });
+
+  it("requires complete wormhole identity evidence for a non-empty related name", () => {
+    const project = (relation: { wormholeId?: unknown; nestedWormholeId?: unknown; wormholeName?: unknown }) => {
+      const result = completeSourceSnapshot();
+      if (!result.ok) throw new Error("source fixture failed to normalize");
+      Object.assign(result.fixture.sourceSignatureEvidence![0], { signatureCategoryName: "Wormhole", ...relation });
+      return topologyProjectionFromFixture(result.fixture);
+    };
+    const noRelationOrName = project({});
+    expect(noRelationOrName.blockers).toEqual([]);
+    expect((noRelationOrName.candidate.signatures as any[])[0]).toMatchObject({ sigType: "wormhole", whType: "" });
+
+    for (const relation of [
+      { wormholeName: "B274" },
+      { wormholeId: 26, wormholeName: "B274" },
+      { nestedWormholeId: 26, wormholeName: "B274" },
+      { wormholeId: 26, nestedWormholeId: 27, wormholeName: "B274" },
+      { wormholeId: 26 },
+      { nestedWormholeId: 26 },
+      { wormholeId: 26, nestedWormholeId: 27 },
+    ]) {
+      const projection = project(relation);
+      expect(projection.blockers).toContain(
+        "signatures[signature-resource-a].wormhole_id: Wormhole classification has a partial or contradictory relation/name");
+    }
+
+    for (const relation of [
+      { wormholeId: 26, nestedWormholeId: 26 },
+      { wormholeId: 26, nestedWormholeId: 26, wormholeName: "" },
+      { wormholeId: 26, nestedWormholeId: 26, wormholeName: "B274" },
+    ]) {
+      const projection = project(relation);
+      expect(projection.blockers).toEqual([]);
+      expect((projection.candidate.signatures as any[])[0]).toMatchObject({
+        sigType: "wormhole", whType: relation.wormholeName || "",
+      });
+    }
+  });
+
+  it("projects prototype-named unsupported categories as valid unknown signatures", () => {
+    for (const category of ["constructor", "toString", "__proto__"]) {
+      const result = completeSourceSnapshot();
+      expect(result.ok).toBe(true);
+      if (!result.ok) continue;
+      for (const evidence of result.fixture.sourceSignatureEvidence!) evidence.signatureCategoryName = category;
+      const projection = topologyProjectionFromFixture(result.fixture);
+      expect(projection.blockers).toEqual([]);
+      const signatures = projection.candidate.signatures as Array<{ sigType: string; whType: string }>;
+      expect(signatures).toHaveLength(2);
+      expect(signatures.every(signature => signature.sigType === "unknown" && signature.whType === "")).toBe(true);
+      expect(projection.diagnostics).toHaveLength(2);
+      expect(projection.diagnostics.every(message => message.includes("type_unmapped"))).toBe(true);
+      const validated = validateWormholesystemsTopologyRequest(projection.candidate, now);
+      expect(validated.blockers).toEqual([]);
+      expect(validated.request?.signatures).toHaveLength(2);
+    }
+  });
+
+  it("projects all source-present signatures in a mixed 100-row v3 snapshot", () => {
+    const names = ["Wormhole", "Data Site", "Relic Site", "Combat Site", "Gas Site", "Ore Site", "Homefront Operations", "Factional Warfare Site"];
+    const types: Record<string, string> = { Wormhole: "wormhole", "Data Site": "data", "Relic Site": "relic",
+      "Combat Site": "combat", "Gas Site": "gas", "Ore Site": "ore" };
+    const signatures = Array.from({ length: 100 }, (_, index) => {
+      const name = names[index % names.length];
+      const categoryId = index % names.length + 1;
+      const typeId = 1_000 + index;
+      return { id: `signature-resource-${String(index).padStart(3, "0")}`, signature_id: `SIG-${String(index).padStart(3, "0")}`,
+        map_solarsystem_id: "member", signature_category_id: categoryId, signature_category: { id: categoryId, name },
+        signature_type_id: typeId, signature_type: { id: typeId, signature_category_id: categoryId, name: "Combat Site" } };
+    });
+    const normalized = normalizeSourceSnapshot({ mapId: "source-map", canonicalMapId: "target-map",
+      sourceIdentity: `wormholesystems:${JSON.stringify(["https://source.example", "source-map"])}`,
+      revisionOrDigest: "100-row-digest", fetchedAt: at,
+      detail: { data: { id: "source-map", map_solarsystems: [{ id: "member", map_id: "source-map", solarsystem_id: 31_000_001 }], map_connections: [] } },
+      systemDetails: [{ data: { id: "member", map_id: "source-map", solarsystem_id: 31_000_001,
+        signatures, map_connections: [], audits: [] } }],
+    });
+    expect(normalized.ok).toBe(true);
+    if (!normalized.ok) return;
+    const projection = topologyProjectionFromFixture(normalized.fixture);
+    expect(projection.blockers).toEqual([]);
+    const rows = projection.candidate.signatures as Array<{ sourceSignatureId: string; sigType: string; whType: string }>;
+    expect(rows).toHaveLength(100);
+    for (const [index, name] of names.entries()) {
+      const row = rows.find(item => item.sourceSignatureId === `signature-resource-${String(index).padStart(3, "0")}`);
+      expect(row).toMatchObject({ sigType: types[name] ?? "unknown", whType: "" });
+    }
+    expect(rows.filter(row => row.sigType === "unknown")).toHaveLength(24);
+  });
+
+  it("requires a newly validated v3 source fixture for projection and never upgrades v2 evidence", () => {
+    const result = completeSourceSnapshot();
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const legacy = structuredClone(result.fixture);
+    legacy.schemaVersion = 2;
+    const projection = topologyProjectionFromFixture(legacy);
+    expect(projection.blockers).toContain("signatures: a newly fetched version-3 classification snapshot is required for data writes");
+  });
+
   it("requires signature-side connection references to match a present edge and its scanner endpoint", () => {
     const normalized = completeSourceSnapshot();
     expect(normalized.ok).toBe(true);
