@@ -10,7 +10,7 @@ import { canonicalSolarSystemClassFromSde } from "../../src/wormholesystems.js";
 const now = Date.parse("2026-10-13T12:00:00.000Z");
 const at = new Date(now - 1_000).toISOString();
 
-function completeSourceSnapshot() {
+function completeSourceSnapshot(detailPosition?: { memberId: string; position: unknown }) {
   const mapId = "source-map";
   const rows = [
     { id: "member-home", map_id: mapId, solarsystem_id: 31_000_001, alias: "0", status: "SAFE", position: { x: 10, y: 20 } },
@@ -19,13 +19,14 @@ function completeSourceSnapshot() {
   const sigA = { id: "signature-resource-a", signature_id: "ABC-123", map_solarsystem_id: "member-home", map_connection_id: "edge-a" };
   const sigB = { id: "signature-resource-b", signature_id: "DEF-456", map_solarsystem_id: "member-branch", map_connection_id: "edge-a" };
   const edge = { id: "edge-a", from_map_solarsystem_id: "member-home", to_map_solarsystem_id: "member-branch",
-    type: "standard", ship_size: "medium", mass_status: "critical", lifetime_status: "expired",
+    type: "wormhole", ship_size: "medium", mass_status: "critical", lifetime_status: "expired",
     signatures: [
       { id: sigA.id, signature_id: sigA.signature_id, map_solarsystem_id: sigA.map_solarsystem_id },
       { id: sigB.id, signature_id: sigB.signature_id, map_solarsystem_id: sigB.map_solarsystem_id },
     ] };
   const detailFor = (id: string, eveId: number, signature: typeof sigA) => ({ data: {
     id, map_id: mapId, solarsystem_id: eveId, alias: rows.find(row => row.id === id)!.alias,
+    ...(detailPosition?.memberId === id ? { position: detailPosition.position } : {}),
     signatures: [{ ...signature, status: "inactive" }], map_connections: [edge], audits: [],
   } });
   return normalizeSourceSnapshot({ mapId, canonicalMapId: "target-map",
@@ -38,6 +39,13 @@ function completeSourceSnapshot() {
 }
 
 describe("WormholeSystems source-owned Nexum reconciliation", () => {
+  it("rejects a selected-system position that contradicts the map member canvas position", () => {
+    const result = completeSourceSnapshot({ memberId: "member-home", position: { x: 999, y: 20 } });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.issues).toContainEqual({ path: "$.systemDetails[0].data.position",
+      reason: "selected-system position contradicts the selected map member position" });
+  });
+
   it("renders destination classes from canonical SDE data, never target-map classes", () => {
     const db = new Database(":memory:");
     db.exec("CREATE TABLE mapSolarSystems (solarSystemID INTEGER PRIMARY KEY, security REAL); CREATE TABLE mapLocationWormholeClasses (locationID INTEGER PRIMARY KEY, wormholeClassID INTEGER)");
@@ -63,20 +71,26 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
     const fixture = result.fixture;
     const request = validateWormholesystemsTopologyRequest(topologyCandidateFromFixture(fixture), now);
     expect(request).toEqual({ request: {
+      schemaVersion: 2,
       sourceIdentity: `wormholesystems:${JSON.stringify(["https://source.example", "source-map"])}`,
       snapshot: { complete: true, fetchedAt: at },
       systems: [
-        { sourceSystemId: "member-home", eveSystemId: 31_000_001, positionX: 10, positionY: 20 },
         { sourceSystemId: "member-branch", eveSystemId: 31_000_002, positionX: 30, positionY: 40 },
+        { sourceSystemId: "member-home", eveSystemId: 31_000_001, positionX: 10, positionY: 20 },
       ],
       connections: [{ sourceConnectionId: "edge-a", fromSourceSystemId: "member-home", toSourceSystemId: "member-branch",
+        fromSourceSignatureId: "signature-resource-a", toSourceSignatureId: "signature-resource-b",
         connection_type: "standard", ship_size: "medium" }],
+      signatures: [
+        { sourceSignatureId: "signature-resource-a", sourceSystemId: "member-home", sigId: "ABC-123", sigType: "unknown", whType: "" },
+        { sourceSignatureId: "signature-resource-b", sourceSystemId: "member-branch", sigId: "DEF-456", sigType: "unknown", whType: "" },
+      ],
     }, blockers: [] });
     expect(Object.keys(request.request!.snapshot).sort()).toEqual(["complete", "fetchedAt"]);
-    expect(Object.keys(request.request!.connections[0]).sort()).toEqual(["connection_type", "fromSourceSystemId", "ship_size", "sourceConnectionId", "toSourceSystemId"]);
+    expect(Object.keys(request.request!.connections[0]).sort()).toEqual(["connection_type", "fromSourceSignatureId", "fromSourceSystemId", "ship_size", "sourceConnectionId", "toSourceSignatureId", "toSourceSystemId"]);
     expect(fixture.connections).toMatchObject([{ sourceConnectionId: "edge-a", state: "unknown" }]);
     expect(fixture.topologyEvidence?.connections).toEqual([{ sourceConnectionId: "edge-a", fromSourceSystemId: "member-home",
-      toSourceSystemId: "member-branch", connectionType: "standard", size: "medium" }]);
+      toSourceSystemId: "member-branch", connectionType: "wormhole", size: "medium" }]);
     expect(fixture.allianceNoteEvidence).toMatchObject({ knownStatusAnnotations: ["HOSTILE", "SAFE"],
       connections: [{ sourceConnectionId: "edge-a", size: "medium" }] });
     expect(fixture.allianceNoteEvidence?.systems).toEqual(expect.arrayContaining([
@@ -88,15 +102,36 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
     expect(request.request?.connections).toHaveLength(1);
   });
 
-  it("blocks missing coordinates and unsupported source type/ship size without inventing defaults", () => {
+  it("omits unavailable coordinate pairs and rejects partial or malformed pairs", () => {
     const normalized = completeSourceSnapshot();
     expect(normalized.ok).toBe(true);
     if (!normalized.ok) return;
+    const evidence = normalized.fixture.topologyEvidence!;
+    evidence.systems = evidence.systems.map(system => system.sourceSystemId === "member-home"
+      ? { ...system, positionX: null, positionY: null } : system);
     const candidate = topologyCandidateFromFixture(normalized.fixture);
-    const systems = (candidate.systems as any[]).map((row, index) => index ? row : { ...row, positionX: null });
-    const missingPosition = validateWormholesystemsTopologyRequest({ ...candidate, systems }, now);
-    expect(missingPosition.request).toBeUndefined();
-    expect(missingPosition.blockers).toContain("systems[0].positionX: verified source-owned map position is unavailable");
+    const homeCandidate = (candidate.systems as any[]).find(row => row.sourceSystemId === "member-home");
+    expect(homeCandidate).not.toHaveProperty("positionX");
+    expect(homeCandidate).not.toHaveProperty("positionY");
+    const unavailablePair = validateWormholesystemsTopologyRequest(candidate, now);
+    expect(unavailablePair.blockers).toEqual([]);
+    const homeRequest = unavailablePair.request?.systems.find(row => row.sourceSystemId === "member-home");
+    expect(homeRequest).toBeDefined();
+    // No coordinates are serialized: Nexum can use its creation default without overwriting existing/manual positions.
+    expect(homeRequest).not.toHaveProperty("positionX");
+    expect(homeRequest).not.toHaveProperty("positionY");
+
+    const partialSystems = (candidate.systems as any[]).map(row => row.sourceSystemId === "member-branch"
+      ? { ...row, positionY: null } : row);
+    const partialPosition = validateWormholesystemsTopologyRequest({ ...candidate, systems: partialSystems }, now);
+    expect(partialPosition.request).toBeUndefined();
+    expect(partialPosition.blockers).toContain("systems[0].positionY: verified source-owned map position is unavailable");
+
+    const malformedSystems = (candidate.systems as any[]).map(row => row.sourceSystemId === "member-branch"
+      ? { ...row, positionX: "30" } : row);
+    const malformedPosition = validateWormholesystemsTopologyRequest({ ...candidate, systems: malformedSystems }, now);
+    expect(malformedPosition.request).toBeUndefined();
+    expect(malformedPosition.blockers).toContain("systems[0].positionX: verified source-owned map position is unavailable");
 
     const connections = (candidate.connections as any[]).map(row => ({ ...row, connection_type: "wormhole", ship_size: "xlarge" }));
     const unsupported = validateWormholesystemsTopologyRequest({ ...candidate, connections }, now);
@@ -131,15 +166,43 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
     expect(fixture.topologyEvidence).not.toHaveProperty("maxAgeMs");
   });
 
+  it("requires a recognized accepted or replayed checkpoint before treating counters as a reconciliation result", () => {
+    const counts = { createdSystems: 0, preservedSystems: 0, updatedSystems: 0, deletedSystems: 0,
+      createdConnections: 0, preservedConnections: 0, updatedConnections: 0, deletedConnections: 0,
+      createdSignatures: 0, preservedSignatures: 0, updatedSignatures: 0, deletedSignatures: 0, conflicts: [] };
+    expect(summarizeTopologyWriteResponse(counts)).toMatchObject({ reconciliation_status: "unknown", checkpoint: null });
+    expect(summarizeTopologyWriteResponse({ ...counts, checkpoint: { accepted: "yes", replayed: false, partial: false } }))
+      .toMatchObject({ reconciliation_status: "unknown", checkpoint: null });
+    expect(summarizeTopologyWriteResponse({ ...counts, checkpoint: { accepted: true } }))
+      .toMatchObject({ reconciliation_status: "unknown", checkpoint: null });
+    expect(summarizeTopologyWriteResponse({ ...counts, checkpoint: { accepted: true, replayed: false, partial: false } }))
+      .toMatchObject({ reconciliation_status: "unchanged", checkpoint: { accepted: true, replayed: false, partial: false } });
+    expect(summarizeTopologyWriteResponse({ ...counts, checkpoint: { accepted: false, replayed: true, partial: false } }))
+      .toMatchObject({ reconciliation_status: "unchanged", checkpoint: { accepted: false, replayed: true, partial: false } });
+    expect(summarizeTopologyWriteResponse({ ...counts, checkpoint: { accepted: false, replayed: false, partial: false } }))
+      .toMatchObject({ reconciliation_status: "unknown", checkpoint: { accepted: false, replayed: false, partial: false } });
+  });
+
   it("reports row-level conflicts and no-op outcomes separately from successful request submission", () => {
-    expect(summarizeTopologyWriteResponse({ createdSystems: 1, preservedSystems: 2, updatedSystems: 0, deletedSystems: 0,
+    const summary = summarizeTopologyWriteResponse({ createdSystems: 1, preservedSystems: 2, updatedSystems: 0, deletedSystems: 0,
       createdConnections: 0, preservedConnections: 1, updatedConnections: 0, deletedConnections: 0,
-      conflicts: [{ itemId: "safe-id", reason: "preserved" }, { itemId: "other-id", reason: "conflict" }] }))
-      .toEqual({ request_status: "succeeded", status: "completed", reconciliation_status: "partial",
+      createdSignatures: 0, preservedSignatures: 0, updatedSignatures: 0, deletedSignatures: 0,
+      mappings: { systems: [{ sourceSystemId: "source-member", nexumSystemId: "nexum-row", ownership: "owned", status: "created",
+        notes: "private note must not be exposed" }] }, snapshotFetchedAt: at, payloadDigest: "a".repeat(64),
+      checkpoint: { accepted: true, replayed: false, partial: true },
+      conflicts: [{ itemId: "safe-id", reason: "preserved" }, { itemId: "other-id", reason: "conflict" }] });
+    expect(summary).toMatchObject({ request_status: "succeeded", status: "completed", reconciliation_status: "partial",
         created_systems: 1, updated_systems: 0, deleted_systems: 0, preserved_systems: 2,
-        created_connections: 0, updated_connections: 0, deleted_connections: 0, preserved_connections: 1, conflict_count: 2 });
+        created_connections: 0, updated_connections: 0, deleted_connections: 0, preserved_connections: 1,
+        created_signatures: 0, updated_signatures: 0, deleted_signatures: 0, preserved_signatures: 0, conflict_count: 2,
+        conflicts: expect.arrayContaining([expect.objectContaining({ source_id: "safe-id", reason: "Nexum reported a row-level reconciliation conflict" })]),
+        mappings: [{ kind: "system", source_id: "source-member", nexum_row_id: "nexum-row", ownership: "owned", status: "created" }],
+        snapshot_fetched_at: at, payload_digest: "a".repeat(64), checkpoint: { accepted: true, replayed: false, partial: true } });
+    expect(JSON.stringify(summary)).not.toContain("private note must not be exposed");
     expect(summarizeTopologyWriteResponse({ createdSystems: 0, preservedSystems: 0, updatedSystems: 0, deletedSystems: 0,
-      createdConnections: 0, preservedConnections: 0, updatedConnections: 0, deletedConnections: 0, conflicts: [] }))
+      createdConnections: 0, preservedConnections: 0, updatedConnections: 0, deletedConnections: 0,
+      createdSignatures: 0, preservedSignatures: 0, updatedSignatures: 0, deletedSignatures: 0, conflicts: [],
+      checkpoint: { accepted: true, replayed: false, partial: false } }))
       .toMatchObject({ request_status: "succeeded", status: "completed", reconciliation_status: "unchanged", conflict_count: 0 });
   });
 });

@@ -16,6 +16,14 @@ export type AdapterResult =
   | { ok: false; issues: AdapterIssue[] };
 
 const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
+const sourcePosition = (value: unknown, path: string, issues: AdapterIssue[]): { x: number; y: number } | null => {
+  if (!record(value)) { issues.push({ path, reason: "expected source canvas coordinates" }); return null; }
+  const x = value.x, y = value.y;
+  const valid = (coordinate: unknown): coordinate is number => typeof coordinate === "number" && Number.isFinite(coordinate) && Math.abs(coordinate) <= 1_000_000;
+  if (!valid(x)) issues.push({ path: `${path}.x`, reason: "expected a bounded finite source coordinate" });
+  if (!valid(y)) issues.push({ path: `${path}.y`, reason: "expected a bounded finite source coordinate" });
+  return valid(x) && valid(y) ? { x, y } : null;
+};
 const opaque = (value: unknown, path: string, issues: AdapterIssue[]): string | null => {
   if ((typeof value !== "string" && !(typeof value === "number" && Number.isSafeInteger(value))) ||
       !String(value).trim() || String(value).length > 256 || /[\u0000-\u001f\u007f]/.test(String(value))) {
@@ -74,6 +82,7 @@ export function validateSourceMapDetail(value: unknown, expectedMapId: string): 
     const rowId = opaque(row.id, `${path}.id`, issues);
     const rowMapId = opaque(row.map_id, `${path}.map_id`, issues);
     eveId(row.solarsystem_id, `${path}.solarsystem_id`, issues);
+    if (row.position !== undefined && row.position !== null) sourcePosition(row.position, `${path}.position`, issues);
     if (rowMapId !== expectedMapId) issues.push({ path: `${path}.map_id`, reason: "map solar-system row is outside selected map scope" });
     if (rowId && mapRows.has(rowId)) issues.push({ path: `${path}.id`, reason: "duplicate map solar-system identity" });
     if (rowId) mapRows.add(rowId);
@@ -98,6 +107,13 @@ export function normalizeSourceSnapshot(input: {
   const detail = validated.detail;
   const observedAt = observedTime(detail.observed_at, "$.data.observed_at", issues);
   const mapSystems = detail.map_solarsystems as Array<Record<string, unknown>>;
+  const positionsByMember = new Map<string, { x: number; y: number }>();
+  mapSystems.forEach((row, index) => {
+    if (row.position === undefined || row.position === null) return;
+    const rowId = opaque(row.id, `$.data.map_solarsystems[${index}].id`, issues);
+    const position = sourcePosition(row.position, `$.data.map_solarsystems[${index}].position`, issues);
+    if (rowId && position) positionsByMember.set(rowId, position);
+  });
   if (input.systemDetails.length !== mapSystems.length || input.systemDetails.length > 100)
     issues.push({ path: "$.systemDetails", reason: "map-system detail count does not match map scope" });
 
@@ -173,6 +189,13 @@ export function normalizeSourceSnapshot(input: {
     const expectedEveId = eveId(mapSystem.solarsystem_id, `${path}.mapSystem.solarsystem_id`, issues);
     if (detailId !== mapSystemId || mapId !== input.mapId || detailEveId !== expectedEveId)
       issues.push({ path: `${path}.data`, reason: "selected map-solar-system detail identity or scope mismatch" });
+    if (body.position !== undefined && body.position !== null) {
+      const detailPosition = sourcePosition(body.position, `${path}.data.position`, issues);
+      const mapPosition = positionsByMember.get(mapSystemId ?? "");
+      if (detailPosition && mapPosition && (detailPosition.x !== mapPosition.x || detailPosition.y !== mapPosition.y))
+        issues.push({ path: `${path}.data.position`, reason: "selected-system position contradicts the selected map member position" });
+      else if (detailPosition && !mapPosition && mapSystemId) positionsByMember.set(mapSystemId, detailPosition);
+    }
     for (const [collection, max] of [["signatures", 2_000], ["map_connections", 2_000], ["audits", 10_000]] as const)
       if (!Array.isArray(body[collection]) || body[collection]!.length > max)
         issues.push({ path: `${path}.data.${collection}`, reason: "expected a bounded source array" });
@@ -395,10 +418,9 @@ export function normalizeSourceSnapshot(input: {
   const topologySystems = mapSystems.map((row, index) => {
     const sourceSystemId = opaque(row.id, `$.data.map_solarsystems[${index}].id`, issues);
     const eveSystemId = eveId(row.solarsystem_id, `$.data.map_solarsystems[${index}].solarsystem_id`, issues);
-    const position = record(row.position) ? row.position : {};
-    const coordinateValue = (value: unknown) => typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= 1_000_000 ? value : null;
+    const position = positionsByMember.get(sourceSystemId ?? "");
     return { sourceSystemId: sourceSystemId ?? "", eveSystemId: eveSystemId ?? 0,
-      positionX: coordinateValue(position.x), positionY: coordinateValue(position.y) };
+      positionX: position?.x ?? null, positionY: position?.y ?? null };
   });
   const sourceValue = (value: unknown): string | null => typeof value === "string" && value.length > 0 && value.length <= 128 &&
     value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value) ? value : null;
