@@ -25,6 +25,10 @@ export type ValidatedSourceSignatureEvidence = {
   signatureCode?: string | null;
   signatureTypeId?: SourceClassificationScalar;
   signatureCategoryId?: SourceClassificationScalar;
+  signatureCategoryName?: string | null;
+  nestedSignatureCategoryId?: SourceClassificationScalar;
+  nestedSignatureTypeId?: SourceClassificationScalar;
+  signatureTypeCategoryId?: SourceClassificationScalar;
   wormholeId?: SourceClassificationScalar;
   nestedWormholeId?: SourceClassificationScalar;
   wormholeName?: SourceClassificationScalar;
@@ -33,7 +37,7 @@ export type ValidatedSourceSignatureEvidence = {
 export type WormholeSystemsFixture = {
   fixtureOnly: true;
   sourceKind?: "synthetic" | "wormholesystems";
-  schemaVersion: 1 | 2;
+  schemaVersion: 1 | 2 | 3;
   sourceIdentity: string;
   revisionOrDigest: string;
   fetchedAt: string;
@@ -71,7 +75,7 @@ export type WormholeSystemsFixture = {
   topologyEvidence?: ValidatedTopologyEvidence;
   /** Present only after aliases and explicit alliance annotations have validated source semantics. */
   allianceNoteEvidence?: ValidatedAllianceNoteEvidence;
-  /** Version-2 source snapshot's allowlisted full-detail classification evidence. */
+  /** Versioned source snapshots' allowlisted full-detail classification evidence. */
   sourceSignatureEvidence?: ValidatedSourceSignatureEvidence[];
   authorityMetadata: { confirmed: false; fields: null };
   /** Raw validated source fields are retained as opaque JSON, never interpreted as authority. */
@@ -164,7 +168,7 @@ const enumValue = <T extends string>(value: unknown, values: readonly T[], path:
 };
 const identity = (scanner: number, code: string, sourceId: string | null) => `${scanner}\0${code}\0${sourceId ?? ""}`;
 
-/** Strict validator for the local, explicitly synthetic v1 fixture contract. */
+/** Strict validator for local synthetic fixtures and versioned source snapshots. */
 export function validateWormholeSystemsFixture(input: unknown): FixtureValidationResult {
   const issues: FixtureValidationIssue[] = [];
   if (!isRecord(input)) return { ok: false, issues: [{ path: "$", reason: "expected an object" }] };
@@ -177,11 +181,11 @@ export function validateWormholeSystemsFixture(input: unknown): FixtureValidatio
     issues.push({ path: "$.sourceKind", reason: "unsupported source kind" });
   if (input.sourceKind === "wormholesystems" && nonempty(input.sourceIdentity, "$.sourceIdentity", issues) && !input.sourceIdentity.startsWith("wormholesystems:"))
     issues.push({ path: "$.sourceIdentity", reason: "source snapshot identity must be labeled wormholesystems:" });
-  if (input.schemaVersion !== 1 && input.schemaVersion !== 2) issues.push({ path: "$.schemaVersion", reason: "unsupported fixture schema version" });
-  if (input.schemaVersion === 2 && input.sourceKind !== "wormholesystems")
-    issues.push({ path: "$.schemaVersion", reason: "version 2 is reserved for validated WormholeSystems source snapshots" });
+  if (input.schemaVersion !== 1 && input.schemaVersion !== 2 && input.schemaVersion !== 3) issues.push({ path: "$.schemaVersion", reason: "unsupported fixture schema version" });
+  if ((input.schemaVersion === 2 || input.schemaVersion === 3) && input.sourceKind !== "wormholesystems")
+    issues.push({ path: "$.schemaVersion", reason: "version 2 and 3 are reserved for validated WormholeSystems source snapshots" });
   if (input.schemaVersion === 1 && input.sourceSignatureEvidence !== undefined)
-    issues.push({ path: "$.sourceSignatureEvidence", reason: "classification evidence requires a version-2 source snapshot" });
+    issues.push({ path: "$.sourceSignatureEvidence", reason: "classification evidence requires a version-2 or version-3 source snapshot" });
   if (input.sourceKind !== "wormholesystems" && nonempty(input.sourceIdentity, "$.sourceIdentity", issues) && !input.sourceIdentity.startsWith("synthetic:"))
     issues.push({ path: "$.sourceIdentity", reason: "offline fixture identity must be labeled synthetic:" });
   nonempty(input.revisionOrDigest, "$.revisionOrDigest", issues);
@@ -224,20 +228,25 @@ export function validateWormholeSystemsFixture(input: unknown): FixtureValidatio
     timestamp(row.freshUntil, `${p}.freshUntil`, issues, true);
   });
 
-  if (input.sourceSignatureEvidence !== undefined || input.schemaVersion === 2) {
+  if (input.sourceSignatureEvidence !== undefined || input.schemaVersion === 2 || input.schemaVersion === 3) {
     if (!Array.isArray(input.sourceSignatureEvidence)) issues.push({ path: "$.sourceSignatureEvidence", reason: "expected versioned source signature evidence" });
     else {
       if (input.sourceSignatureEvidence.length > 200_000) issues.push({ path: "$.sourceSignatureEvidence", reason: "source signature evidence exceeds its bound" });
       input.sourceSignatureEvidence.forEach((row, index) => {
         const p = `$.sourceSignatureEvidence[${index}]`;
         if (!isRecord(row)) { issues.push({ path: p, reason: "expected a source signature evidence record" }); return; }
-        const allowed = ["sourceSignatureId", "scannerEveSystemId", "signatureCode", "signatureTypeId", "signatureCategoryId", "wormholeId", "nestedWormholeId", "wormholeName"];
+        const allowed = ["sourceSignatureId", "scannerEveSystemId", "signatureCode", "signatureTypeId", "signatureCategoryId", "signatureCategoryName",
+          "nestedSignatureCategoryId", "nestedSignatureTypeId", "signatureTypeCategoryId", "wormholeId", "nestedWormholeId", "wormholeName"];
         for (const key of ["sourceSignatureId", "scannerEveSystemId"]) if (!(key in row)) issues.push({ path: `${p}.${key}`, reason: "required field is missing" });
         for (const key of Object.keys(row)) if (!allowed.includes(key)) issues.push({ path: `${p}.${key}`, reason: "unrecognized field" });
+        if (input.schemaVersion === 2) for (const key of ["signatureCategoryName", "nestedSignatureCategoryId", "nestedSignatureTypeId", "signatureTypeCategoryId"])
+          if (Object.prototype.hasOwnProperty.call(row, key))
+            issues.push({ path: `${p}.${key}`, reason: "v3 category evidence is not valid in a legacy v2 source snapshot" });
         nonempty(row.sourceSignatureId, `${p}.sourceSignatureId`, issues);
         eveId(row.scannerEveSystemId, `${p}.scannerEveSystemId`, issues);
         if ("signatureCode" in row && row.signatureCode !== null) nonempty(row.signatureCode, `${p}.signatureCode`, issues, 64);
-        for (const key of ["signatureTypeId", "signatureCategoryId", "wormholeId", "nestedWormholeId", "wormholeName"] as const) {
+        for (const key of ["signatureTypeId", "signatureCategoryId", "nestedSignatureCategoryId", "nestedSignatureTypeId",
+          "signatureTypeCategoryId", "wormholeId", "nestedWormholeId", "wormholeName"] as const) {
           if (!(key in row) || row[key] === null) continue;
           const value = row[key];
           const valid = key === "wormholeName"
@@ -246,13 +255,27 @@ export function validateWormholeSystemsFixture(input: unknown): FixtureValidatio
               (typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
           if (!valid) issues.push({ path: `${p}.${key}`, reason: "expected a bounded exact source scalar or null" });
         }
+        if ("signatureCategoryName" in row && row.signatureCategoryName !== null &&
+            (typeof row.signatureCategoryName !== "string" || row.signatureCategoryName.length > 128 ||
+             row.signatureCategoryName.trim() !== row.signatureCategoryName || /\p{Cc}/u.test(row.signatureCategoryName)))
+          issues.push({ path: `${p}.signatureCategoryName`, reason: "expected a bounded exact source category name or null" });
+        const consistentIds = (keys: string[]) => {
+          const present = keys.filter(key => Object.prototype.hasOwnProperty.call(row, key)).map(key => row[key]);
+          const nonNull = present.filter(value => value !== null);
+          if (nonNull.some(value => String(value) !== String(nonNull[0])))
+            issues.push({ path: p, reason: "source classification identity references disagree" });
+          if (nonNull.length && present.some(value => value === null))
+            issues.push({ path: p, reason: "explicit null source classification identity contradicts a non-null reference" });
+        };
+        consistentIds(["signatureTypeId", "nestedSignatureTypeId"]);
+        consistentIds(["signatureCategoryId", "nestedSignatureCategoryId", "signatureTypeCategoryId"]);
         if (row.wormholeId !== undefined && row.nestedWormholeId !== undefined && row.wormholeId !== null && row.nestedWormholeId !== null &&
             String(row.wormholeId) !== String(row.nestedWormholeId))
           issues.push({ path: p, reason: "direct and nested wormhole IDs disagree" });
         if (row.wormholeId === null && row.nestedWormholeId !== undefined && row.nestedWormholeId !== null)
           issues.push({ path: p, reason: "direct null wormhole ID contradicts the nested wormhole ID" });
       });
-      if (input.schemaVersion === 2 && input.sourceKind === "wormholesystems" && Array.isArray(input.signatures)) {
+      if ((input.schemaVersion === 2 || input.schemaVersion === 3) && input.sourceKind === "wormholesystems" && Array.isArray(input.signatures)) {
         const evidenceRows = input.sourceSignatureEvidence as Array<Record<string, unknown>>;
         if (evidenceRows.length !== input.signatures.length)
           issues.push({ path: "$.sourceSignatureEvidence", reason: "classification evidence must cover every full-detail source signature" });

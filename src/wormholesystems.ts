@@ -609,11 +609,12 @@ export class WormholeSystemsService {
       const payload = JSON.parse(row.payload_json);
       const fixture = payload?.fixture;
       const supportedSnapshotVersion = (payload?.schema === "wormholesystems-source-v1" && payload?.adapterVersion === 1 && fixture?.schemaVersion === 1) ||
-        (payload?.schema === "wormholesystems-source-v2" && payload?.adapterVersion === 2 && fixture?.schemaVersion === 2);
+        (payload?.schema === "wormholesystems-source-v2" && payload?.adapterVersion === 2 && fixture?.schemaVersion === 2) ||
+        (payload?.schema === "wormholesystems-source-v3" && payload?.adapterVersion === 3 && fixture?.schemaVersion === 3);
       if (!supportedSnapshotVersion || fixture?.sourceKind !== "wormholesystems")
         blockers.push("stored snapshot does not match the validated adapter version");
-      if (payload?.schema === "wormholesystems-source-v1" && payload?.adapterVersion === 1)
-        blockers.push("source signature classification was not captured in this legacy v1 snapshot");
+      if (fixture?.schemaVersion !== 3)
+        blockers.push("stored v1/v2 source snapshot is read-only; a fresh validated v3 snapshot is required for writes");
       if (fixture?.revisionOrDigest !== row.revision_or_digest || fixture?.sourceIdentity !== row.source_identity || fixture?.fetchedAt !== row.fetched_at)
         blockers.push("stored source snapshot fields do not match the validated fixture");
     } catch {
@@ -801,9 +802,9 @@ export class WormholeSystemsService {
       try {
         const payload = JSON.parse(stored.payload_json);
         const parsed = validateWormholeSystemsFixture(payload?.fixture);
-        if (payload?.schema !== "wormholesystems-source-v2" || payload?.adapterVersion !== 2 || !parsed.ok ||
+        if (payload?.schema !== "wormholesystems-source-v3" || payload?.adapterVersion !== 3 || !parsed.ok ||
             stableJson(parsed.ok ? parsed.value : null) !== stableJson(fixture))
-          blockers.push("persisted source snapshot is not the exact validated version-2 fixture fetched by this invocation");
+          blockers.push("persisted source snapshot is not the exact validated version-3 fixture fetched by this invocation");
       } catch { blockers.push("persisted source snapshot is unavailable or malformed before the Nexum write"); }
     }
     const maxAge = policy.policy?.max_age_ms ?? 0;
@@ -885,7 +886,7 @@ export class WormholeSystemsService {
       let payload: any;
       try { payload = JSON.parse(stored.payload_json); } catch { return null; }
       const parsed = validateWormholeSystemsFixture(payload?.fixture);
-      if (payload?.schema !== "wormholesystems-source-v2" || payload?.adapterVersion !== 2 || !parsed.ok ||
+      if (payload?.schema !== "wormholesystems-source-v3" || payload?.adapterVersion !== 3 || !parsed.ok ||
           parsed.value.fetchedAt !== stored.fetched_at || parsed.value.sourceIdentity !== stored.source_identity ||
           parsed.value.revisionOrDigest !== stored.revision_or_digest) return null;
       const outcome = await this.reconcileFreshTopologyLocked(mapId, fetchedConfig, parsed.value,
@@ -999,7 +1000,7 @@ export class WormholeSystemsService {
           throw new WormholeSystemsError(0, 0, "WormholeSystems returned an older observed snapshot");
       }
       if (containsSecretValue(normalized.fixture.sourceMetadata, token)) throw new WormholeSystemsError(0, 0, "Malformed WormholeSystems source response");
-      const payload = { schema: "wormholesystems-source-v2", adapterVersion: 2, revisionOrdering,
+      const payload = { schema: "wormholesystems-source-v3", adapterVersion: 3, revisionOrdering,
         adapterDiagnostics: normalized.diagnostics, fixture: normalized.fixture };
       const payloadJson = JSON.stringify(payload);
       if (Buffer.byteLength(payloadJson, "utf8") > MAX_SOURCE_SNAPSHOT_BYTES)
@@ -1264,7 +1265,8 @@ export class WormholeSystemsService {
       let payload: Json | undefined;
       try { payload = JSON.parse(row.payload_json) as Json; } catch { payload = undefined; }
       const supportedSnapshotVersion = (payload?.schema === "wormholesystems-source-v1" && payload?.adapterVersion === 1 && payload.fixture?.schemaVersion === 1) ||
-        (payload?.schema === "wormholesystems-source-v2" && payload?.adapterVersion === 2 && payload.fixture?.schemaVersion === 2);
+        (payload?.schema === "wormholesystems-source-v2" && payload?.adapterVersion === 2 && payload.fixture?.schemaVersion === 2) ||
+        (payload?.schema === "wormholesystems-source-v3" && payload?.adapterVersion === 3 && payload.fixture?.schemaVersion === 3);
       if (!payload || !supportedSnapshotVersion || !payload.fixture || payload.fixture.sourceKind !== "wormholesystems") {
         const reason = "stored snapshot does not match the validated adapter version";
        return { ...current, eligible_for_matching: false, source_snapshot_eligible_for_matching: false,
@@ -1287,7 +1289,8 @@ export class WormholeSystemsService {
       }
       const sourceFixture = validatedFixture.value;
       const source = sourceFixture as unknown as Json;
-      const classificationCaptured = sourceFixture.schemaVersion === 2 && Array.isArray(sourceFixture.sourceSignatureEvidence);
+      const classificationCaptured = (sourceFixture.schemaVersion === 2 || sourceFixture.schemaVersion === 3) && Array.isArray(sourceFixture.sourceSignatureEvidence);
+      const categoryNameCaptured = sourceFixture.schemaVersion === 3;
       const classificationRows: ValidatedSourceSignatureEvidence[] = classificationCaptured
         ? sourceFixture.sourceSignatureEvidence!
         : sourceFixture.signatures.filter(signature => signature.sourceSignatureId !== null).map(signature => ({
@@ -1300,8 +1303,15 @@ export class WormholeSystemsService {
         ...(Object.prototype.hasOwnProperty.call(signature, "signatureCode") ? { signature_code: signature.signatureCode } : {}),
         scanner_eve_system_id: signature.scannerEveSystemId,
         classification_status: classificationCaptured ? "captured" : "not_captured_in_snapshot",
+        signature_category_name_status: !categoryNameCaptured ? "not_captured_in_snapshot"
+          : !Object.prototype.hasOwnProperty.call(signature, "signatureCategoryName") ? "source_absent"
+            : signature.signatureCategoryName === null ? "source_null" : "source_value",
         ...(classificationCaptured && Object.prototype.hasOwnProperty.call(signature, "signatureTypeId") ? { signature_type_id: signature.signatureTypeId } : {}),
         ...(classificationCaptured && Object.prototype.hasOwnProperty.call(signature, "signatureCategoryId") ? { signature_category_id: signature.signatureCategoryId } : {}),
+        ...(categoryNameCaptured && Object.prototype.hasOwnProperty.call(signature, "signatureCategoryName") ? { signature_category_name: signature.signatureCategoryName } : {}),
+        ...(categoryNameCaptured && Object.prototype.hasOwnProperty.call(signature, "nestedSignatureCategoryId") ? { nested_signature_category_id: signature.nestedSignatureCategoryId } : {}),
+        ...(categoryNameCaptured && Object.prototype.hasOwnProperty.call(signature, "nestedSignatureTypeId") ? { nested_signature_type_id: signature.nestedSignatureTypeId } : {}),
+        ...(categoryNameCaptured && Object.prototype.hasOwnProperty.call(signature, "signatureTypeCategoryId") ? { signature_type_category_id: signature.signatureTypeCategoryId } : {}),
         ...(classificationCaptured && Object.prototype.hasOwnProperty.call(signature, "wormholeId") ? { wormhole_id: signature.wormholeId } : {}),
         ...(classificationCaptured && Object.prototype.hasOwnProperty.call(signature, "nestedWormholeId") ? { nested_wormhole_id: signature.nestedWormholeId } : {}),
         ...(classificationCaptured && Object.prototype.hasOwnProperty.call(signature, "wormholeName") ? { wormhole_name: signature.wormholeName } : {}),

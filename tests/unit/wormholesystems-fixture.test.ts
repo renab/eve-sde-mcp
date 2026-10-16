@@ -127,6 +127,9 @@ describe("offline WormholeSystems canonical fixture boundary", () => {
       expect(valid.value.sourceSignatureEvidence?.[1]).not.toHaveProperty("signatureTypeId");
       expect(valid.value.sourceSignatureEvidence?.[1]).not.toHaveProperty("signatureCategoryId");
     }
+    const categoryEvidenceInV2 = version2();
+    categoryEvidenceInV2.sourceSignatureEvidence[0].signatureCategoryName = "Wormhole";
+    expect(validateWormholeSystemsFixture(categoryEvidenceInV2)).toMatchObject({ ok: false });
 
     const legacy = sourceFixture() as any;
     legacy.sourceKind = "wormholesystems";

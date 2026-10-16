@@ -21,6 +21,9 @@ const validTime = (value: unknown): value is string => typeof value === "string"
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/.test(value) && Number.isFinite(Date.parse(value));
 const coordinate = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= 1_000_000;
 const approvedMaxSnapshotAgeMs = 60_000;
+const sourceCategoryTypes = new Map<string, "data" | "relic" | "combat" | "gas" | "ore" | "wormhole">([
+  ["Wormhole", "wormhole"], ["Data Site", "data"], ["Relic Site", "relic"], ["Combat Site", "combat"], ["Gas Site", "gas"], ["Ore Site", "ore"],
+]);
 
 function validSourceIdentity(value: unknown): value is string {
   if (!safeId(value) || !value.startsWith("wormholesystems:")) return false;
@@ -244,8 +247,8 @@ export function topologyProjectionFromFixture(fixture: WormholeSystemsFixture): 
         connection_type: connectionType,
         ...(size ? { ship_size: size } : {}) };
     }).sort((a, b) => a.sourceConnectionId.localeCompare(b.sourceConnectionId));
-    if (fixture.schemaVersion !== 2 || fixture.sourceKind !== "wormholesystems" || !Array.isArray(fixture.sourceSignatureEvidence))
-      blockers.push("signatures: a newly fetched version-2 classification snapshot is required for data writes");
+    if (fixture.schemaVersion !== 3 || fixture.sourceKind !== "wormholesystems" || !Array.isArray(fixture.sourceSignatureEvidence))
+      blockers.push("signatures: a newly fetched version-3 classification snapshot is required for data writes");
     const evidenceById = new Map((fixture.sourceSignatureEvidence ?? []).map(signature => [signature.sourceSignatureId, signature]));
     const signatures = fixture.signatures.map((signature, index) => {
       const sourceSignatureId = signature.sourceSignatureId;
@@ -258,18 +261,28 @@ export function topologyProjectionFromFixture(fixture: WormholeSystemsFixture): 
         if (!Object.prototype.hasOwnProperty.call(classification, "signatureCode"))
           blockers.push(`signatures[${sourceSignatureId}].signature_id: source code assignment was not explicitly captured`);
       }
-      const hasWormholeId = (value: unknown) => value !== undefined && value !== null && value !== "";
+      const category = classification?.signatureCategoryName;
       const directWormholeId = classification?.wormholeId;
       const nestedWormholeId = classification?.nestedWormholeId;
-      const hasWormholeRelation = !!classification && (hasWormholeId(directWormholeId) || hasWormholeId(nestedWormholeId)) &&
-        (!hasWormholeId(directWormholeId) || !hasWormholeId(nestedWormholeId) || String(directWormholeId) === String(nestedWormholeId));
+      const hasDirectWormholeId = directWormholeId !== undefined && directWormholeId !== null && directWormholeId !== "";
+      const hasNestedWormholeId = nestedWormholeId !== undefined && nestedWormholeId !== null && nestedWormholeId !== "";
+      const hasWormholeIdEvidence = hasDirectWormholeId || hasNestedWormholeId;
+      const hasWormholeRelation = hasDirectWormholeId && hasNestedWormholeId && String(directWormholeId) === String(nestedWormholeId);
       const wormholeName = classification?.wormholeName;
-      const sigType = hasWormholeRelation ? "wormhole" : "unknown";
-      const whType = hasWormholeRelation && typeof wormholeName === "string" && wormholeName.length > 0 ? wormholeName : "";
-      if (classification && !hasWormholeRelation)
-        addDiagnostic(`signatures[${sourceSignatureId}]: source classification is unmapped or unavailable; projected as sigType "unknown" with empty whType`);
-      else if (classification && hasWormholeRelation && !whType)
-        addDiagnostic(`signatures[${sourceSignatureId}]: validated wormhole relation has no non-empty name; projected with empty whType`);
+      const sigType = typeof category === "string" ? sourceCategoryTypes.get(category) ?? "unknown" : "unknown";
+      const hasWormholeName = typeof wormholeName === "string" && wormholeName.length > 0;
+      const whType = category === "Wormhole" && hasWormholeRelation && hasWormholeName
+        ? wormholeName : "";
+      if (category === "Wormhole" && ((hasWormholeIdEvidence && !hasWormholeRelation) || (hasWormholeName && !hasWormholeRelation)))
+        blockers.push(`signatures[${sourceSignatureId}].wormhole_id: Wormhole classification has a partial or contradictory relation/name`);
+      if (["Data Site", "Relic Site", "Combat Site", "Gas Site", "Ore Site"].includes(String(category)) &&
+          ((directWormholeId !== undefined && directWormholeId !== null) || (nestedWormholeId !== undefined && nestedWormholeId !== null) ||
+            (typeof wormholeName === "string" && wormholeName.length > 0)))
+        blockers.push(`signatures[${sourceSignatureId}].wormhole_id: wormhole relation contradicts the validated non-wormhole category`);
+      if (sigType === "unknown")
+        addDiagnostic(`signatures[${sourceSignatureId}]: source category is absent or unsupported; projected as sigType "unknown" with empty whType (type_unmapped)`);
+      else if (category === "Wormhole" && hasWormholeRelation && !whType)
+        addDiagnostic(`signatures[${sourceSignatureId}]: validated Wormhole category has no non-empty related name; projected with empty whType`);
       return { sourceSignatureId: sourceSignatureId ?? "", sourceSystemId: sourceSystemId ?? "",
         sourceConnectionId: signature.sourceConnectionId,
         sigId: signature.signatureCode ?? "", sigType, whType };

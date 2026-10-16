@@ -48,6 +48,12 @@ const sourceClassificationScalar = (value: unknown, path: string, issues: Adapte
   issues.push({ path, reason: "expected a bounded exact source scalar or null" });
   return null;
 };
+const sourceCategoryName = (value: unknown, path: string, issues: AdapterIssue[]): string | null => {
+  if (value === null) return null;
+  if (typeof value === "string" && value.length <= 128 && value.trim() === value && !/\p{Cc}/u.test(value)) return value;
+  issues.push({ path, reason: "expected a bounded exact source category name or null" });
+  return null;
+};
 const observedTime = (value: unknown, path: string, issues: AdapterIssue[]): string | null => {
   if (value === undefined || value === null) return null;
   if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
@@ -245,6 +251,22 @@ export function normalizeSourceSnapshot(input: {
         evidence.signatureTypeId = sourceClassificationScalar(value.signature_type_id, `${signaturePath}.signature_type_id`, issues);
       if (Object.prototype.hasOwnProperty.call(value, "signature_category_id"))
         evidence.signatureCategoryId = sourceClassificationScalar(value.signature_category_id, `${signaturePath}.signature_category_id`, issues);
+      if (value.signature_category !== undefined && value.signature_category !== null && !record(value.signature_category))
+        issues.push({ path: `${signaturePath}.signature_category`, reason: "expected nullable signature category relationship" });
+      if (record(value.signature_category)) {
+        if (Object.prototype.hasOwnProperty.call(value.signature_category, "id"))
+          evidence.nestedSignatureCategoryId = sourceClassificationScalar(value.signature_category.id, `${signaturePath}.signature_category.id`, issues);
+        if (Object.prototype.hasOwnProperty.call(value.signature_category, "name"))
+          evidence.signatureCategoryName = sourceCategoryName(value.signature_category.name, `${signaturePath}.signature_category.name`, issues);
+      }
+      if (value.signature_type !== undefined && value.signature_type !== null && !record(value.signature_type))
+        issues.push({ path: `${signaturePath}.signature_type`, reason: "expected nullable signature type relationship" });
+      if (record(value.signature_type)) {
+        if (Object.prototype.hasOwnProperty.call(value.signature_type, "id"))
+          evidence.nestedSignatureTypeId = sourceClassificationScalar(value.signature_type.id, `${signaturePath}.signature_type.id`, issues);
+        if (Object.prototype.hasOwnProperty.call(value.signature_type, "signature_category_id"))
+          evidence.signatureTypeCategoryId = sourceClassificationScalar(value.signature_type.signature_category_id, `${signaturePath}.signature_type.signature_category_id`, issues);
+      }
       if (Object.prototype.hasOwnProperty.call(value, "wormhole_id"))
         evidence.wormholeId = sourceClassificationScalar(value.wormhole_id, `${signaturePath}.wormhole_id`, issues);
       if (record(value.wormhole)) {
@@ -253,6 +275,23 @@ export function normalizeSourceSnapshot(input: {
         if (Object.prototype.hasOwnProperty.call(value.wormhole, "name"))
           evidence.wormholeName = sourceClassificationScalar(value.wormhole.name, `${signaturePath}.wormhole.name`, issues, true);
       }
+      const validateIdentityReferences = (references: Array<{ present: boolean; value: string | number | null | undefined; path: string }>) => {
+        const present = references.filter(reference => reference.present);
+        const nonNull = present.filter(reference => reference.value !== null && reference.value !== undefined);
+        const disagrees = nonNull.some(reference => String(reference.value) !== String(nonNull[0]?.value));
+        const nullContradiction = nonNull.length > 0 && present.some(reference => reference.value === null);
+        if (disagrees || nullContradiction) for (const reference of present)
+          issues.push({ path: reference.path, reason: "source classification identity references disagree" });
+      };
+      validateIdentityReferences([
+        { present: Object.prototype.hasOwnProperty.call(value, "signature_type_id"), value: evidence.signatureTypeId, path: `${signaturePath}.signature_type_id` },
+        { present: record(value.signature_type) && Object.prototype.hasOwnProperty.call(value.signature_type, "id"), value: evidence.nestedSignatureTypeId, path: `${signaturePath}.signature_type.id` },
+      ]);
+      validateIdentityReferences([
+        { present: Object.prototype.hasOwnProperty.call(value, "signature_category_id"), value: evidence.signatureCategoryId, path: `${signaturePath}.signature_category_id` },
+        { present: record(value.signature_category) && Object.prototype.hasOwnProperty.call(value.signature_category, "id"), value: evidence.nestedSignatureCategoryId, path: `${signaturePath}.signature_category.id` },
+        { present: record(value.signature_type) && Object.prototype.hasOwnProperty.call(value.signature_type, "signature_category_id"), value: evidence.signatureTypeCategoryId, path: `${signaturePath}.signature_type.signature_category_id` },
+      ]);
       const signatureObservedAt = observedTime(value.observed_at, `${signaturePath}.observed_at`, issues);
       if (connectionId && !connectionById.has(connectionId))
         issues.push({ path: `${signaturePath}.map_connection_id`, reason: "signature references an unknown map connection" });
@@ -475,7 +514,7 @@ export function normalizeSourceSnapshot(input: {
   }));
 
   if (issues.length) return { ok: false, issues: issues.slice(0, 40) };
-  const canonical = normalizeWormholeSystemsFixture({ fixtureOnly: true, sourceKind: "wormholesystems", schemaVersion: 2,
+  const canonical = normalizeWormholeSystemsFixture({ fixtureOnly: true, sourceKind: "wormholesystems", schemaVersion: 3,
     sourceIdentity: input.sourceIdentity, revisionOrDigest: input.revisionOrDigest, fetchedAt: input.fetchedAt,
     observedAt, scope: { canonicalMapId: input.canonicalMapId, eveSolarSystemIds: systems.map(system => system.eveSolarSystemId) },
     systems, signatures, connections, sourceSignatureEvidence,
