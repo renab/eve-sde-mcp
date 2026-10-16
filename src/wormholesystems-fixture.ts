@@ -396,12 +396,18 @@ export function validateWormholeSystemsFixture(input: unknown): FixtureValidatio
 
   const signatureByKey = new Map<string, WormholeSystemsFixture["signatures"][number]>();
   const identitySet = new Set<string>();
+  const scannerCodes = new Set<string>();
   for (const [i, signature] of value.signatures.entries()) {
     if (signatureByKey.has(signature.signatureKey)) issues.push({ path: `$.signatures[${i}].signatureKey`, reason: "duplicate signature key" });
     signatureByKey.set(signature.signatureKey, signature);
     const key = identity(signature.scannerEveSystemId, signature.signatureCode ?? "", signature.sourceSignatureId);
     if (identitySet.has(key)) issues.push({ path: `$.signatures[${i}]`, reason: "duplicate directional signature identity" });
     identitySet.add(key);
+    if (signature.signatureCode !== null) {
+      const scannerCode = `${signature.scannerEveSystemId}\u0000${signature.signatureCode}`;
+      if (scannerCodes.has(scannerCode)) issues.push({ path: `$.signatures[${i}].signatureCode`, reason: "duplicate assigned scanner-side signature code" });
+      scannerCodes.add(scannerCode);
+    }
     if (!systemSet.has(signature.scannerEveSystemId)) issues.push({ path: `$.signatures[${i}].scannerEveSystemId`, reason: "scanner system is outside map scope" });
     if (signature.connectedEveSystemId !== null && !systemSet.has(signature.connectedEveSystemId))
       issues.push({ path: `$.signatures[${i}].connectedEveSystemId`, reason: "connected system is outside map scope" });

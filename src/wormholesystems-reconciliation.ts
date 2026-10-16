@@ -1,11 +1,15 @@
 import type { WormholeSystemsFixture } from "./wormholesystems-fixture.js";
 
 export type WormholesystemsTopologyRequest = {
+  schemaVersion: 2;
   sourceIdentity: string;
   snapshot: { complete: true; fetchedAt: string };
-  systems: Array<{ sourceSystemId: string; eveSystemId: number; positionX: number; positionY: number }>;
+  systems: Array<{ sourceSystemId: string; eveSystemId: number; positionX?: number; positionY?: number }>;
   connections: Array<{ sourceConnectionId: string; fromSourceSystemId: string; toSourceSystemId: string;
-    connection_type: "standard" | "gate" | "jumpgate" | "cyno"; ship_size: "small" | "medium" | "large" | "xl" }>;
+    fromSourceSignatureId: string | null; toSourceSignatureId: string | null;
+    connection_type: "standard" | "gate" | "jumpgate" | "cyno"; ship_size?: "small" | "medium" | "large" | "xl" }>;
+  signatures: Array<{ sourceSignatureId: string; sourceSystemId: string; sigId: string;
+    sigType: "data" | "relic" | "gas" | "ore" | "combat" | "wormhole" | "ghost" | "unknown"; whType: string }>;
 };
 
 type UnknownRecord = Record<string, unknown>;
@@ -36,8 +40,9 @@ export function validateWormholesystemsTopologyRequest(input: unknown, now = Dat
   if (!Number.isSafeInteger(maxSnapshotAgeMs) || maxSnapshotAgeMs <= 0)
     blockers.push("snapshot.fetchedAt: valid runtime staleness policy is unavailable");
   if (!record(input)) return { blockers: ["request: expected an object"] };
-  if (Object.keys(input).some(key => !["sourceIdentity", "snapshot", "systems", "connections"].includes(key)))
+  if (Object.keys(input).some(key => !["schemaVersion", "sourceIdentity", "snapshot", "systems", "connections", "signatures"].includes(key)))
     blockers.push("request: contains an unsupported field");
+  if (input.schemaVersion !== 2) blockers.push("schemaVersion: complete signature-inclusive version 2 is required");
   if (!validSourceIdentity(input.sourceIdentity)) blockers.push("sourceIdentity: missing or invalid canonical WormholeSystems identity");
 
   const snapshot = record(input.snapshot) ? input.snapshot : {};
@@ -63,8 +68,14 @@ export function validateWormholesystemsTopologyRequest(input: unknown, now = Dat
     if (!safeId(value.sourceSystemId)) blockers.push(`${path}.sourceSystemId: validated source member ID is required`);
     if (!Number.isSafeInteger(value.eveSystemId) || Number(value.eveSystemId) < 1 || Number(value.eveSystemId) > 2_147_483_647)
       blockers.push(`${path}.eveSystemId: validated EVE solar-system ID is required`);
-    if (!coordinate(value.positionX)) blockers.push(`${path}.positionX: verified source-owned map position is unavailable`);
-    if (!coordinate(value.positionY)) blockers.push(`${path}.positionY: verified source-owned map position is unavailable`);
+    const positionXUnavailable = value.positionX === undefined || value.positionX === null;
+    const positionYUnavailable = value.positionY === undefined || value.positionY === null;
+    const positionPairUnavailable = positionXUnavailable && positionYUnavailable;
+    const positionPairValid = coordinate(value.positionX) && coordinate(value.positionY);
+    if (!positionPairUnavailable && !positionPairValid) {
+      if (!coordinate(value.positionX)) blockers.push(`${path}.positionX: verified source-owned map position is unavailable`);
+      if (!coordinate(value.positionY)) blockers.push(`${path}.positionY: verified source-owned map position is unavailable`);
+    }
     if (safeId(value.sourceSystemId)) {
       if (sourceSystems.has(value.sourceSystemId)) blockers.push(`${path}.sourceSystemId: duplicate source member ID`);
       sourceSystems.add(value.sourceSystemId);
@@ -73,8 +84,9 @@ export function validateWormholesystemsTopologyRequest(input: unknown, now = Dat
       if (eveSystems.has(Number(value.eveSystemId))) blockers.push(`${path}.eveSystemId: duplicate EVE system ID`);
       eveSystems.add(Number(value.eveSystemId));
     }
-    if (safeId(value.sourceSystemId) && Number.isSafeInteger(value.eveSystemId) && coordinate(value.positionX) && coordinate(value.positionY))
-      systems.push({ sourceSystemId: value.sourceSystemId, eveSystemId: Number(value.eveSystemId), positionX: value.positionX, positionY: value.positionY });
+    if (safeId(value.sourceSystemId) && Number.isSafeInteger(value.eveSystemId) && (positionPairValid || positionPairUnavailable))
+      systems.push({ sourceSystemId: value.sourceSystemId, eveSystemId: Number(value.eveSystemId),
+        ...(positionPairValid ? { positionX: value.positionX as number, positionY: value.positionY as number } : {}) });
   });
 
   const connectionIds = new Set<string>();
@@ -83,15 +95,17 @@ export function validateWormholesystemsTopologyRequest(input: unknown, now = Dat
   else input.connections.forEach((value, index) => {
     const path = `connections[${index}]`;
     if (!record(value)) { blockers.push(`${path}: expected a validated source-connection record`); return; }
-    if (Object.keys(value).some(key => !["sourceConnectionId", "fromSourceSystemId", "toSourceSystemId", "connection_type", "ship_size"].includes(key)))
+    if (Object.keys(value).some(key => !["sourceConnectionId", "fromSourceSystemId", "toSourceSystemId", "fromSourceSignatureId", "toSourceSignatureId", "connection_type", "ship_size"].includes(key)))
       blockers.push(`${path}: contains an unsupported field`);
     if (!safeId(value.sourceConnectionId)) blockers.push(`${path}.sourceConnectionId: validated source connection ID is required`);
     if (!safeId(value.fromSourceSystemId) || !sourceSystems.has(String(value.fromSourceSystemId))) blockers.push(`${path}.fromSourceSystemId: validated in-scope source member ID is required`);
     if (!safeId(value.toSourceSystemId) || !sourceSystems.has(String(value.toSourceSystemId))) blockers.push(`${path}.toSourceSystemId: validated in-scope source member ID is required`);
     if (value.fromSourceSystemId === value.toSourceSystemId) blockers.push(`${path}: source connection endpoints must differ`);
+    for (const key of ["fromSourceSignatureId", "toSourceSignatureId"] as const)
+      if (value[key] !== null && !safeId(value[key])) blockers.push(`${path}.${key}: expected a validated source signature ID or null`);
     if (!(value.connection_type === "standard" || value.connection_type === "gate" || value.connection_type === "jumpgate" || value.connection_type === "cyno"))
       blockers.push(`${path}.connection_type: validated source connection type is unavailable`);
-    if (!(value.ship_size === "small" || value.ship_size === "medium" || value.ship_size === "large" || value.ship_size === "xl"))
+    if (value.ship_size !== undefined && !(value.ship_size === "small" || value.ship_size === "medium" || value.ship_size === "large" || value.ship_size === "xl"))
       blockers.push(`${path}.ship_size: validated source connection size is unavailable`);
     if (safeId(value.sourceConnectionId)) {
       if (connectionIds.has(value.sourceConnectionId)) blockers.push(`${path}.sourceConnectionId: duplicate source connection ID`);
@@ -100,33 +114,164 @@ export function validateWormholesystemsTopologyRequest(input: unknown, now = Dat
     if (safeId(value.sourceConnectionId) && safeId(value.fromSourceSystemId) && safeId(value.toSourceSystemId) &&
       value.fromSourceSystemId !== value.toSourceSystemId && sourceSystems.has(value.fromSourceSystemId) && sourceSystems.has(value.toSourceSystemId) &&
       (value.connection_type === "standard" || value.connection_type === "gate" || value.connection_type === "jumpgate" || value.connection_type === "cyno") &&
-      (value.ship_size === "small" || value.ship_size === "medium" || value.ship_size === "large" || value.ship_size === "xl"))
+      (value.ship_size === undefined || value.ship_size === "small" || value.ship_size === "medium" || value.ship_size === "large" || value.ship_size === "xl") &&
+      (value.fromSourceSignatureId === null || safeId(value.fromSourceSignatureId)) &&
+      (value.toSourceSignatureId === null || safeId(value.toSourceSignatureId)))
       connections.push({ sourceConnectionId: value.sourceConnectionId, fromSourceSystemId: value.fromSourceSystemId,
-        toSourceSystemId: value.toSourceSystemId, connection_type: value.connection_type, ship_size: value.ship_size });
+        toSourceSystemId: value.toSourceSystemId, fromSourceSignatureId: value.fromSourceSignatureId as string | null,
+        toSourceSignatureId: value.toSourceSignatureId as string | null, connection_type: value.connection_type,
+        ...(value.ship_size === undefined ? {} : { ship_size: value.ship_size }) });
   });
 
+  const signatures: WormholesystemsTopologyRequest["signatures"] = [];
+  const sourceSignatureIds = new Set<string>();
+  const sourceSignatureById = new Map<string, WormholesystemsTopologyRequest["signatures"][number]>();
+  if (!Array.isArray(input.signatures) || input.signatures.length > 200_000)
+    blockers.push("signatures: validated bounded source-signature records are required");
+  else input.signatures.forEach((value, index) => {
+    const path = `signatures[${index}]`;
+    if (!record(value)) { blockers.push(`${path}: expected a validated source-signature record`); return; }
+    if (Object.keys(value).some(key => !["sourceSignatureId", "sourceSystemId", "sigId", "sigType", "whType"].includes(key)))
+      blockers.push(`${path}: contains an unsupported field`);
+    if (!safeId(value.sourceSignatureId)) blockers.push(`${path}.sourceSignatureId: validated source signature resource ID is required`);
+    if (!safeId(value.sourceSystemId) || !sourceSystems.has(String(value.sourceSystemId)))
+      blockers.push(`${path}.sourceSystemId: validated in-scope source member ID is required`);
+    if (typeof value.sigId !== "string" || value.sigId.length > 64 || /[\u0000-\u001f\u007f]/.test(value.sigId))
+      blockers.push(`${path}.sigId: expected the exact assigned source code or an empty unassigned code`);
+    if (!(value.sigType === "data" || value.sigType === "relic" || value.sigType === "gas" || value.sigType === "ore" ||
+      value.sigType === "combat" || value.sigType === "wormhole" || value.sigType === "ghost" || value.sigType === "unknown"))
+      blockers.push(`${path}.sigType: mapped Nexum signature category is required`);
+    if (typeof value.whType !== "string" || value.whType.length > 128 || /[\u0000-\u001f\u007f]/.test(value.whType))
+      blockers.push(`${path}.whType: exact evidenced wormhole code or empty value is required`);
+    if (safeId(value.sourceSignatureId)) {
+      if (sourceSignatureIds.has(value.sourceSignatureId)) blockers.push(`${path}.sourceSignatureId: duplicate source signature resource ID`);
+      sourceSignatureIds.add(value.sourceSignatureId);
+    }
+    if (safeId(value.sourceSignatureId) && safeId(value.sourceSystemId) && sourceSystems.has(value.sourceSystemId) &&
+        typeof value.sigId === "string" && value.sigId.length <= 64 && !/[\u0000-\u001f\u007f]/.test(value.sigId) &&
+        (value.sigType === "data" || value.sigType === "relic" || value.sigType === "gas" || value.sigType === "ore" ||
+         value.sigType === "combat" || value.sigType === "wormhole" || value.sigType === "ghost" || value.sigType === "unknown") &&
+        typeof value.whType === "string" && value.whType.length <= 128 && !/[\u0000-\u001f\u007f]/.test(value.whType)) {
+      const signature: WormholesystemsTopologyRequest["signatures"][number] = { sourceSignatureId: value.sourceSignatureId,
+        sourceSystemId: value.sourceSystemId, sigId: value.sigId,
+        sigType: value.sigType as WormholesystemsTopologyRequest["signatures"][number]["sigType"], whType: value.whType };
+      signatures.push(signature);
+      sourceSignatureById.set(signature.sourceSignatureId, signature);
+    }
+  });
+  for (const [index, connection] of connections.entries()) {
+    for (const key of ["fromSourceSignatureId", "toSourceSignatureId"] as const) {
+      const id = connection[key];
+      if (id !== null) {
+        const signature = sourceSignatureById.get(id);
+        if (!signature) blockers.push(`connections[${index}].${key}: source signature is absent from the complete snapshot projection`);
+        else {
+          const expectedSystem = key === "fromSourceSignatureId" ? connection.fromSourceSystemId : connection.toSourceSystemId;
+          if (signature.sourceSystemId !== expectedSystem)
+            blockers.push(`connections[${index}].${key}: source signature scanner member contradicts the connection endpoint`);
+        }
+      }
+    }
+  }
+
   if (blockers.length) return { blockers: [...new Set(blockers)] };
-  return { request: { sourceIdentity: input.sourceIdentity as string,
-    snapshot: { complete: true, fetchedAt: new Date(Date.parse(snapshot.fetchedAt as string)).toISOString() }, systems, connections }, blockers: [] };
+  return { request: { schemaVersion: 2, sourceIdentity: input.sourceIdentity as string,
+    snapshot: { complete: true, fetchedAt: new Date(Date.parse(snapshot.fetchedAt as string)).toISOString() }, systems, connections, signatures }, blockers: [] };
 }
 
-/** Current adapter fields are intentionally not promoted from opaque metadata to write authority. */
-export function topologyCandidateFromFixture(fixture: WormholeSystemsFixture): UnknownRecord {
+/** Build the only complete, deletion-authorizing request from a validated source fixture. */
+export function topologyProjectionFromFixture(fixture: WormholeSystemsFixture): { candidate: UnknownRecord; blockers: string[]; diagnostics: string[] } {
+  const blockers: string[] = [];
+  const diagnostics: string[] = [];
+  const maxDiagnostics = 100;
+  let omittedDiagnostics = 0;
+  const addDiagnostic = (message: string) => {
+    if (diagnostics.length < maxDiagnostics - 1) diagnostics.push(message);
+    else omittedDiagnostics++;
+  };
   const evidence = fixture.topologyEvidence;
-  if (evidence) return { sourceIdentity: fixture.sourceIdentity,
-    snapshot: { complete: evidence.complete, fetchedAt: fixture.fetchedAt }, systems: evidence.systems,
-    connections: evidence.connections.map(connection => ({ sourceConnectionId: connection.sourceConnectionId,
-      fromSourceSystemId: connection.fromSourceSystemId, toSourceSystemId: connection.toSourceSystemId,
-      connection_type: connection.connectionType, ship_size: connection.size })) };
-  const systems = fixture.systems.map(system => ({ sourceSystemId: system.sourceSystemId, eveSystemId: system.eveSolarSystemId,
-    positionX: undefined, positionY: undefined }));
+  if (evidence) {
+    if (evidence.systems.length !== fixture.systems.length)
+      blockers.push("systems: topology projection does not contain every validated source member");
+    if (evidence.connections.length !== fixture.connections.length)
+      blockers.push("connections: topology projection does not contain every validated source connection");
+    const systems = evidence.systems.map(system => ({ sourceSystemId: system.sourceSystemId, eveSystemId: system.eveSystemId,
+      ...(system.positionX == null && system.positionY == null ? {} : { positionX: system.positionX, positionY: system.positionY }) }))
+      .sort((a, b) => a.sourceSystemId.localeCompare(b.sourceSystemId));
+    const sourceByEve = new Map(evidence.systems.map(system => [system.eveSystemId, system.sourceSystemId]));
+    const signaturesByConnectionAndEve = new Map<string, string[]>();
+    for (const signature of fixture.signatures) {
+      if (!signature.sourceConnectionId || !signature.sourceSignatureId) continue;
+      const key = `${signature.sourceConnectionId}\u0000${signature.scannerEveSystemId}`;
+      signaturesByConnectionAndEve.set(key, [...(signaturesByConnectionAndEve.get(key) ?? []), signature.sourceSignatureId]);
+    }
+    const connections = evidence.connections.map(connection => {
+      const sourceConnection = fixture.connections.find(row => row.sourceConnectionId === connection.sourceConnectionId);
+      const sourceType = connection.connectionType;
+      const connectionType = sourceType === "wormhole" ? "standard" : sourceType === "stargate" ? "gate" : undefined;
+      if (!connectionType) blockers.push(`connections[${connection.sourceConnectionId}].type: unsupported source-present connection type cannot be projected`);
+      const size = connection.size === "frigate" ? "small" : connection.size === "medium" ? "medium"
+        : connection.size === "large" ? "large" : connection.size === "xlarge" ? "xl" : undefined;
+      if (!size) addDiagnostic(`connections[${connection.sourceConnectionId}].ship_size: source size is absent or unsupported; Nexum default may be used on creation`);
+      const fromEveSystemId = sourceConnection?.fromEveSystemId;
+      const toEveSystemId = sourceConnection?.toEveSystemId;
+      const fromCandidates = fromEveSystemId === undefined ? [] : signaturesByConnectionAndEve.get(`${connection.sourceConnectionId}\u0000${fromEveSystemId}`) ?? [];
+      const toCandidates = toEveSystemId === undefined ? [] : signaturesByConnectionAndEve.get(`${connection.sourceConnectionId}\u0000${toEveSystemId}`) ?? [];
+      return { sourceConnectionId: connection.sourceConnectionId, fromSourceSystemId: connection.fromSourceSystemId,
+        toSourceSystemId: connection.toSourceSystemId,
+        fromSourceSignatureId: fromCandidates.length === 1 ? fromCandidates[0] : null,
+        toSourceSignatureId: toCandidates.length === 1 ? toCandidates[0] : null,
+        connection_type: connectionType,
+        ...(size ? { ship_size: size } : {}) };
+    }).sort((a, b) => a.sourceConnectionId.localeCompare(b.sourceConnectionId));
+    if (fixture.schemaVersion !== 2 || fixture.sourceKind !== "wormholesystems" || !Array.isArray(fixture.sourceSignatureEvidence))
+      blockers.push("signatures: a newly fetched version-2 classification snapshot is required for data writes");
+    const evidenceById = new Map((fixture.sourceSignatureEvidence ?? []).map(signature => [signature.sourceSignatureId, signature]));
+    const signatures = fixture.signatures.map((signature, index) => {
+      const sourceSignatureId = signature.sourceSignatureId;
+      const sourceSystemId = sourceByEve.get(signature.scannerEveSystemId);
+      if (!sourceSignatureId) blockers.push(`signatures[${index}].sourceSignatureId: source signature resource ID is unavailable`);
+      if (!sourceSystemId) blockers.push(`signatures[${index}].sourceSystemId: scanner is not a validated source member`);
+      const classification = sourceSignatureId ? evidenceById.get(sourceSignatureId) : undefined;
+      if (!classification) blockers.push(`signatures[${index}].classification: validated source classification evidence is unavailable`);
+      else {
+        if (!Object.prototype.hasOwnProperty.call(classification, "signatureCode"))
+          blockers.push(`signatures[${sourceSignatureId}].signature_id: source code assignment was not explicitly captured`);
+      }
+      const hasWormholeId = (value: unknown) => value !== undefined && value !== null && value !== "";
+      const directWormholeId = classification?.wormholeId;
+      const nestedWormholeId = classification?.nestedWormholeId;
+      const hasWormholeRelation = !!classification && (hasWormholeId(directWormholeId) || hasWormholeId(nestedWormholeId)) &&
+        (!hasWormholeId(directWormholeId) || !hasWormholeId(nestedWormholeId) || String(directWormholeId) === String(nestedWormholeId));
+      const wormholeName = classification?.wormholeName;
+      const sigType = hasWormholeRelation ? "wormhole" : "unknown";
+      const whType = hasWormholeRelation && typeof wormholeName === "string" && wormholeName.length > 0 ? wormholeName : "";
+      if (classification && !hasWormholeRelation)
+        addDiagnostic(`signatures[${sourceSignatureId}]: source classification is unmapped or unavailable; projected as sigType "unknown" with empty whType`);
+      else if (classification && hasWormholeRelation && !whType)
+        addDiagnostic(`signatures[${sourceSignatureId}]: validated wormhole relation has no non-empty name; projected with empty whType`);
+      return { sourceSignatureId: sourceSignatureId ?? "", sourceSystemId: sourceSystemId ?? "",
+        sigId: signature.signatureCode ?? "", sigType, whType };
+    }).sort((a, b) => a.sourceSignatureId.localeCompare(b.sourceSignatureId));
+    if (signatures.length !== fixture.signatures.length)
+      blockers.push("signatures: projection cardinality differs from the complete source signature collection");
+    if (omittedDiagnostics) diagnostics.push(`projection: ${omittedDiagnostics} additional diagnostic(s) omitted by the ${maxDiagnostics}-item bound`);
+    return { candidate: { schemaVersion: 2, sourceIdentity: fixture.sourceIdentity,
+      snapshot: { complete: evidence.complete, fetchedAt: fixture.fetchedAt }, systems, connections, signatures },
+      blockers: [...new Set(blockers)], diagnostics };
+  }
+  const systems = fixture.systems.map(system => ({ sourceSystemId: system.sourceSystemId, eveSystemId: system.eveSolarSystemId }));
   const connections = fixture.connections.map(connection => ({ sourceConnectionId: connection.sourceConnectionId,
     fromSourceSystemId: fixture.systems.find(system => system.eveSolarSystemId === connection.fromEveSystemId)?.sourceSystemId,
     toSourceSystemId: fixture.systems.find(system => system.eveSolarSystemId === connection.toEveSystemId)?.sourceSystemId,
     connection_type: undefined, ship_size: undefined }));
-  return { sourceIdentity: fixture.sourceIdentity,
-    snapshot: { complete: false, fetchedAt: fixture.fetchedAt },
-    systems, connections }; // Never pull aliases, positions, statuses or annotations out of opaque sourceMetadata.
+  return { candidate: { schemaVersion: 2, sourceIdentity: fixture.sourceIdentity,
+    snapshot: { complete: false, fetchedAt: fixture.fetchedAt }, systems, connections, signatures: [] },
+    blockers: ["topology evidence: complete validated source topology fields are unavailable"], diagnostics: [] };
+}
+
+export function topologyCandidateFromFixture(fixture: WormholeSystemsFixture): UnknownRecord {
+  return topologyProjectionFromFixture(fixture).candidate;
 }
 
 export type TopologyWriteDiagnostics = {
@@ -135,26 +280,104 @@ export type TopologyWriteDiagnostics = {
   reconciliation_status: "applied" | "partial" | "unchanged" | "unknown";
   created_systems: number | null; updated_systems: number | null; deleted_systems: number | null; preserved_systems: number | null;
   created_connections: number | null; updated_connections: number | null; deleted_connections: number | null; preserved_connections: number | null;
+  created_signatures: number | null; updated_signatures: number | null; deleted_signatures: number | null; preserved_signatures: number | null;
   conflict_count: number | null;
+  conflicts: Array<{ kind?: string; source_id?: string; nexum_row_id?: string; field?: string; reason?: string }>;
+  conflicts_omitted: number;
+  mappings: Array<{ kind: string; source_id: string; nexum_row_id: string; ownership?: "owned" | "preserved"; status?: string }>;
+  mappings_omitted: number;
+  snapshot_fetched_at: string | null;
+  payload_digest: string | null;
+  checkpoint: { accepted: boolean | null; replayed: boolean | null; partial: boolean | null } | null;
 };
+
+function safeDiagnosticText(value: unknown, max = 512): string | undefined {
+  if (typeof value === "number" && Number.isSafeInteger(value)) value = String(value);
+  return typeof value === "string" && value.length > 0 && value.length <= max && value.trim() === value &&
+    !/[\u0000-\u001f\u007f]/.test(value) ? value : undefined;
+}
+
+function sanitizedItems(value: unknown, kind?: string): Array<Record<string, string>> {
+  const rows: Array<Record<string, string>> = [];
+  const append = (item: unknown, fallbackKind?: string) => {
+    if (!record(item)) return;
+    const inferredKind = item.sourceSystemId !== undefined ? "system" : item.sourceConnectionId !== undefined ? "connection"
+      : item.sourceSignatureId !== undefined ? "signature" : undefined;
+    const candidateKind = safeDiagnosticText(item.kind ?? fallbackKind ?? inferredKind, 32);
+    const itemKind = candidateKind && ["system", "connection", "signature", "map_system", "map_connection", "map_signature"].includes(candidateKind)
+      ? candidateKind : undefined;
+    const sourceId = safeDiagnosticText(item.sourceItemId ?? item.source_id ?? item.sourceId ?? item.itemId ??
+      item.sourceSystemId ?? item.sourceConnectionId ?? item.sourceSignatureId, 256);
+    const rowId = safeDiagnosticText(item.nexumRowId ?? item.rowId ?? item.nexum_row_id ?? item.nexumId ??
+      item.nexumSystemId ?? item.nexumConnectionId ?? item.nexumSignatureId, 256);
+    const ownership = item.ownership === "owned" || item.ownership === "preserved" ? item.ownership : undefined;
+    const candidateStatus = safeDiagnosticText(item.status, 32);
+    const status = candidateStatus && ["created", "preserved", "updated", "deleted", "unchanged", "conflict", "owned", "mapped", "type_unmapped"].includes(candidateStatus)
+      ? candidateStatus : undefined;
+    const field = safeDiagnosticText(item.field, 64);
+    const reason = safeDiagnosticText(item.reason, 512);
+    const row: Record<string, string> = {};
+    if (itemKind) row.kind = itemKind;
+    if (sourceId) row.source_id = sourceId;
+    if (rowId) row.nexum_row_id = rowId;
+    if (ownership) row.ownership = ownership;
+    if (status) row.status = status;
+    if (field) row.field = field;
+    if (reason) row.reason = "Nexum reported a row-level reconciliation conflict";
+    if (Object.keys(row).length) rows.push(row);
+  };
+  if (Array.isArray(value)) value.forEach(item => append(item, kind));
+  else if (record(value)) {
+    for (const group of ["systems", "connections", "signatures"] as const)
+      if (Array.isArray(value[group])) (value[group] as unknown[]).forEach(item => append(item, group.slice(0, -1)));
+  }
+  return rows;
+}
 
 /** Keep successful HTTP submission distinct from the row-level reconciliation result. */
 export function summarizeTopologyWriteResponse(value: unknown): TopologyWriteDiagnostics {
   const count = (key: string): number | null => record(value) && Number.isSafeInteger(value[key]) && Number(value[key]) >= 0
     ? Number(value[key]) : null;
+  const rawConflicts = record(value) && Array.isArray(value.conflicts) ? value.conflicts : undefined;
+  const rawMappings = record(value) ? value.mappings ?? value.sourceToNexum ?? value.source_to_nexum : undefined;
+  const conflicts = sanitizedItems(rawConflicts).slice(0, 256).map(item => ({
+    ...(item.kind ? { kind: item.kind } : {}), ...(item.source_id ? { source_id: item.source_id } : {}),
+    ...(item.nexum_row_id ? { nexum_row_id: item.nexum_row_id } : {}), ...(item.field ? { field: item.field } : {}),
+    ...(item.reason ? { reason: item.reason } : {}),
+  }));
+  const mappings = sanitizedItems(rawMappings).filter(item => item.kind && item.source_id && item.nexum_row_id).slice(0, 1_000).map(item => ({
+    kind: item.kind!, source_id: item.source_id!, nexum_row_id: item.nexum_row_id!,
+    ...(item.ownership === "owned" || item.ownership === "preserved" ? { ownership: item.ownership as "owned" | "preserved" } : {}),
+    ...(item.status ? { status: item.status } : {}),
+  }));
   const counts = {
     created_systems: count("createdSystems"), updated_systems: count("updatedSystems"),
     deleted_systems: count("deletedSystems"), preserved_systems: count("preservedSystems"),
     created_connections: count("createdConnections"), updated_connections: count("updatedConnections"),
     deleted_connections: count("deletedConnections"), preserved_connections: count("preservedConnections"),
-    conflict_count: record(value) && Array.isArray(value.conflicts) ? value.conflicts.length : null,
+    created_signatures: count("createdSignatures"), updated_signatures: count("updatedSignatures"),
+    deleted_signatures: count("deletedSignatures"), preserved_signatures: count("preservedSignatures"),
+    conflict_count: rawConflicts?.length ?? null,
   };
   const countValues = Object.values(counts);
-  const reconciliationStatus: TopologyWriteDiagnostics["reconciliation_status"] = countValues.some(item => item === null)
-    ? "unknown" : counts.conflict_count! > 0 ? "partial"
-      : counts.created_systems! + counts.updated_systems! + counts.deleted_systems! + counts.created_connections! +
-        counts.updated_connections! + counts.deleted_connections! > 0 ? "applied" : "unchanged";
-  return { request_status: "succeeded", status: "completed", reconciliation_status: reconciliationStatus, ...counts };
+  const checkpointInput = record(value) && record(value.checkpoint) ? value.checkpoint : undefined;
+  const checkpointRecognized = checkpointInput && ["accepted", "replayed", "partial"].every(key =>
+    typeof checkpointInput[key] === "boolean");
+  const checkpoint = checkpointRecognized ? { accepted: checkpointInput.accepted as boolean,
+    replayed: checkpointInput.replayed as boolean, partial: checkpointInput.partial as boolean } : null;
+  const acknowledged = checkpoint?.accepted === true || checkpoint?.replayed === true;
+  const reconciliationStatus: TopologyWriteDiagnostics["reconciliation_status"] = !acknowledged ? "unknown"
+    : counts.conflict_count !== null && counts.conflict_count > 0 || checkpoint?.partial === true
+      ? "partial" : countValues.some(item => item === null)
+        ? "unknown" : counts.created_systems! + counts.updated_systems! + counts.deleted_systems! + counts.created_connections! +
+        counts.updated_connections! + counts.deleted_connections! + counts.created_signatures! + counts.updated_signatures! + counts.deleted_signatures! > 0 ? "applied" : "unchanged";
+  const fetchedAt = record(value) ? safeDiagnosticText(value.snapshotFetchedAt ?? value.snapshot_fetched_at, 64) : undefined;
+  const payloadDigest = record(value) ? safeDiagnosticText(value.payloadDigest ?? value.payload_digest, 128) : undefined;
+  return { request_status: "succeeded", status: "completed", reconciliation_status: reconciliationStatus, ...counts,
+    conflicts, conflicts_omitted: Math.max(0, (rawConflicts?.length ?? 0) - conflicts.length),
+    mappings, mappings_omitted: Math.max(0, sanitizedItems(rawMappings).filter(item => item.kind && item.source_id && item.nexum_row_id).length - mappings.length),
+    snapshot_fetched_at: fetchedAt && validTime(fetchedAt) ? new Date(Date.parse(fetchedAt)).toISOString() : null,
+    payload_digest: payloadDigest && /^(?:sha256:)?[a-f0-9]{64}$/i.test(payloadDigest) ? payloadDigest : null, checkpoint };
 }
 
 export type AllianceNoteInput = {

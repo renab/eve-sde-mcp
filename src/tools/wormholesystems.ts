@@ -25,19 +25,22 @@ export function registerWormholeSystemsTools(server: McpServer, getService: () =
       canonical_map_id: id, upstream_map_id: id, credential_id: id }, (service, args) => service.configure(args));
   tool("wormholesystems_get_config", "Read safe WormholeSystems source configuration and activation blockers. Never returns credentials or makes network calls.",
     {}, service => service.configuration());
+  tool("wormholesystems_bind_nexum_topology_writer", "Explicitly bind one enabled map-accessible Nexum key to the configured canonical map. Calling this confirms the operator has verified wormholesystems_sync scope and deployment of the v2 endpoint; this tool makes no Nexum request.",
+    { credential_id: id, confirm_v2_endpoint_deployed: z.literal(true) },
+    (service, args) => service.bindNexumTopologyWriter(args.credential_id, args.confirm_v2_endpoint_deployed));
   tool("wormholesystems_set_max_staleness", "Set the persisted global WormholeSystems and Nexum matching freshness bound in milliseconds. Requires a configured source; performs no network calls or writes.",
     { max_staleness_ms: z.number().finite() }, (service, args) => service.setMaxStaleness(args.max_staleness_ms));
   tool("wormholesystems_remove_config", "Remove the current WormholeSystems source configuration and reset freshness policy to the approved 60,000 ms default. This does not remove the encrypted credential or source snapshots.",
     {}, service => service.removeConfiguration());
   tool("wormholesystems_test_connection", "Explicitly test bearer access by listing accessible maps and requesting the explicitly selected map detail. This does not enable sync.",
     {}, service => service.testConnection());
-  tool("wormholesystems_enable_sync", "Explicitly enable on-demand, GET-only source snapshot synchronization after a successful connection and selected-map schema test. Never enables Nexum writes.",
+  tool("wormholesystems_enable_sync", "Explicitly enable on-demand source snapshot synchronization after a successful connection and selected-map schema test. Data writes still require the separately bound Nexum v2 writer and a complete eligible fresh snapshot.",
     {}, service => service.enableSync());
   tool("wormholesystems_disable_sync", "Disable on-demand WormholeSystems source synchronization. This never changes Nexum data.",
     {}, service => service.disableSync());
   tool("wormholesystems_list_maps", "List accessible WormholeSystems API map IDs and slugs using the configured origin and credential. Explicit upstream GET; no sync or writes.",
     {}, service => service.listAccessibleMaps());
-  tool("wormholesystems_sync_map", "Fetch and store one complete validated snapshot for the explicitly enabled selected map using source GETs only. This fetch-only diagnostic milestone never writes Nexum topology, signatures, or notes. Use the subsequent local-only preview to inspect allowlisted source signature classification evidence; preview makes zero upstream calls and performs no writes.",
+  tool("wormholesystems_sync_map", "Fetch and validate the current complete selected alliance map, store its provenance, then reconcile the complete eligible v2 topology/signature snapshot to its explicitly bound Nexum map in this same invocation. Blocked projections send no partial PUT. Never writes linked notes. Preview remains local-only and is not an approval step.",
     { map_id: id }, (service, args) => service.syncMap(args.map_id));
   tool("wormholesystems_map_sync_status", "Read local source snapshot/run status and a local-only preview summary. No upstream calls or Nexum writes.",
     { map_id: id }, (service, args) => service.status(args.map_id));

@@ -20,9 +20,10 @@ afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); for (const dir of tm
 const response = (payload: unknown, status = 200, headers: Record<string, string> = {}) => new Response(JSON.stringify(payload), { status, headers });
 
 function harness(transport: typeof fetch = vi.fn(async () => response({ data: [] })), sleep: (ms: number) => Promise<void> = async () => {},
-  systemClass?: (eveSystemId: number) => string | null) {
+  systemClass?: (eveSystemId: number) => string | null, systemExists: (eveSystemId: number) => boolean = () => true,
+  now: () => number = () => Date.parse("2026-10-13T12:00:00.000Z")) {
   const db = openStateDatabase(":memory:");
-  const store = new NexumStore(db, () => Date.parse("2026-10-13T12:00:00.000Z"));
+  const store = new NexumStore(db, now);
   const credential = { id: "nexum-test", base_url: "https://nexum.invalid", label: "fixture", enabled: true };
   store.saveCredential(credential);
   store.discover(credential, [{ id: "target-map", name: "Target" }, { id: "other-map", name: "Other" }], credential.base_url);
@@ -31,7 +32,7 @@ function harness(transport: typeof fetch = vi.fn(async () => response({ data: []
     const value = secretValues.get(id); if (!value) throw new Error("Credential secret unavailable"); return value;
   }, remove: (id: string) => secretValues.delete(id) };
   const nexumWrites = {
-    writeWormholesystemsTopology: vi.fn(async () => ({ status: "ok" } as any)),
+    writeWormholesystemsTopology: vi.fn(async () => ({ status: "ok", checkpoint: { accepted: true, replayed: false, partial: false } } as any)),
     writeWormholesystemsSignatureNotes: vi.fn(async (_map: string, changes: Array<any>, validateSource?: () => string[]) => {
       const blockers = validateSource?.() ?? [];
       return blockers.length ? { written: 0, status: "blocked", blockers,
@@ -39,7 +40,8 @@ function harness(transport: typeof fetch = vi.fn(async () => response({ data: []
         { written: changes.length, status: "completed", items: changes.map((_: any, item_index: number) => ({ item_index, status: "written" })) } as any;
     }),
   };
-  const service = new WormholeSystemsService(store, secrets, transport, () => Date.parse("2026-10-13T12:00:00.000Z"), sleep, nexumWrites, systemClass);
+  const service = new WormholeSystemsService(store, secrets, transport, now, sleep,
+    nexumWrites, systemClass, systemExists);
   const maps = store.maps();
   return { db, store, service, secrets, secretValues, nexumWrites, targetMap: maps.find(map => map.name === "Target")!.id, otherMap: maps.find(map => map.name === "Other")!.id };
 }
@@ -530,7 +532,7 @@ describe("WormholeSystems service and MCP controls", () => {
     h.db.close();
   });
 
-  it("stores a full validated normalized snapshot transactionally and never writes to Nexum", async () => {
+  it("stores a full validated snapshot and blocks data writes until a Nexum writer is explicitly bound", async () => {
     const transport = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
       if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
@@ -543,9 +545,11 @@ describe("WormholeSystems service and MCP controls", () => {
     h.db.prepare(`INSERT INTO wormholesystems_source_snapshots(map_id,source_identity,source_origin,source_api_map_id,revision_or_digest,fetched_at,observed_at,payload_json,eligible_for_matching)
       VALUES (?,?,?,?,?,?,NULL,?,0)`).run(h.targetMap, "old-source", "https://old.invalid", "old-map", "old-digest", "2026-10-12T00:00:00.000Z", JSON.stringify({ old: true }));
     const result = await h.service.syncMap(h.targetMap);
-    expect(result).toMatchObject({ status: "snapshot_validated", fetched: true, fetch_only: true, source_calls: 3,
+    expect(result).toMatchObject({ status: "snapshot_validated", fetched: true, source_calls: 3,
       source_api_map_id: "api-map-7", systemCount: 1, snapshot_stored: true,
-      data_writes_enabled: false, nexum_writes_attempted: false });
+      linked_note_writes_attempted: false, nexum_writes_attempted: false,
+      topology_sync: { status: "blocked", attempted: false,
+        blockers: expect.arrayContaining(["an explicit Nexum topology writer key has not been selected"]) } });
     const stored = h.db.prepare("SELECT * FROM wormholesystems_source_snapshots WHERE map_id=?").get(h.targetMap) as any;
     expect(stored.source_api_map_id).toBe("api-map-7");
     expect(stored.revision_or_digest).toBe(result.revision_or_digest);
@@ -566,6 +570,367 @@ describe("WormholeSystems service and MCP controls", () => {
     h.service.removeConfiguration();
     expect(h.db.prepare("SELECT count(*) AS n,eligible_for_matching FROM wormholesystems_source_snapshots WHERE map_id=?").get(h.targetMap))
       .toMatchObject({ n: 1, eligible_for_matching: 0 });
+    h.db.close();
+  });
+
+  it("fetches and PUTs the complete v2 snapshot in the same sync, including an unconnected unassigned signature", async () => {
+    vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
+    const mapDetail = { ...selectedMapDetail(), map_solarsystems: [{ id: "map-system-test", map_id: "api-map-7",
+      solarsystem_id: 31_000_001, position: { x: 12, y: 34 } }] };
+    const detail = systemDetail("map-system-test", 31_000_001, [{ id: "source-signature-1", signature_id: null,
+      map_solarsystem_id: "map-system-test", signature_type_id: null, signature_category_id: null, wormhole_id: null,
+      wormhole: { id: null, name: null, leads_to: "must-not-be-used" } }]);
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: mapDetail });
+      return response(detail);
+    });
+    const h = harness(transport as typeof fetch);
+    await configured(h.service, h.targetMap);
+    await enableAfterTest(h.service);
+    const binding = h.service.bindNexumTopologyWriter("nexum-test", true);
+    expect(binding).toMatchObject({ bound: true, canonical_map_id: h.targetMap, nexum_map_id: "target-map", topology_schema_version: 2 });
+    h.nexumWrites.writeWormholesystemsTopology.mockResolvedValue({
+      createdSystems: 1, updatedSystems: 0, preservedSystems: 0, deletedSystems: 0,
+      createdConnections: 0, updatedConnections: 0, preservedConnections: 0, deletedConnections: 0,
+      createdSignatures: 1, updatedSignatures: 0, preservedSignatures: 0, deletedSignatures: 0, conflicts: [],
+      checkpoint: { accepted: true, replayed: false, partial: false },
+    } as any);
+
+    const sync = await h.service.syncMap(h.targetMap) as any;
+    expect(sync).toMatchObject({ status: "snapshot_validated", fetched: true, source_calls: 3,
+      nexum_writes_attempted: true, linked_note_writes_attempted: false,
+      topology_sync: { status: "succeeded", attempted: true,
+        reconciliation: { reconciliation_status: "applied", created_signatures: 1 } } });
+    expect(h.nexumWrites.writeWormholesystemsTopology).toHaveBeenCalledTimes(1);
+    const [canonicalId, request, writerId, bindingArgs] = h.nexumWrites.writeWormholesystemsTopology.mock.calls[0] as any;
+    expect(canonicalId).toBe(h.targetMap);
+    expect(writerId).toBe("nexum-test");
+    expect(bindingArgs).toEqual({ baseUrl: "https://nexum.invalid", nexumMapId: "target-map" });
+    expect(request).toMatchObject({ schemaVersion: 2,
+      sourceIdentity: 'wormholesystems:["https://wormholes.invalid","api-map-7"]',
+      snapshot: { complete: true, fetchedAt: sync.fetched_at },
+      systems: [{ sourceSystemId: "map-system-test", eveSystemId: 31_000_001, positionX: 12, positionY: 34 }],
+      connections: [],
+      signatures: [{ sourceSignatureId: "source-signature-1", sourceSystemId: "map-system-test", sigId: "", sigType: "unknown", whType: "" }] });
+    expect(Object.isFrozen(request)).toBe(true);
+    expect(JSON.stringify(request)).not.toContain("must-not-be-used");
+    expect(h.nexumWrites.writeWormholesystemsSignatureNotes).not.toHaveBeenCalled();
+    const upstreamCalls = transport.mock.calls.length;
+    h.service.preview(h.targetMap);
+    expect(transport).toHaveBeenCalledTimes(upstreamCalls);
+    expect(h.nexumWrites.writeWormholesystemsTopology).toHaveBeenCalledTimes(1);
+    h.db.close();
+  });
+
+  it("reports an incomplete acknowledgement when a successful PUT response lacks a valid checkpoint", async () => {
+    vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: selectedMapDetail() });
+      return response(testSystemDetail());
+    });
+    const h = harness(transport as typeof fetch);
+    await configured(h.service, h.targetMap);
+    await enableAfterTest(h.service);
+    h.service.bindNexumTopologyWriter("nexum-test", true);
+    const counters = { createdSystems: 0, updatedSystems: 0, preservedSystems: 0, deletedSystems: 0,
+      createdConnections: 0, updatedConnections: 0, preservedConnections: 0, deletedConnections: 0,
+      createdSignatures: 0, updatedSignatures: 0, preservedSignatures: 0, deletedSignatures: 0, conflicts: [] };
+    h.nexumWrites.writeWormholesystemsTopology.mockResolvedValueOnce(counters as any)
+      .mockResolvedValueOnce({ ...counters, checkpoint: { accepted: "yes", replayed: false, partial: false } } as any)
+      .mockResolvedValueOnce({ ...counters, checkpoint: { accepted: true } } as any)
+      .mockResolvedValueOnce({ ...counters, checkpoint: { accepted: false, replayed: true, partial: false } } as any);
+
+    const missing = await h.service.syncMap(h.targetMap) as any;
+    expect(missing.topology_sync).toMatchObject({ status: "acknowledged_result_incomplete", attempted: true,
+      accepted: null, reconciliation: { reconciliation_status: "unknown", checkpoint: null } });
+    const malformed = await h.service.syncMap(h.targetMap) as any;
+    expect(malformed.topology_sync).toMatchObject({ status: "acknowledged_result_incomplete", attempted: true,
+      accepted: null, reconciliation: { reconciliation_status: "unknown", checkpoint: null } });
+    const missingPartial = await h.service.syncMap(h.targetMap) as any;
+    expect(missingPartial.topology_sync).toMatchObject({ status: "acknowledged_result_incomplete", attempted: true,
+      accepted: null, reconciliation: { reconciliation_status: "unknown", checkpoint: null } });
+    const replayed = await h.service.syncMap(h.targetMap) as any;
+    expect(replayed.topology_sync).toMatchObject({ status: "succeeded", attempted: true, accepted: true,
+      reconciliation: { reconciliation_status: "unchanged", checkpoint: { accepted: false, replayed: true, partial: false } } });
+    expect(h.nexumWrites.writeWormholesystemsTopology).toHaveBeenCalledTimes(4);
+    h.db.close();
+  });
+
+  it("uses a valid selected-system position when the map member has no position", async () => {
+    vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
+    const mapDetail = selectedMapDetail();
+    const detail = { ...testSystemDetail(), data: { ...testSystemDetail().data, position: { x: 12, y: 34 } } };
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: mapDetail });
+      return response(detail);
+    });
+    const h = harness(transport as typeof fetch);
+    await configured(h.service, h.targetMap);
+    await enableAfterTest(h.service);
+    h.service.bindNexumTopologyWriter("nexum-test", true);
+    h.nexumWrites.writeWormholesystemsTopology.mockResolvedValue({
+      createdSystems: 1, updatedSystems: 0, preservedSystems: 0, deletedSystems: 0,
+      createdConnections: 0, updatedConnections: 0, preservedConnections: 0, deletedConnections: 0,
+      createdSignatures: 0, updatedSignatures: 0, preservedSignatures: 0, deletedSignatures: 0, conflicts: [],
+      checkpoint: { accepted: true, replayed: false, partial: false },
+    } as any);
+
+    const result = await h.service.syncMap(h.targetMap) as any;
+    expect(result.topology_sync).toMatchObject({ status: "succeeded", attempted: true });
+    const request = h.nexumWrites.writeWormholesystemsTopology.mock.calls[0][1] as any;
+    expect(request.systems).toEqual([{ sourceSystemId: "map-system-test", eveSystemId: 31_000_001, positionX: 12, positionY: 34 }]);
+    h.db.close();
+  });
+
+  it("replays the identical frozen request after a lost response and refetches after its freshness deadline", async () => {
+    vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
+    const initialNow = Date.parse("2026-10-13T12:00:00.000Z");
+    let now = initialNow;
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: selectedMapDetail() });
+      return response(testSystemDetail());
+    });
+    const h = harness(transport as typeof fetch, undefined, undefined, () => true, () => now);
+    await configured(h.service, h.targetMap);
+    await enableAfterTest(h.service);
+    h.service.bindNexumTopologyWriter("nexum-test", true);
+    const counters = { createdSystems: 1, updatedSystems: 0, preservedSystems: 0, deletedSystems: 0,
+      createdConnections: 0, updatedConnections: 0, preservedConnections: 0, deletedConnections: 0,
+      createdSignatures: 0, updatedSignatures: 0, preservedSignatures: 0, deletedSignatures: 0, conflicts: [] };
+    h.nexumWrites.writeWormholesystemsTopology.mockRejectedValueOnce(new Error("simulated lost PUT response"))
+      .mockRejectedValueOnce(new Error("simulated repeated lost PUT response"))
+      .mockResolvedValueOnce({ ...counters, checkpoint: { accepted: true, replayed: false, partial: false } } as any);
+
+    const first = await h.service.syncMap(h.targetMap) as any;
+    expect(first.topology_sync).toMatchObject({ status: "indeterminate", attempted: true, indeterminate: true });
+    const firstRequest = h.nexumWrites.writeWormholesystemsTopology.mock.calls[0][1] as any;
+    const firstBytes = JSON.stringify(firstRequest);
+    const sourceCallsAfterInitialFetch = transport.mock.calls.length;
+
+    now = initialNow + 30_000;
+    const replay = await h.service.syncMap(h.targetMap) as any;
+    expect(replay).toMatchObject({ status: "snapshot_validated", fetched: false, source_calls: 0,
+      topology_sync: { status: "indeterminate", attempted: true, indeterminate: true } });
+    expect(transport).toHaveBeenCalledTimes(sourceCallsAfterInitialFetch);
+    const replayRequest = h.nexumWrites.writeWormholesystemsTopology.mock.calls[1][1] as any;
+    expect(replayRequest).toEqual(firstRequest);
+    expect(JSON.stringify(replayRequest)).toBe(firstBytes);
+
+    now = initialNow + 60_001;
+    const refreshed = await h.service.syncMap(h.targetMap) as any;
+    expect(refreshed).toMatchObject({ status: "snapshot_validated", fetched: true, source_calls: 3,
+      topology_sync: { status: "succeeded", attempted: true } });
+    expect(transport).toHaveBeenCalledTimes(sourceCallsAfterInitialFetch + 3);
+    const freshRequest = h.nexumWrites.writeWormholesystemsTopology.mock.calls[2][1] as any;
+    expect(freshRequest.snapshot.fetchedAt).toBe(new Date(now).toISOString());
+    expect(JSON.stringify(freshRequest)).not.toBe(firstBytes);
+    expect(JSON.stringify({ first, replay, refreshed })).not.toContain("simulated lost PUT response");
+    h.db.close();
+  });
+
+  it("PUTs a complete snapshot with unknown classification when source scalars are unmapped", async () => {
+    vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
+    const mapDetail = { ...selectedMapDetail(), map_solarsystems: [{ id: "map-system-test", map_id: "api-map-7",
+      solarsystem_id: 31_000_001, position: { x: 12, y: 34 } }] };
+    const detail = systemDetail("map-system-test", 31_000_001, [{ id: "source-signature-1", signature_id: "QRS-123",
+      map_solarsystem_id: "map-system-test", signature_type_id: 197, signature_category_id: 1, wormhole_id: null,
+      wormhole: { id: null, name: "B274" } }]);
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: mapDetail });
+      return response(detail);
+    });
+    const h = harness(transport as typeof fetch);
+    await configured(h.service, h.targetMap);
+    await enableAfterTest(h.service);
+    h.service.bindNexumTopologyWriter("nexum-test", true);
+    h.nexumWrites.writeWormholesystemsTopology.mockResolvedValue({
+      createdSystems: 1, updatedSystems: 0, preservedSystems: 0, deletedSystems: 0,
+      createdConnections: 0, updatedConnections: 0, preservedConnections: 0, deletedConnections: 0,
+      createdSignatures: 1, updatedSignatures: 0, preservedSignatures: 0, deletedSignatures: 0, conflicts: [],
+      checkpoint: { accepted: true, replayed: false, partial: false },
+    } as any);
+    const sync = await h.service.syncMap(h.targetMap) as any;
+    expect(sync).toMatchObject({ status: "snapshot_validated", fetched: true, nexum_writes_attempted: true,
+      topology_sync: { status: "succeeded", attempted: true, diagnostics: [
+        'signatures[source-signature-1]: source classification is unmapped or unavailable; projected as sigType "unknown" with empty whType',
+      ] } });
+    expect(h.nexumWrites.writeWormholesystemsTopology).toHaveBeenCalledTimes(1);
+    const request = h.nexumWrites.writeWormholesystemsTopology.mock.calls[0][1] as any;
+    expect(request.signatures).toEqual([{ sourceSignatureId: "source-signature-1", sourceSystemId: "map-system-test",
+      sigId: "QRS-123", sigType: "unknown", whType: "" }]);
+    expect(h.db.prepare("SELECT eligible_for_matching FROM wormholesystems_source_snapshots WHERE map_id=?").get(h.targetMap))
+      .toMatchObject({ eligible_for_matching: 1 });
+    h.db.close();
+  });
+
+  it("projects a validated WormholeSystems wormhole relation using its exact name", async () => {
+    vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
+    const mapDetail = { ...selectedMapDetail(), map_solarsystems: [{ id: "map-system-test", map_id: "api-map-7",
+      solarsystem_id: 31_000_001, position: { x: 12, y: 34 } }] };
+    const detail = systemDetail("map-system-test", 31_000_001, [{ id: "source-signature-bcm-579", signature_id: "BCM-579",
+      map_solarsystem_id: "map-system-test", signature_type_id: 197, signature_category_id: 1, wormhole_id: 26,
+      wormhole: { id: 26, name: "B274" } }]);
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: mapDetail });
+      return response(detail);
+    });
+    const h = harness(transport as typeof fetch);
+    await configured(h.service, h.targetMap);
+    await enableAfterTest(h.service);
+    h.service.bindNexumTopologyWriter("nexum-test", true);
+    h.nexumWrites.writeWormholesystemsTopology.mockResolvedValue({
+      createdSystems: 1, updatedSystems: 0, preservedSystems: 0, deletedSystems: 0,
+      createdConnections: 0, updatedConnections: 0, preservedConnections: 0, deletedConnections: 0,
+      createdSignatures: 1, updatedSignatures: 0, preservedSignatures: 0, deletedSignatures: 0, conflicts: [],
+      checkpoint: { accepted: true, replayed: false, partial: false },
+    } as any);
+
+    const sync = await h.service.syncMap(h.targetMap) as any;
+    expect(sync).toMatchObject({ status: "snapshot_validated", nexum_writes_attempted: true,
+      topology_sync: { status: "succeeded", attempted: true } });
+    const request = h.nexumWrites.writeWormholesystemsTopology.mock.calls[0][1] as any;
+    expect(request.signatures).toEqual([{ sourceSignatureId: "source-signature-bcm-579", sourceSystemId: "map-system-test",
+      sigId: "BCM-579", sigType: "wormhole", whType: "B274" }]);
+    h.db.close();
+  });
+
+  it("sends every source signature, connection link, and system in the same complete snapshot sync", async () => {
+    vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
+    const edge = { id: "source-edge", from_map_solarsystem_id: "map-system-a", to_map_solarsystem_id: "map-system-b",
+      type: "wormhole", ship_size: "medium", signatures: [
+        { id: "source-signature-a", signature_id: "BCM-579", map_solarsystem_id: "map-system-a" },
+        { id: "source-signature-b", signature_id: "DEF-456", map_solarsystem_id: "map-system-b" },
+      ] };
+    const mapDetail = { ...selectedMapDetail(), map_solarsystems: [
+      { id: "map-system-a", map_id: "api-map-7", solarsystem_id: 31_000_001, position: { x: 12, y: 34 } },
+      { id: "map-system-b", map_id: "api-map-7", solarsystem_id: 31_000_002, position: { x: 56, y: 78 } },
+    ], map_connections: [edge] };
+    const detailFor = (id: string, eveId: number, signatures: unknown[]) => ({ data: { id, map_id: "api-map-7",
+      solarsystem_id: eveId, signatures, map_connections: [edge], audits: [] } });
+    const detailA = detailFor("map-system-a", 31_000_001, [
+      { id: "source-signature-a", signature_id: "BCM-579", map_solarsystem_id: "map-system-a", map_connection_id: "source-edge",
+        map_connection: { id: "source-edge" }, wormhole_id: 26, wormhole: { id: 26, name: "B274" } },
+      { id: "source-signature-unassigned", signature_id: null, map_solarsystem_id: "map-system-a", map_connection_id: null },
+    ]);
+    const detailB = detailFor("map-system-b", 31_000_002, [
+      { id: "source-signature-b", signature_id: "DEF-456", map_solarsystem_id: "map-system-b", map_connection_id: "source-edge",
+        map_connection: { id: "source-edge" }, wormhole_id: "wormhole-27", wormhole: { id: "wormhole-27" } },
+    ]);
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: mapDetail });
+      if (url.endsWith("/map-solarsystems/map-system-a")) return response(detailA);
+      if (url.endsWith("/map-solarsystems/map-system-b")) return response(detailB);
+      throw new Error("Unexpected source route");
+    });
+    const h = harness(transport as typeof fetch);
+    await configured(h.service, h.targetMap);
+    await enableAfterTest(h.service);
+    h.service.bindNexumTopologyWriter("nexum-test", true);
+    h.nexumWrites.writeWormholesystemsTopology.mockResolvedValue({
+      createdSystems: 2, updatedSystems: 0, preservedSystems: 0, deletedSystems: 0,
+      createdConnections: 1, updatedConnections: 0, preservedConnections: 0, deletedConnections: 0,
+      createdSignatures: 3, updatedSignatures: 0, preservedSignatures: 0, deletedSignatures: 0, conflicts: [],
+      checkpoint: { accepted: true, replayed: false, partial: false },
+    } as any);
+
+    const sync = await h.service.syncMap(h.targetMap) as any;
+    expect(sync).toMatchObject({ status: "snapshot_validated", fetched: true, source_calls: 4,
+      nexum_writes_attempted: true, topology_sync: { status: "succeeded", attempted: true } });
+    expect(h.nexumWrites.writeWormholesystemsTopology).toHaveBeenCalledTimes(1);
+    const request = h.nexumWrites.writeWormholesystemsTopology.mock.calls[0][1] as any;
+    expect(request.systems).toEqual([
+      { sourceSystemId: "map-system-a", eveSystemId: 31_000_001, positionX: 12, positionY: 34 },
+      { sourceSystemId: "map-system-b", eveSystemId: 31_000_002, positionX: 56, positionY: 78 },
+    ]);
+    expect(request.connections).toEqual([{ sourceConnectionId: "source-edge", fromSourceSystemId: "map-system-a",
+      toSourceSystemId: "map-system-b", fromSourceSignatureId: "source-signature-a", toSourceSignatureId: "source-signature-b",
+      connection_type: "standard", ship_size: "medium" }]);
+    expect(request.signatures).toEqual([
+      { sourceSignatureId: "source-signature-a", sourceSystemId: "map-system-a", sigId: "BCM-579", sigType: "wormhole", whType: "B274" },
+      { sourceSignatureId: "source-signature-b", sourceSystemId: "map-system-b", sigId: "DEF-456", sigType: "wormhole", whType: "" },
+      { sourceSignatureId: "source-signature-unassigned", sourceSystemId: "map-system-a", sigId: "", sigType: "unknown", whType: "" },
+    ]);
+    expect(sync.topology_sync.diagnostics).toContain(
+      "signatures[source-signature-b]: validated wormhole relation has no non-empty name; projected with empty whType");
+    h.db.close();
+  });
+
+  it("blocks the complete write when one source edge is unsupported and another previously-owned edge is absent", async () => {
+    vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
+    const members = [
+      { id: "map-system-a", map_id: "api-map-7", solarsystem_id: 31_000_001 },
+      { id: "map-system-b", map_id: "api-map-7", solarsystem_id: 31_000_002 },
+    ];
+    const unsupportedEdge = { id: "source-edge-unsupported", from_map_solarsystem_id: "map-system-a",
+      to_map_solarsystem_id: "map-system-b", type: "unsupported-type", ship_size: "medium", signatures: [] };
+    const mapDetail = { ...selectedMapDetail(), map_solarsystems: members, map_connections: [unsupportedEdge] };
+    const detailFor = (id: string, eveId: number) => ({ data: { id, map_id: "api-map-7", solarsystem_id: eveId,
+      signatures: [], map_connections: [unsupportedEdge], audits: [] } });
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: mapDetail });
+      if (url.endsWith("/map-solarsystems/map-system-a")) return response(detailFor("map-system-a", 31_000_001));
+      if (url.endsWith("/map-solarsystems/map-system-b")) return response(detailFor("map-system-b", 31_000_002));
+      throw new Error("Unexpected source route");
+    });
+    const previouslyOwnedEdges = new Set(["previously-owned-edge"]);
+    let mockCheckpoint: unknown = { revision: "previously-accepted-snapshot" };
+    const h = harness(transport as typeof fetch);
+    await configured(h.service, h.targetMap);
+    await enableAfterTest(h.service);
+    h.service.bindNexumTopologyWriter("nexum-test", true);
+    h.nexumWrites.writeWormholesystemsTopology.mockImplementation(async (_map, request) => {
+      previouslyOwnedEdges.clear();
+      for (const connection of (request as any).connections) previouslyOwnedEdges.add(connection.sourceConnectionId);
+      mockCheckpoint = (request as any).snapshot.fetchedAt;
+      return { checkpoint: { accepted: true, replayed: false, partial: false } } as any;
+    });
+    const checkpointBefore = mockCheckpoint;
+
+    const sync = await h.service.syncMap(h.targetMap) as any;
+    expect(sync.topology_sync).toMatchObject({ status: "blocked", attempted: false, accepted: false,
+      blockers: expect.arrayContaining(["connections[source-edge-unsupported].type: unsupported source-present connection type cannot be projected"]) });
+    expect(h.nexumWrites.writeWormholesystemsTopology).not.toHaveBeenCalled();
+    expect([...previouslyOwnedEdges]).toEqual(["previously-owned-edge"]);
+    expect(mockCheckpoint).toBe(checkpointBefore);
+    expect(sync.topology_sync).not.toHaveProperty("reconciliation");
+    h.db.close();
+  });
+
+  it("blocks the topology PUT and preview eligibility when a source system is absent from the canonical SDE", async () => {
+    vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: selectedMapDetail() });
+      return response(testSystemDetail());
+    });
+    const h = harness(transport as typeof fetch, undefined, undefined, () => false);
+    await configured(h.service, h.targetMap);
+    await enableAfterTest(h.service);
+    h.service.bindNexumTopologyWriter("nexum-test", true);
+
+    const sync = await h.service.syncMap(h.targetMap) as any;
+    expect(sync.topology_sync).toMatchObject({ status: "blocked", attempted: false,
+      blockers: expect.arrayContaining(["systems[0].eveSystemId: canonical SDE solar-system identity is unavailable"]) });
+    expect(h.nexumWrites.writeWormholesystemsTopology).not.toHaveBeenCalled();
+    expect((h.service.preview(h.targetMap) as any).preview.topology_apply).toMatchObject({ eligible: false,
+      blockers: expect.arrayContaining(["systems[0].eveSystemId: canonical SDE solar-system identity is unavailable"]) });
     h.db.close();
   });
 
@@ -668,7 +1033,8 @@ describe("WormholeSystems service and MCP controls", () => {
     await configured(h.service, h.targetMap);
     await enableAfterTest(h.service);
     const sync = await h.service.syncMap(h.targetMap) as any;
-    expect(sync).toMatchObject({ status: "snapshot_validated", fetch_only: true, data_writes_enabled: false, nexum_writes_attempted: false,
+    expect(sync).toMatchObject({ status: "snapshot_validated", nexum_writes_attempted: false,
+      topology_sync: { status: "blocked", attempted: false },
       staleness_policy: { max_age_ms: 60_000, origin: "approved_default" } });
     const callsAfterFetch = transport.mock.calls.length;
     const preview = h.service.preview(h.targetMap) as any;
@@ -782,9 +1148,9 @@ describe("WormholeSystems service and MCP controls", () => {
     await configured(h.service, h.targetMap);
     await enableAfterTest(h.service);
     const result = await h.service.syncMap(h.targetMap);
-    expect(result).toMatchObject({ status: "snapshot_validated", fetch_only: true, data_writes_enabled: false,
+    expect(result).toMatchObject({ status: "snapshot_validated",
       source_calls: 4, snapshot_stored: true, systemCount: 2, signatureCount: 2, connectionCount: 1, auditRecordCount: 2,
-      nexum_writes_attempted: false });
+      nexum_writes_attempted: false, topology_sync: { status: "blocked", attempted: false } });
     expect(transport.mock.calls.map(call => String(call[0]))).toEqual([
       "https://wormholes.invalid/api/maps", "https://wormholes.invalid/api/maps/api-map-7",
       "https://wormholes.invalid/api/map-solarsystems/map-system-a", "https://wormholes.invalid/api/map-solarsystems/map-system-b",
@@ -796,6 +1162,10 @@ describe("WormholeSystems service and MCP controls", () => {
     const fixture = JSON.parse(stored.payload_json).fixture;
     expect(fixture.scope.eveSolarSystemIds).toEqual([31_000_001, 31_000_002]);
     expect(fixture.systems.map((system: any) => system.sourceSystemId)).toEqual(["map-system-a", "map-system-b"]);
+    expect(fixture.topologyEvidence.systems).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sourceSystemId: "map-system-a", positionX: null, positionY: null }),
+      expect.objectContaining({ sourceSystemId: "map-system-b", positionX: null, positionY: null }),
+    ]));
     expect(fixture.signatures.map((signature: any) => signature.sourceSignatureId)).toEqual(["source-row-a", "source-row-b"]);
     expect(fixture.signatures.map((signature: any) => signature.signatureCode)).toEqual(["ABC-123", "DEF-456"]);
     expect(fixture.signatures.every((signature: any) => signature.sourceSignatureId !== signature.signatureCode)).toBe(true);
@@ -811,8 +1181,8 @@ describe("WormholeSystems service and MCP controls", () => {
     h.store.saveState(h.targetMap, cachedState);
     const preview = h.service.preview(h.targetMap) as any;
     expect(preview.preview).toMatchObject({ local_only: true, upstream_calls: 0, writes_enabled: false });
-    expect(preview.preview.topology_apply).toMatchObject({ eligible: false,
-      blockers: expect.arrayContaining(["systems[0].positionX: verified source-owned map position is unavailable"]) });
+    expect(preview.preview.topology_apply.eligible).toBe(false);
+    expect(preview.preview.topology_apply.blockers).not.toContain("systems[0].positionX: verified source-owned map position is unavailable");
     expect(preview.preview.alliance_notes).toHaveLength(2);
     expect(preview.preview.alliance_notes.every((note: any) => note.eligible_for_write === false && note.blocking_fields.length > 0)).toBe(true);
     expect(preview.preview.alliance_notes.every((note: any) => !("desired_note" in note) && !("actual_note" in note) &&
@@ -869,7 +1239,8 @@ describe("WormholeSystems service and MCP controls", () => {
       { id: "nexum-row-b", signature: "DEF-456", status: "active", notes: "..1-0 DEF-456 C2 medium" },
     ]);
 
-    expect(await h.service.syncMap(h.targetMap)).toMatchObject({ status: "snapshot_validated", fetch_only: true, nexum_writes_attempted: false });
+    expect(await h.service.syncMap(h.targetMap)).toMatchObject({ status: "snapshot_validated", nexum_writes_attempted: false,
+      linked_note_writes_attempted: false });
     expect(h.nexumWrites.writeWormholesystemsSignatureNotes).not.toHaveBeenCalled();
     const preview = h.service.preview(h.targetMap) as any;
     expect(preview.preview.unmatched).toContainEqual(expect.objectContaining({ source_signature_id: "source-unconnected",
@@ -1327,11 +1698,13 @@ describe("WormholeSystems service and MCP controls", () => {
     const h = harness(transport as typeof fetch);
     registerWormholeSystemsTools(server as any, () => h.service);
     for (const name of ["wormholesystems_add_credential", "wormholesystems_test_connection", "wormholesystems_enable_sync", "wormholesystems_disable_sync", "wormholesystems_list_maps", "wormholesystems_get_config",
+      "wormholesystems_bind_nexum_topology_writer",
       "wormholesystems_remove_config", "wormholesystems_sync_map", "wormholesystems_map_sync_status", "wormholesystems_preview_map_sync",
       "wormholesystems_reconcile_linked_notes",
       "wormholesystems_set_max_staleness"])
       expect(registered.has(name)).toBe(true);
-    expect(descriptions.get("wormholesystems_sync_map")).toMatch(/source GETs only.*never writes/i);
+    expect(descriptions.get("wormholesystems_sync_map")).toMatch(/complete eligible v2 topology\/signature snapshot.*same invocation/i);
+    expect(descriptions.get("wormholesystems_bind_nexum_topology_writer")).toMatch(/confirms.*wormholesystems_sync scope.*v2 endpoint/i);
     expect(descriptions.get("wormholesystems_preview_map_sync")).toMatch(/local-only.*classification.*zero upstream/i);
     expect(descriptions.get("wormholesystems_reconcile_linked_notes")).toMatch(/PATCH.*linked-direction.*never acts on unconnected/i);
     const redacted = redactSecrets([{ jsonrpc: "2.0", method: "tools/call", params: {

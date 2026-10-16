@@ -76,10 +76,19 @@ describe("Nexum credentials and canonical synchronization",()=>{
   });
   it("routes source-owned topology PUT and signature-note PATCH through Nexum's configured map transport",async()=>{
     await enroll();
-    const request={sourceIdentity:"wormholesystems:source-map",snapshot:{complete:true,revision:"rev",fetchedAt:"2026-10-13T11:59:59.000Z",
-      observedAt:"2026-10-13T11:59:59.000Z",maxAgeMs:30_000},systems:[],connections:[]};
-    await service.writeWormholesystemsTopology(mapId,request);
-    expect(up.put).toHaveBeenCalledWith(base,key,`${endpoint}/wormholesystems/topology`,request,expect.any(AbortSignal));
+    const selectedKey=crypto.randomBytes(32).toString("base64url"),selected=await enroll("selected writer",selectedKey);
+    const request={schemaVersion:2,sourceIdentity:'wormholesystems:["https://source.example","source-map"]',
+      snapshot:{complete:true,fetchedAt:"2026-10-13T11:59:59.000Z"},systems:[],connections:[],signatures:[]};
+    await service.writeWormholesystemsTopology(mapId,request,selected.id,{baseUrl:base,nexumMapId:"map-1"});
+    expect(up.put).toHaveBeenCalledWith(base,selectedKey,`${endpoint}/wormholesystems/topology`,request,expect.any(AbortSignal));
+    up.bad.add(selectedKey);
+    await expect(service.writeWormholesystemsTopology(mapId,request,selected.id,{baseUrl:base,nexumMapId:"map-1"}))
+      .rejects.toMatchObject({status:403});
+    expect(up.put).toHaveBeenCalledTimes(2);
+    expect(up.put.mock.calls[1][1]).toBe(selectedKey);
+    await expect(service.writeWormholesystemsTopology(mapId,request,selected.id,{baseUrl:"https://wrong.example",nexumMapId:"map-1"}))
+      .rejects.toMatchObject({status:0});
+    expect(up.put).toHaveBeenCalledTimes(2);
 
     prepareNoteRow("sig-row-1");
     await expect(service.writeWormholesystemsSignatureNotes(mapId,[{systemId:"s1",signatureId:"sig-row-1",notes:".0-1 ABC-123 C3 medium",expectedIdentity:noteIdentity()}],()=>[]))
@@ -92,6 +101,16 @@ describe("Nexum credentials and canonical synchronization",()=>{
     await expect(service.writeWormholesystemsSignatureNotes(mapId,[{systemId:"s1",signatureId:"sig-row-2",notes:".1-2 DEF-456 C4 large",expectedIdentity:noteIdentity()}],()=>[]))
       .resolves.toMatchObject({status:"blocked",written:0});
     expect(up.patch).not.toHaveBeenCalled();
+  });
+  it("invalidates map and signature freshness after an acknowledged topology reconciliation",async()=>{
+    await enroll();
+    store.saveState(mapId,{systems:[{id:"s1",eveSystemId:31000001}],connections:[],routes:[]});
+    store.saveResource(mapId,"s1","signatures",[{id:"old-row",signature:"OLD-123"}]);
+    store.patchMap(mapId,{health:"live",hydrated_at:store.now()});
+    await service.invalidateWormholesystemsTopologyCache(mapId);
+    expect(store.map(mapId)).toMatchObject({health:"degraded",hydrated_at:null,last_rest_success_at:null});
+    expect(store.resources(mapId,"s1").signatures).toMatchObject({items:[],status:"uninitialized"});
+    expect(store.state(mapId).systems).toEqual([{id:"s1",eveSystemId:31000001}]);
   });
   it("serializes source alliance-note patches through the existing per-map Nexum queue",async()=>{
     await enroll();
@@ -479,5 +498,14 @@ describe("remote tool security and SSE transport",()=>{
     await expect(new HttpNexumTransport().put!(base,key,`${endpoint}/wormholesystems/topology`,body)).resolves.toEqual({createdSystems:1});
     expect(fetcher).toHaveBeenCalledWith(base+`${endpoint}/wormholesystems/topology`,expect.objectContaining({method:"PUT",body:JSON.stringify(body),
       redirect:"error",headers:expect.objectContaining({Authorization:`Bearer ${key}`,"Content-Type":"application/json"})}));
+  });
+  it("rejects oversized topology bodies before HTTP and bounds acknowledged response bytes",async()=>{
+    const fetcher=vi.spyOn(globalThis,"fetch").mockResolvedValue(new Response("{}",{status:200}));
+    const oversized={payload:"x".repeat(16*1024*1024)};
+    await expect(new HttpNexumTransport().put!(base,key,`${endpoint}/wormholesystems/topology`,oversized)).rejects.toMatchObject({status:413});
+    expect(fetcher).not.toHaveBeenCalled();
+    fetcher.mockResolvedValueOnce(new Response("x".repeat(1024*1024+1),{status:200}));
+    await expect(new HttpNexumTransport().put!(base,key,`${endpoint}/wormholesystems/topology`,{})).rejects.toMatchObject({
+      status:0,message:"Nexum topology response exceeds the size limit"});
   });
 });

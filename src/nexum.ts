@@ -475,14 +475,27 @@ export class NexumService {
     if(credential)await this.reconcileChain(m.id,credential);
     return this.chainDiagnostics(m.id);
   });}
-  async writeWormholesystemsTopology(map:string,request:Record<string,unknown>):Promise<Json>{
-    const m=this.store.map(map),writer=this.candidates(m.id)[0];
-    if(!writer)throw new NexumError(0,0,"No Nexum credential has access to the selected map");
+  async writeWormholesystemsTopology(map:string,request:Record<string,unknown>,writerCredentialId:string,
+    binding:{baseUrl:string;nexumMapId:string}):Promise<Json>{
+    const m=this.store.map(map),base=this.nexumBase();
+    if(!writerCredentialId||!binding||binding.baseUrl!==base||m.base_url!==base||m.nexum_map_id!==binding.nexumMapId)
+      throw new NexumError(0,0,"Selected Nexum map/base binding changed");
+    const writer=this.store.credentials().find(candidate=>candidate.id===writerCredentialId);
+    if(!writer||!writer.enabled||writer.base_url!==base||
+      !this.store.access(m.id).some(access=>access.credential_id===writerCredentialId))
+      throw new NexumError(0,0,"The explicitly selected Nexum writer is unavailable or lacks access to the selected map");
     if(!this.transport.put)throw new NexumError(0,0,"Configured Nexum transport has no PUT support");
     const retryAt=this.store.credential(writer.id).retry_at??0;
     if(retryAt>this.now())throw new NexumError(429,retryAt-this.now(),"Nexum rate limited");
-    return this.transport.put(this.nexumBase(),this.secrets.get(writer.secret_ref),
+    return this.transport.put(base,this.secrets.get(writer.secret_ref),
       `${prefix(m)}/wormholesystems/topology`,request,this.lifetime.signal);
+  }
+  invalidateWormholesystemsTopologyCache(map:string):Promise<void>{
+    const m=this.store.map(map);
+    return mapDecisionBoundary.run(m.id,()=>this.store.db.transaction(()=>{
+      this.store.db.prepare("DELETE FROM nexum_resources WHERE map_id=? AND kind='signatures'").run(m.id);
+      this.store.patchMap(m.id,{hydrated_at:null,health:"degraded",last_rest_success_at:null});
+    })());
   }
   writeWormholesystemsSignatureNotes(map:string,changes:WormholesystemsSignatureNoteChange[],validateSource:()=>string[]):Promise<Json>{
     const m=this.store.map(map);
