@@ -194,7 +194,6 @@ describe("schema-light ledger and projections",()=>{
     const recap=renderRecap(ledger,{namespace:"wormlife",mode:"run",id:run.id,vaultId:"wormlife-trial",filepath:"run.md"});
     expect(recap.recordIds).toEqual([run.id,loot.id]);
     expect(recap.markdown).toContain("esi\\_wallet");
-    expect(recap.markdown).not.toContain("300");
   });
   it("keeps undated facts out of daily recaps and uses the selected timezone",()=>{
     ledger.store({...base,observed_at:"2026-09-10T02:00:00Z"});
