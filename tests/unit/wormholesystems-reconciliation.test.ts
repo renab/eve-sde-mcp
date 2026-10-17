@@ -7,6 +7,7 @@ import {
 } from "../../src/wormholesystems-reconciliation.js";
 import { normalizeSourceSnapshot } from "../../src/wormholesystems-adapter.js";
 import { canonicalSolarSystemClassFromSde } from "../../src/wormholesystems.js";
+import { resolveTypeName } from "../../src/utils.js";
 
 const now = Date.parse("2026-10-13T12:00:00.000Z");
 const at = new Date(now - 1_000).toISOString();
@@ -40,6 +41,21 @@ function completeSourceSnapshot(detailPosition?: { memberId: string; position: u
 }
 
 describe("WormholeSystems source-owned Nexum reconciliation", () => {
+  it("resolves exact site display names only from bound invTypes IDs", () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE invTypes (typeID INTEGER PRIMARY KEY, typeName TEXT); CREATE TABLE mapSolarSystems (solarSystemID INTEGER PRIMARY KEY, solarSystemName TEXT)");
+    db.prepare("INSERT INTO invTypes VALUES (?,?)").run(197, "Sleeper Cache");
+    db.prepare("INSERT INTO invTypes VALUES (?,?)").run(198, "  ");
+    expect(resolveTypeName(db, 197)).toBe("Sleeper Cache");
+    expect(resolveTypeName(db, "197")).toBe("Sleeper Cache");
+    expect(resolveTypeName(db, null)).toBeNull();
+    expect(resolveTypeName(db, "197x")).toBeNull();
+    expect(resolveTypeName(db, Number.MAX_SAFE_INTEGER + 1)).toBeNull();
+    expect(resolveTypeName(db, 999)).toBeNull();
+    expect(resolveTypeName(db, 198)).toBeNull();
+    db.close();
+  });
+
   it("rejects a selected-system position that contradicts the map member canvas position", () => {
     const result = completeSourceSnapshot({ memberId: "member-home", position: { x: 999, y: 20 } });
     expect(result.ok).toBe(false);
@@ -76,12 +92,12 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
       toSourceSystemId: "member-branch", sourceSignatureId: "signature-resource-a", targetSignatureId: "signature-resource-b",
       connection_type: "standard", ship_size: "medium" }]);
     expect(projection.candidate.signatures).toEqual([
-      { sourceSignatureId: "signature-resource-a", sourceSystemId: "member-home", sourceConnectionId: "edge-a", sigId: "ABC-123", sigType: "unknown", whType: "" },
-      { sourceSignatureId: "signature-resource-b", sourceSystemId: "member-branch", sourceConnectionId: "edge-a", sigId: "DEF-456", sigType: "unknown", whType: "" },
+      { sourceSignatureId: "signature-resource-a", sourceSystemId: "member-home", sourceConnectionId: "edge-a", sigId: "ABC-123", sigType: "unknown", whType: "", name: null },
+      { sourceSignatureId: "signature-resource-b", sourceSystemId: "member-branch", sourceConnectionId: "edge-a", sigId: "DEF-456", sigType: "unknown", whType: "", name: null },
     ]);
     const request = validateWormholesystemsTopologyRequest(projection.candidate, now);
     expect(request).toEqual({ request: {
-      schemaVersion: 2,
+      schemaVersion: 3,
       sourceIdentity: `wormholesystems:${JSON.stringify(["https://source.example", "source-map"])}`,
       snapshot: { complete: true, fetchedAt: at },
       systems: [
@@ -92,13 +108,13 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
         sourceSignatureId: "signature-resource-a", targetSignatureId: "signature-resource-b",
         connection_type: "standard", ship_size: "medium" }],
       signatures: [
-        { sourceSignatureId: "signature-resource-a", sourceSystemId: "member-home", sourceConnectionId: "edge-a", sigId: "ABC-123", sigType: "unknown", whType: "" },
-        { sourceSignatureId: "signature-resource-b", sourceSystemId: "member-branch", sourceConnectionId: "edge-a", sigId: "DEF-456", sigType: "unknown", whType: "" },
+        { sourceSignatureId: "signature-resource-a", sourceSystemId: "member-home", sourceConnectionId: "edge-a", sigId: "ABC-123", sigType: "unknown", whType: "", name: null },
+        { sourceSignatureId: "signature-resource-b", sourceSystemId: "member-branch", sourceConnectionId: "edge-a", sigId: "DEF-456", sigType: "unknown", whType: "", name: null },
       ],
     }, blockers: [] });
     expect(Object.keys(request.request!.snapshot).sort()).toEqual(["complete", "fetchedAt"]);
     expect(Object.keys(request.request!.connections[0]).sort()).toEqual(["connection_type", "fromSourceSystemId", "ship_size", "sourceConnectionId", "sourceSignatureId", "targetSignatureId", "toSourceSystemId"]);
-    expect(Object.keys(request.request!.signatures[0]).sort()).toEqual(["sigId", "sigType", "sourceConnectionId", "sourceSignatureId", "sourceSystemId", "whType"]);
+    expect(Object.keys(request.request!.signatures[0]).sort()).toEqual(["name", "sigId", "sigType", "sourceConnectionId", "sourceSignatureId", "sourceSystemId", "whType"]);
     expect(fixture.connections).toMatchObject([{ sourceConnectionId: "edge-a", state: "unknown" }]);
     expect(fixture.topologyEvidence?.connections).toEqual([{ sourceConnectionId: "edge-a", fromSourceSystemId: "member-home",
       toSourceSystemId: "member-branch", connectionType: "wormhole", size: "medium" }]);
@@ -111,6 +127,20 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
     // Expired mass/lifetime annotations and inactive visual signature status do
     // not remove a connection that is present in the complete map list.
     expect(request.request?.connections).toHaveLength(1);
+  });
+
+  it("projects exact type names from SDE lookup and leaves unresolved IDs null with keyed diagnostics", () => {
+    const result = completeSourceSnapshot();
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    Object.assign(result.fixture.sourceSignatureEvidence![0], { signatureTypeId: 197 });
+    Object.assign(result.fixture.sourceSignatureEvidence![1], { signatureTypeId: 999 });
+    const projection = topologyProjectionFromFixture(result.fixture, id => Number(id) === 197 ? "Sleeper Cache" : null);
+    expect(projection.candidate.signatures).toMatchObject([
+      { sourceSignatureId: "signature-resource-a", name: "Sleeper Cache" },
+      { sourceSignatureId: "signature-resource-b", name: null },
+    ]);
+    expect(projection.diagnostics).toContain("signatures[signature-resource-b]: SDE display name unresolved (name_unresolved)");
   });
 
   it.each([
@@ -216,8 +246,7 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
       const signatures = projection.candidate.signatures as Array<{ sigType: string; whType: string }>;
       expect(signatures).toHaveLength(2);
       expect(signatures.every(signature => signature.sigType === "unknown" && signature.whType === "")).toBe(true);
-      expect(projection.diagnostics).toHaveLength(2);
-      expect(projection.diagnostics.every(message => message.includes("type_unmapped"))).toBe(true);
+      expect(projection.diagnostics.filter(message => message.includes("type_unmapped"))).toHaveLength(2);
       const validated = validateWormholesystemsTopologyRequest(projection.candidate, now);
       expect(validated.blockers).toEqual([]);
       expect(validated.request?.signatures).toHaveLength(2);
@@ -328,10 +357,10 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
     const projection = topologyProjectionFromFixture(normalized.fixture);
     expect(projection.blockers).toEqual([]);
     expect(projection.candidate.signatures).toContainEqual({ sourceSignatureId: "signature-standalone", sourceSystemId: "member-home",
-      sourceConnectionId: null, sigId: "", sigType: "unknown", whType: "" });
+      sourceConnectionId: null, sigId: "", sigType: "unknown", whType: "", name: null });
     const checked = validateWormholesystemsTopologyRequest(projection.candidate, now);
     expect(checked.request?.signatures).toContainEqual({ sourceSignatureId: "signature-standalone", sourceSystemId: "member-home",
-      sourceConnectionId: null, sigId: "", sigType: "unknown", whType: "" });
+      sourceConnectionId: null, sigId: "", sigType: "unknown", whType: "", name: null });
   });
 
   it("omits unavailable coordinate pairs and rejects partial or malformed pairs", () => {
@@ -436,6 +465,30 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
       createdSignatures: 0, preservedSignatures: 0, updatedSignatures: 0, deletedSignatures: 0, conflicts: [],
       checkpoint: { accepted: true, replayed: false, partial: false } }))
       .toMatchObject({ request_status: "succeeded", status: "completed", reconciliation_status: "unchanged", conflict_count: 0 });
+  });
+
+  it("preserves bounded dependency identities in conflicts and skipped-deletion outcomes", () => {
+    const summary = summarizeTopologyWriteResponse({ createdSystems: 0, preservedSystems: 0, updatedSystems: 0, deletedSystems: 0,
+      createdConnections: 0, preservedConnections: 0, updatedConnections: 0, deletedConnections: 0,
+      createdSignatures: 0, preservedSignatures: 0, updatedSignatures: 0, deletedSignatures: 0,
+      conflicts: [{ itemKind: "system", sourceItemId: "member-1", reasonCode: "dependent_anomaly",
+        reason: "removed source system is referenced by anomaly; preserved",
+        dependency: { kind: "anomaly", id: "anomaly-1" } }],
+      outcomes: { totalsByKind: { system: { skipped_deletion: 1 } },
+        items: { skipped_deletion: [{ itemKind: "system", sourceItemId: "member-1", reasonCode: "dependent_anomaly",
+          dependency: { kind: "anomaly", id: "anomaly-1" } }] }, omittedByOutcome: {} },
+      checkpoint: { accepted: true, replayed: false, partial: true } });
+
+    expect(summary.conflicts).toEqual([{ kind: "system", source_id: "member-1", reason_code: "dependent_anomaly",
+      reason: "Nexum reported a row-level reconciliation conflict", dependency: { kind: "anomaly", id: "anomaly-1" } }]);
+    expect(summary.outcomes.items).toEqual([{ item_kind: "system", source_item_id: "member-1", outcome: "skipped_deletion",
+      reason_code: "dependent_anomaly", dependency: { kind: "anomaly", id: "anomaly-1" } }]);
+    const rejectedDependency = summarizeTopologyWriteResponse({ createdSystems: 0, preservedSystems: 0, updatedSystems: 0, deletedSystems: 0,
+      createdConnections: 0, preservedConnections: 0, updatedConnections: 0, deletedConnections: 0,
+      createdSignatures: 0, preservedSignatures: 0, updatedSignatures: 0, deletedSignatures: 0,
+      conflicts: [{ itemKind: "system", sourceItemId: "member-1", dependency: { kind: "private_table", id: "x" } }],
+      checkpoint: { accepted: true, replayed: false, partial: true } });
+    expect(rejectedDependency.conflicts[0]).not.toHaveProperty("dependency");
   });
 });
 
