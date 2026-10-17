@@ -13,6 +13,7 @@ export function normalizeBaseUrl(value: string): string {
 export interface NexumStream { events: AsyncIterable<Json>; close(): void; }
 export interface NexumTransport {
   get(base: string, key: string, endpoint: string, signal?: AbortSignal): Promise<any>;
+  post?(base: string, key: string, endpoint: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<any>;
   patch?(base: string, key: string, endpoint: string, body: Record<string,unknown>, signal?: AbortSignal): Promise<any>;
   put?(base: string, key: string, endpoint: string, body: Record<string,unknown>, signal?: AbortSignal): Promise<any>;
   stream(base: string, key: string, endpoint: string, signal?: AbortSignal): Promise<NexumStream>;
@@ -78,6 +79,17 @@ export class HttpNexumTransport implements NexumTransport {
     const s=AbortSignal.any([AbortSignal.timeout(20_000),...(signal?[signal]:[])]);
     const r=await this.request(base,key,endpoint,s);
     try{return parseEsiJson(await r.text());}catch{throw new NexumError(0,0,"Malformed Nexum response");}
+  }
+  async post(base:string,key:string,endpoint:string,body:Record<string,unknown>,signal?:AbortSignal):Promise<any> {
+    const s=AbortSignal.any([AbortSignal.timeout(20_000),...(signal?[signal]:[])]);
+    let serialized:string;
+    try{serialized=JSON.stringify(body);}catch{throw new NexumError(400,0,"Invalid Nexum JSON request");}
+    if(Buffer.byteLength(serialized,"utf8")>256_000)throw new NexumError(413,0,"Nexum ownership request exceeds the size limit");
+    try {
+      const r=await fetch(base+endpoint,{method:"POST",headers:{Authorization:`Bearer ${key}`,Accept:"application/json","Content-Type":"application/json"},body:serialized,redirect:"error",signal:s});
+      if(!r.ok){const retry=r.headers.get("retry-after"),ms=retry?(/^\d+(\.\d+)?$/.test(retry)?Number(retry)*1000:Math.max(0,Date.parse(retry)-Date.now())):0;await r.body?.cancel();throw new NexumError(r.status,Number.isFinite(ms)?ms:0,`Nexum HTTP ${r.status}`);}
+      const text=await readBoundedText(r,1024*1024); return text?parseEsiJson(text):{};
+    } catch(e){if(e instanceof NexumError)throw e;throw new NexumError();}
   }
   async patch(base:string,key:string,endpoint:string,body:Record<string,unknown>,signal?:AbortSignal):Promise<any> {
     const s=AbortSignal.any([AbortSignal.timeout(20_000),...(signal?[signal]:[])]);

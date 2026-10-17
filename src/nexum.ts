@@ -22,8 +22,10 @@ const presenceCoverage=()=>({
 });
 type Worker={controller:AbortController; task:Promise<void>; credential?:string; stream?:NexumStream};
 export type WormholesystemsSignatureNoteIdentity={connectionId:string;fromSystemId:string;toSystemId:string;
-  fromEveSystemId:number;toEveSystemId:number;signatureCode:string;maxStalenessMs:number;stalenessPolicyRevision:string};
+  fromEveSystemId:number;toEveSystemId:number;signatureCode:string;sourceIdentity:string;sourceSignatureId:string;nexumSignatureId:string;
+  maxStalenessMs:number;stalenessPolicyRevision:string};
 export type WormholesystemsSignatureNoteChange={systemId:string;signatureId:string;notes:string;expectedIdentity:WormholesystemsSignatureNoteIdentity};
+export type WormholesystemsOwnershipBinding={credentialId:string;baseUrl:string;nexumMapId:string};
 export interface NexumOptions { debounceMs?:number; staleMs?:number; retentionMs?:number; retryMs?:number; accessRefreshMs?:number; random?:()=>number; }
 
 export class NexumService {
@@ -497,26 +499,46 @@ export class NexumService {
       this.store.patchMap(m.id,{hydrated_at:null,health:"degraded",last_rest_success_at:null});
     })());
   }
-  writeWormholesystemsSignatureNotes(map:string,changes:WormholesystemsSignatureNoteChange[],validateSource:()=>string[]):Promise<Json>{
+  writeWormholesystemsSignatureNotes(map:string,changes:WormholesystemsSignatureNoteChange[],validateSource:()=>string[],
+    ownershipBinding?:WormholesystemsOwnershipBinding):Promise<Json>{
     const m=this.store.map(map);
     if(!changes.length)return Promise.resolve({written:0});
-    return this.enqueueValue(m.id,()=>mapDecisionBoundary.run(m.id,()=>this.writeWormholesystemsSignatureNotesLocked(m.id,changes,validateSource)));
+    return this.enqueueValue(m.id,()=>mapDecisionBoundary.run(m.id,()=>this.writeWormholesystemsSignatureNotesLocked(m.id,changes,validateSource,ownershipBinding)));
   }
-  private async writeWormholesystemsSignatureNotesLocked(mapId:string,changes:WormholesystemsSignatureNoteChange[],validateSource:()=>string[]):Promise<Json>{
+  private async attestOwnedSignature(mapId:string,identity:WormholesystemsSignatureNoteIdentity,
+    binding?:WormholesystemsOwnershipBinding):Promise<boolean>{
+    if(!binding||!this.transport.post)return false;
+    const map=this.store.map(mapId),base=this.nexumBase();
+    if(binding.baseUrl!==base||map.base_url!==base||binding.nexumMapId!==map.nexum_map_id)return false;
+    const writer=this.store.credentials().find(candidate=>candidate.id===binding.credentialId);
+    if(!writer||!writer.enabled||writer.base_url!==base||!this.store.access(mapId).some(access=>access.credential_id===writer.id))return false;
+    const retryAt=this.store.credential(writer.id).retry_at??0;
+    if(retryAt>this.now())return false;
+    try{
+      const result=await this.transport.post(base,this.secrets.get(writer.secret_ref),
+        `${prefix(map)}/wormholesystems/ownership`,{sourceIdentity:identity.sourceIdentity,
+          items:[{sourceSignatureId:identity.sourceSignatureId,rowId:identity.nexumSignatureId}]},this.lifetime.signal);
+      const items=Array.isArray(result?.items)?result.items:[];
+      return items.length===1&&items[0]?.sourceSignatureId===identity.sourceSignatureId&&
+        items[0]?.rowId===identity.nexumSignatureId&&items[0]?.owned===true;
+    }catch{return false;}
+  }
+  private async writeWormholesystemsSignatureNotesLocked(mapId:string,changes:WormholesystemsSignatureNoteChange[],validateSource:()=>string[],
+    ownershipBinding?:WormholesystemsOwnershipBinding):Promise<Json>{
     const m=this.store.map(mapId);
     const writer=this.candidates(m.id)[0];
     if(!writer)throw new NexumError(0,0,"No Nexum credential has access to the selected map");
     if(!this.transport.patch)throw new NexumError(0,0,"Configured Nexum transport has no PATCH support");
     const retryAt=this.store.credential(writer.id).retry_at??0;
     if(retryAt>this.now())throw new NexumError(429,retryAt-this.now(),"Nexum rate limited");
-    const items:Array<{item_index:number;status:"written"|"unchanged"|"blocked"|"failed"|"not_attempted";warnings?:string[]}>=
+    const items:Array<{item_index:number;status:"written"|"unchanged"|"blocked"|"failed"|"not_attempted";warnings?:string[];reason_code?:string}>=
       changes.map((_,item_index)=>({item_index,status:"not_attempted"}));
     const localCacheWarnings:string[]=[];
     const result=(status:"blocked"|"unchanged"|"completed"|"failed",blockers:string[]=[]):Json=>({
       written:items.filter(item=>item.status==="written").length,status,items,...(blockers.length?{blockers}:{}),
       ...(localCacheWarnings.length?{local_cache_status:"degraded",warnings:[...localCacheWarnings]}:{}),
     });
-    const block=(itemIndex:number,blockers:string[])=>{items[itemIndex].status="blocked";return result("blocked",blockers);};
+    const block=(itemIndex:number,blockers:string[],reasonCode?:string)=>{items[itemIndex].status="blocked";if(reasonCode)items[itemIndex].reason_code=reasonCode;return result("blocked",blockers);};
     for(const [itemIndex,change] of changes.entries()){
       const sourceBlockers=validateSource();
       if(sourceBlockers.length)return block(itemIndex,sourceBlockers);
@@ -538,11 +560,13 @@ export class NexumService {
       const resource=this.store.resources(m.id,change.systemId),signatures=resource.signatures.items as Json[];
       const matchingRows=signatures.filter(signature=>String(signature.id)===change.signatureId);
       const actual=matchingRows[0];
-      if(matchingRows.length!==1||String(change.systemId)!==identity.fromSystemId||actual.signature!==identity.signatureCode||actual.status!=="active")
-        return block(itemIndex,["current Nexum directional signature identity changed after alliance-note preview"]);
-      if(typeof actual.notes!=="string")return block(itemIndex,["current Nexum signature note is unknown"]);
-      if(actual.notes===change.notes){items[itemIndex].status="unchanged";continue;}
-      if(actual.notes!=="")return block(itemIndex,["current Nexum note changed after preview; non-empty notes are preserved"]);
+       if(matchingRows.length!==1||String(change.systemId)!==identity.fromSystemId||actual.signature!==identity.signatureCode||actual.status!=="active")
+         return block(itemIndex,["current Nexum directional signature identity changed after alliance-note preview"]);
+       if(typeof actual.notes!=="string")return block(itemIndex,["current Nexum signature note is unknown"]);
+       const owned=await this.attestOwnedSignature(m.id,identity,ownershipBinding);
+       if(actual.notes===change.notes){items[itemIndex].status="unchanged";continue;}
+       if(actual.notes!==""&&!owned)return block(itemIndex,["current non-empty Nexum note is preserved because Galaxy ownership could not be proven"],
+         "note_skipped_unproven_ownership");
       const map=this.store.map(m.id),mapFetchedAt=map.hydrated_at===null||map.hydrated_at===undefined?NaN:Number(map.hydrated_at),resourceFetchedAt=resource.signatures.fetched_at===null||resource.signatures.fetched_at===undefined?NaN:Number(resource.signatures.fetched_at);
       if(!Number.isSafeInteger(identity.maxStalenessMs)||identity.maxStalenessMs<1||typeof identity.stalenessPolicyRevision!=="string"||!identity.stalenessPolicyRevision||
           map.health!=="live"||!Number.isFinite(mapFetchedAt)||mapFetchedAt>this.now()||this.now()-mapFetchedAt>identity.maxStalenessMs||

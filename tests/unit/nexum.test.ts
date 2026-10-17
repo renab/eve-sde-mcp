@@ -22,7 +22,7 @@ class Feed implements NexumStream {
   events=(async function*(this:Feed){while(!this.closed){if(this.queue.length)yield this.queue.shift()!;else await new Promise<void>(r=>this.wake=r);}if(this.error)throw this.error;}).call(this);
 }
 class Upstream {
-  calls:string[]=[];feeds:Feed[]=[];bad=new Set<string>();visible:Json[]=[{id:"map-1",name:"Wormlife"}];
+  calls:string[]=[];feeds:Feed[]=[];bad=new Set<string>();visible:Json[]=[{id:"map-1",name:"Wormlife"}];owned=false;
   get=vi.fn(async(_base:string,key:string,url:string)=>{
     this.calls.push(url);if(this.bad.has(key))throw new NexumError(401);
     if(url==="/api/v1/maps")return {maps:structuredClone(this.visible)};
@@ -31,6 +31,10 @@ class Upstream {
   });
   patch=vi.fn(async(_base:string,key:string,_url:string,_body:Record<string,unknown>)=>{
     if(this.bad.has(key))throw new NexumError(403);return {ok:true};
+  });
+  post=vi.fn(async(_base:string,key:string,_url:string,body:Record<string,any>)=>{
+    if(this.bad.has(key))throw new NexumError(403);
+    return {items:(body.items??[]).map((item:any)=>({...item,owned:this.owned}))};
   });
   put=vi.fn(async(_base:string,key:string,_url:string,_body:Record<string,unknown>)=>{
     if(this.bad.has(key))throw new NexumError(403);return {ok:true};
@@ -51,8 +55,9 @@ beforeEach(()=>{
 });
 afterEach(async()=>{await service.stop();store.db.close();fs.rmSync(tmp,{recursive:true,force:true});vi.restoreAllMocks();delete process.env.NEXUM_BASE_URL;});
 async function enroll(label="McGreggor",api_key=key){const c=await service.addCredential({api_key,label});await until(()=>store.map(mapId).health==="live");return c;}
-const noteIdentity=(signatureCode="ABC-123")=>({connectionId:"note-edge",fromSystemId:"s1",toSystemId:"s2",
-  fromEveSystemId:31000001,toEveSystemId:31000002,signatureCode,maxStalenessMs:30_000,stalenessPolicyRevision:"test-policy-revision"});
+const noteIdentity=(signatureCode="ABC-123",nexumSignatureId="sig-row")=>({connectionId:"note-edge",fromSystemId:"s1",toSystemId:"s2",
+  fromEveSystemId:31000001,toEveSystemId:31000002,signatureCode,sourceIdentity:'wormholesystems:["https://source.example","source-map"]',
+  sourceSignatureId:"source-sig",nexumSignatureId,maxStalenessMs:30_000,stalenessPolicyRevision:"test-policy-revision"});
 function prepareNoteRow(signatureId:string,notes=""){
   store.saveState(mapId,{systems:[{id:"s1",eveSystemId:31000001},{id:"s2",eveSystemId:31000002}],
     connections:[{id:"note-edge",sourceId:"s1",targetId:"s2",sourceSignatureId:signatureId,targetSignatureId:"partner-row",broken:false,timeStatus:"stable"}],routes:[]});
@@ -102,6 +107,26 @@ describe("Nexum credentials and canonical synchronization",()=>{
       .resolves.toMatchObject({status:"blocked",written:0});
     expect(up.patch).not.toHaveBeenCalled();
   });
+  it("overwrites a non-empty note only after a fresh map-bound ownership attestation",async()=>{
+    const writerKey=crypto.randomBytes(32).toString("base64url");
+    const credential=await enroll("source writer",writerKey);
+    const rowId="source-note-row";prepareNoteRow(rowId,"stale WHS note");up.owned=true;
+    const binding={credentialId:credential.id,baseUrl:base,nexumMapId:"map-1"};
+    const change={systemId:"s1",signatureId:rowId,notes:"new WHS note",expectedIdentity:noteIdentity("ABC-123",rowId)};
+    const result=await service.writeWormholesystemsSignatureNotes(mapId,[change],()=>[],binding);
+    expect(result).toMatchObject({written:1,status:"completed",items:[{status:"written"}]});
+    expect(up.post).toHaveBeenCalledWith(base,expect.any(String),`${endpoint}/wormholesystems/ownership`,{
+      sourceIdentity:change.expectedIdentity.sourceIdentity,items:[{sourceSignatureId:"source-sig",rowId}]},expect.any(AbortSignal));
+    expect(up.patch).toHaveBeenCalledWith(base,writerKey,`${endpoint}/systems/s1/signatures/${rowId}`,{notes:"new WHS note"},expect.any(AbortSignal));
+    expect(store.resources(mapId,"s1").signatures.items[0].notes).toBe("new WHS note");
+
+    prepareNoteRow("unknown-row","unrelated note");up.owned=false;up.patch.mockClear();
+    const skipped=await service.writeWormholesystemsSignatureNotes(mapId,[{...change,signatureId:"unknown-row",
+      expectedIdentity:noteIdentity("ABC-123","unknown-row")}],()=>[],binding);
+    expect(skipped).toMatchObject({status:"blocked",items:[{status:"blocked",reason_code:"note_skipped_unproven_ownership"}]});
+    expect(up.patch).not.toHaveBeenCalled();
+  });
+
   it("invalidates map and signature freshness after an acknowledged topology reconciliation",async()=>{
     await enroll();
     store.saveState(mapId,{systems:[{id:"s1",eveSystemId:31000001}],connections:[],routes:[]});

@@ -20,6 +20,27 @@ export function enrichTypeName(db: Database.Database, typeId: number): string {
   return row?.typeName ?? `Unknown(${typeId})`;
 }
 
+/** Resolve only an exact numeric SDE type ID; unresolved values never get a synthetic display name. */
+export function resolveTypeName(db: Database.Database, sourceTypeId: unknown): string | null {
+  if (sourceTypeId === null || sourceTypeId === undefined) return null;
+  let id: number | bigint;
+  if (typeof sourceTypeId === "number") {
+    if (!Number.isSafeInteger(sourceTypeId) || sourceTypeId < 1) return null;
+    id = sourceTypeId;
+  } else if (typeof sourceTypeId === "string" && /^(?:0|[1-9]\d{0,18})$/.test(sourceTypeId)) {
+    let integer: bigint;
+    try { integer = BigInt(sourceTypeId); } catch { return null; }
+    if (integer < 1n || integer > 9_223_372_036_854_775_807n) return null;
+    id = integer <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(integer) : integer;
+  } else return null;
+
+  const row = getStatements(db).typeName.get(id) as { typeName?: unknown } | undefined;
+  const name = row?.typeName;
+  if (typeof name !== "string" || [...name].length < 1 || [...name].length > 256 ||
+      name.trim() !== name || !name.trim() || /[\p{Cc}\p{Cf}]/u.test(name)) return null;
+  return name;
+}
+
 export function enrichSystemName(db: Database.Database, systemId: number): string {
   const row = getStatements(db).systemName.get(systemId) as { solarSystemName: string } | undefined;
   return row?.solarSystemName ?? `Unknown(${systemId})`;

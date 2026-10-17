@@ -21,7 +21,9 @@ const response = (payload: unknown, status = 200, headers: Record<string, string
 
 function harness(transport: typeof fetch = vi.fn(async () => response({ data: [] })), sleep: (ms: number) => Promise<void> = async () => {},
   systemClass?: (eveSystemId: number) => string | null, systemExists: (eveSystemId: number) => boolean = () => true,
-  now: () => number = () => Date.parse("2026-10-13T12:00:00.000Z")) {
+  now: () => number = () => Date.parse("2026-10-13T12:00:00.000Z"),
+  signatureTypeName: (sourceTypeId: unknown) => string | null = sourceTypeId => sourceTypeId == null ? null : `SDE Type ${sourceTypeId}`,
+  invTypesReadable: () => boolean = () => true) {
   const db = openStateDatabase(":memory:");
   const store = new NexumStore(db, now);
   const credential = { id: "nexum-test", base_url: "https://nexum.invalid", label: "fixture", enabled: true };
@@ -41,7 +43,7 @@ function harness(transport: typeof fetch = vi.fn(async () => response({ data: []
     }),
   };
   const service = new WormholeSystemsService(store, secrets, transport, now, sleep,
-    nexumWrites, systemClass, systemExists);
+    nexumWrites, systemClass, systemExists, signatureTypeName, invTypesReadable);
   const maps = store.maps();
   return { db, store, service, secrets, secretValues, nexumWrites, targetMap: maps.find(map => map.name === "Target")!.id, otherMap: maps.find(map => map.name === "Other")!.id };
 }
@@ -573,7 +575,7 @@ describe("WormholeSystems service and MCP controls", () => {
     h.db.close();
   });
 
-  it("fetches and PUTs the complete v2 snapshot in the same sync, including an unconnected unassigned signature", async () => {
+  it("fetches and PUTs the complete v3 snapshot in the same sync, including an unconnected unassigned signature", async () => {
     vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
     const mapDetail = { ...selectedMapDetail(), map_solarsystems: [{ id: "map-system-test", map_id: "api-map-7",
       solarsystem_id: 31_000_001, position: { x: 12, y: 34 } }] };
@@ -590,7 +592,7 @@ describe("WormholeSystems service and MCP controls", () => {
     await configured(h.service, h.targetMap);
     await enableAfterTest(h.service);
     const binding = h.service.bindNexumTopologyWriter("nexum-test", true);
-    expect(binding).toMatchObject({ bound: true, canonical_map_id: h.targetMap, nexum_map_id: "target-map", topology_schema_version: 2 });
+    expect(binding).toMatchObject({ bound: true, canonical_map_id: h.targetMap, nexum_map_id: "target-map", topology_schema_version: 3 });
     h.nexumWrites.writeWormholesystemsTopology.mockResolvedValue({
       createdSystems: 1, updatedSystems: 0, preservedSystems: 0, deletedSystems: 0,
       createdConnections: 0, updatedConnections: 0, preservedConnections: 0, deletedConnections: 0,
@@ -608,13 +610,13 @@ describe("WormholeSystems service and MCP controls", () => {
     expect(canonicalId).toBe(h.targetMap);
     expect(writerId).toBe("nexum-test");
     expect(bindingArgs).toEqual({ baseUrl: "https://nexum.invalid", nexumMapId: "target-map" });
-    expect(request).toMatchObject({ schemaVersion: 2,
+    expect(request).toMatchObject({ schemaVersion: 3,
       sourceIdentity: 'wormholesystems:["https://wormholes.invalid","api-map-7"]',
       snapshot: { complete: true, fetchedAt: sync.fetched_at },
       systems: [{ sourceSystemId: "map-system-test", eveSystemId: 31_000_001, positionX: 12, positionY: 34 }],
       connections: [],
       signatures: [{ sourceSignatureId: "source-signature-1", sourceSystemId: "map-system-test", sourceConnectionId: null,
-        sigId: "", sigType: "unknown", whType: "" }] });
+        sigId: "", sigType: "unknown", whType: "", name: null }] });
     expect(Object.isFrozen(request)).toBe(true);
     expect(JSON.stringify(request)).not.toContain("must-not-be-used");
     expect(h.nexumWrites.writeWormholesystemsSignatureNotes).not.toHaveBeenCalled();
@@ -689,7 +691,104 @@ describe("WormholeSystems service and MCP controls", () => {
     h.db.close();
   });
 
-  it("replays the identical frozen request after a lost response and refetches after its freshness deadline", async () => {
+  it("recovers an attempting marker after a committed PUT lost its response and refetches after freshness expires", async () => {
+    vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
+    const initialNow = Date.parse("2026-10-13T12:00:00.000Z");
+    let now = initialNow;
+    let resolvedName = "Original Site Name";
+    const detail = systemDetail("map-system-test", 31_000_001, [{ id: "source-signature-retry", signature_id: "ABC-123",
+      map_solarsystem_id: "map-system-test", signature_type_id: 197, signature_category_id: 2,
+      signature_category: { id: 2, name: "Data Site" }, signature_type: { id: 197, signature_category_id: 2 } }]);
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: selectedMapDetail() });
+      return response(detail);
+    });
+    const h = harness(transport as typeof fetch, undefined, undefined, () => true, () => now, () => resolvedName);
+    await configured(h.service, h.targetMap);
+    await enableAfterTest(h.service);
+    h.service.bindNexumTopologyWriter("nexum-test", true);
+    const counters = { createdSystems: 1, updatedSystems: 0, preservedSystems: 0, deletedSystems: 0,
+      createdConnections: 0, updatedConnections: 0, preservedConnections: 0, deletedConnections: 0,
+      createdSignatures: 0, updatedSignatures: 0, preservedSignatures: 0, deletedSignatures: 0, conflicts: [] };
+    let nexumCommitted = false;
+    h.nexumWrites.writeWormholesystemsTopology.mockImplementationOnce(async () => {
+      nexumCommitted = true;
+      throw new Error("simulated lost PUT response after Nexum committed");
+    }).mockImplementationOnce(async () => {
+      expect(nexumCommitted).toBe(true);
+      return { ...counters, checkpoint: { accepted: true, replayed: true, partial: false } } as any;
+    }).mockResolvedValueOnce({ ...counters, checkpoint: { accepted: true, replayed: false, partial: false } } as any);
+
+    const first = await h.service.syncMap(h.targetMap) as any;
+    expect(first.topology_sync).toMatchObject({ status: "indeterminate", attempted: true, indeterminate: true });
+    const firstRequest = h.nexumWrites.writeWormholesystemsTopology.mock.calls[0][1] as any;
+    const firstBytes = JSON.stringify(firstRequest);
+    expect(firstRequest.signatures[0].name).toBe("Original Site Name");
+    const persisted = h.db.prepare("SELECT write_outcomes_json FROM wormholesystems_source_runs WHERE map_id=? ORDER BY id DESC LIMIT 1")
+      .get(h.targetMap) as { write_outcomes_json: string };
+    const frozen = JSON.parse(persisted.write_outcomes_json).frozen_request;
+    expect(frozen.request_json).toBe(firstBytes);
+    expect(frozen.request_digest).toMatch(/^[a-f0-9]{64}$/);
+    expect(frozen.provenance.nameResolutionDigest).toMatch(/^[a-f0-9]{64}$/);
+    const unresolved = JSON.parse(persisted.write_outcomes_json);
+    unresolved.status = "attempting";
+    unresolved.accepted = null;
+    unresolved.indeterminate = false;
+    h.db.prepare(`UPDATE wormholesystems_source_runs SET write_outcomes_json=? WHERE id=(
+      SELECT id FROM wormholesystems_source_runs WHERE map_id=? ORDER BY id DESC LIMIT 1)`)
+      .run(JSON.stringify(unresolved), h.targetMap);
+    const sourceCallsAfterInitialFetch = transport.mock.calls.length;
+
+    now = initialNow + 30_000;
+    resolvedName = "Changed SDE Site Name";
+    const restarted = new WormholeSystemsService(h.store, h.secrets, transport as typeof fetch, () => now, undefined,
+      h.nexumWrites, undefined, () => true, () => resolvedName);
+    const replay = await restarted.syncMap(h.targetMap) as any;
+    expect(replay).toMatchObject({ status: "snapshot_validated", fetched: false, source_calls: 0,
+      topology_sync: { status: "succeeded", attempted: true, indeterminate: false,
+        reconciliation: { checkpoint: { accepted: true, replayed: true } } } });
+    expect(transport).toHaveBeenCalledTimes(sourceCallsAfterInitialFetch);
+    const replayRequest = h.nexumWrites.writeWormholesystemsTopology.mock.calls[1][1] as any;
+    expect(replayRequest).toEqual(firstRequest);
+    expect(JSON.stringify(replayRequest)).toBe(firstBytes);
+    expect(nexumCommitted).toBe(true);
+
+    now = initialNow + 60_001;
+    const refreshed = await restarted.syncMap(h.targetMap) as any;
+    expect(refreshed).toMatchObject({ status: "snapshot_validated", fetched: true, source_calls: 3,
+      topology_sync: { status: "succeeded", attempted: true } });
+    expect(transport).toHaveBeenCalledTimes(sourceCallsAfterInitialFetch + 3);
+    const freshRequest = h.nexumWrites.writeWormholesystemsTopology.mock.calls[2][1] as any;
+    expect(freshRequest.snapshot.fetchedAt).toBe(new Date(now).toISOString());
+    expect(freshRequest.signatures[0].name).toBe("Changed SDE Site Name");
+    expect(JSON.stringify(freshRequest)).not.toBe(firstBytes);
+    expect(JSON.stringify({ first, replay, refreshed })).not.toContain("simulated lost PUT response");
+    h.db.close();
+  });
+
+  it("sends no PUT when durable frozen-request persistence fails", async () => {
+    vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: selectedMapDetail() });
+      return response(testSystemDetail());
+    });
+    const h = harness(transport as typeof fetch);
+    await configured(h.service, h.targetMap);
+    await enableAfterTest(h.service);
+    h.service.bindNexumTopologyWriter("nexum-test", true);
+    h.db.exec(`CREATE TRIGGER reject_frozen_request BEFORE UPDATE OF write_outcomes_json ON wormholesystems_source_runs
+      WHEN NEW.write_outcomes_json IS NOT NULL BEGIN SELECT RAISE(ABORT, 'storage unavailable'); END`);
+    const result = await h.service.syncMap(h.targetMap) as any;
+    expect(result.status).toBe("fetch_failed");
+    expect(h.nexumWrites.writeWormholesystemsTopology).not.toHaveBeenCalled();
+    h.db.close();
+  });
+
+  it("discards a corrupt frozen retry and requires a newly fetched snapshot", async () => {
     vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
     const initialNow = Date.parse("2026-10-13T12:00:00.000Z");
     let now = initialNow;
@@ -703,37 +802,21 @@ describe("WormholeSystems service and MCP controls", () => {
     await configured(h.service, h.targetMap);
     await enableAfterTest(h.service);
     h.service.bindNexumTopologyWriter("nexum-test", true);
-    const counters = { createdSystems: 1, updatedSystems: 0, preservedSystems: 0, deletedSystems: 0,
-      createdConnections: 0, updatedConnections: 0, preservedConnections: 0, deletedConnections: 0,
-      createdSignatures: 0, updatedSignatures: 0, preservedSignatures: 0, deletedSignatures: 0, conflicts: [] };
-    h.nexumWrites.writeWormholesystemsTopology.mockRejectedValueOnce(new Error("simulated lost PUT response"))
-      .mockRejectedValueOnce(new Error("simulated repeated lost PUT response"))
-      .mockResolvedValueOnce({ ...counters, checkpoint: { accepted: true, replayed: false, partial: false } } as any);
-
-    const first = await h.service.syncMap(h.targetMap) as any;
-    expect(first.topology_sync).toMatchObject({ status: "indeterminate", attempted: true, indeterminate: true });
-    const firstRequest = h.nexumWrites.writeWormholesystemsTopology.mock.calls[0][1] as any;
-    const firstBytes = JSON.stringify(firstRequest);
-    const sourceCallsAfterInitialFetch = transport.mock.calls.length;
-
-    now = initialNow + 30_000;
-    const replay = await h.service.syncMap(h.targetMap) as any;
-    expect(replay).toMatchObject({ status: "snapshot_validated", fetched: false, source_calls: 0,
-      topology_sync: { status: "indeterminate", attempted: true, indeterminate: true } });
-    expect(transport).toHaveBeenCalledTimes(sourceCallsAfterInitialFetch);
-    const replayRequest = h.nexumWrites.writeWormholesystemsTopology.mock.calls[1][1] as any;
-    expect(replayRequest).toEqual(firstRequest);
-    expect(JSON.stringify(replayRequest)).toBe(firstBytes);
-
-    now = initialNow + 60_001;
+    h.nexumWrites.writeWormholesystemsTopology.mockRejectedValueOnce(new Error("lost response"))
+      .mockResolvedValueOnce({ checkpoint: { accepted: true, replayed: false, partial: false } } as any);
+    await h.service.syncMap(h.targetMap);
+    const run = h.db.prepare("SELECT id,write_outcomes_json FROM wormholesystems_source_runs WHERE map_id=? ORDER BY id DESC LIMIT 1")
+      .get(h.targetMap) as { id: number; write_outcomes_json: string };
+    const outcome = JSON.parse(run.write_outcomes_json);
+    outcome.frozen_request.request_json = "{}";
+    h.db.prepare("UPDATE wormholesystems_source_runs SET write_outcomes_json=? WHERE id=?").run(JSON.stringify(outcome), run.id);
+    const callsBeforeRetry = transport.mock.calls.length;
+    now += 1_000;
     const refreshed = await h.service.syncMap(h.targetMap) as any;
-    expect(refreshed).toMatchObject({ status: "snapshot_validated", fetched: true, source_calls: 3,
-      topology_sync: { status: "succeeded", attempted: true } });
-    expect(transport).toHaveBeenCalledTimes(sourceCallsAfterInitialFetch + 3);
-    const freshRequest = h.nexumWrites.writeWormholesystemsTopology.mock.calls[2][1] as any;
-    expect(freshRequest.snapshot.fetchedAt).toBe(new Date(now).toISOString());
-    expect(JSON.stringify(freshRequest)).not.toBe(firstBytes);
-    expect(JSON.stringify({ first, replay, refreshed })).not.toContain("simulated lost PUT response");
+    expect(refreshed).toMatchObject({ fetched: true, source_calls: 3, nexum_writes_attempted: true });
+    expect(transport).toHaveBeenCalledTimes(callsBeforeRetry + 3);
+    expect(h.nexumWrites.writeWormholesystemsTopology).toHaveBeenCalledTimes(2);
+    expect((h.nexumWrites.writeWormholesystemsTopology.mock.calls[1][1] as any).snapshot.fetchedAt).toBe(new Date(now).toISOString());
     h.db.close();
   });
 
@@ -768,9 +851,34 @@ describe("WormholeSystems service and MCP controls", () => {
     expect(h.nexumWrites.writeWormholesystemsTopology).toHaveBeenCalledTimes(1);
     const request = h.nexumWrites.writeWormholesystemsTopology.mock.calls[0][1] as any;
     expect(request.signatures).toEqual([{ sourceSignatureId: "source-signature-1", sourceSystemId: "map-system-test",
-      sourceConnectionId: null, sigId: "QRS-123", sigType: "unknown", whType: "" }]);
+      sourceConnectionId: null, sigId: "QRS-123", sigType: "unknown", whType: "", name: "SDE Type 197" }]);
     expect(h.db.prepare("SELECT eligible_for_matching FROM wormholesystems_source_snapshots WHERE map_id=?").get(h.targetMap))
       .toMatchObject({ eligible_for_matching: 1 });
+    h.db.close();
+  });
+
+  it("blocks v3 writes when invTypes is unavailable even if all source type IDs are null", async () => {
+    vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
+    const detail = systemDetail("map-system-test", 31_000_001, [{ id: "source-signature-no-type", signature_id: "ABC-123",
+      map_solarsystem_id: "map-system-test", signature_type_id: null, signature_category_id: null,
+      signature_type: { id: null, signature_category_id: null }, signature_category: { id: null, name: null },
+      wormhole_id: null, wormhole: { id: null, name: null } }]);
+    let useNullTypeSnapshot = false;
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: selectedMapDetail() });
+      return response(useNullTypeSnapshot ? detail : testSystemDetail());
+    });
+    const h = harness(transport as typeof fetch, undefined, undefined, () => true, undefined, undefined, () => false);
+    await configured(h.service, h.targetMap);
+    await enableAfterTest(h.service);
+    useNullTypeSnapshot = true;
+    h.service.bindNexumTopologyWriter("nexum-test", true);
+
+    const result = await h.service.syncMap(h.targetMap) as any;
+    expect(result.topology_sync.blockers).toContain("SDE invTypes table/schema is unavailable; topology writes require a readable installed SDE");
+    expect(h.nexumWrites.writeWormholesystemsTopology).not.toHaveBeenCalled();
     h.db.close();
   });
 
@@ -804,7 +912,7 @@ describe("WormholeSystems service and MCP controls", () => {
       topology_sync: { status: "succeeded", attempted: true } });
     const request = h.nexumWrites.writeWormholesystemsTopology.mock.calls[0][1] as any;
     expect(request.signatures).toEqual([{ sourceSignatureId: "source-signature-bcm-579", sourceSystemId: "map-system-test",
-      sourceConnectionId: null, sigId: "BCM-579", sigType: "wormhole", whType: "B274" }]);
+      sourceConnectionId: null, sigId: "BCM-579", sigType: "wormhole", whType: "B274", name: "SDE Type 197" }]);
     h.db.close();
   });
 
@@ -906,11 +1014,11 @@ describe("WormholeSystems service and MCP controls", () => {
       connection_type: "standard", ship_size: "medium" }]);
     expect(request.signatures).toEqual([
       { sourceSignatureId: "source-signature-a", sourceSystemId: "map-system-a", sourceConnectionId: "source-edge",
-        sigId: "BCM-579", sigType: "wormhole", whType: "B274" },
+        sigId: "BCM-579", sigType: "wormhole", whType: "B274", name: "SDE Type 197" },
       { sourceSignatureId: "source-signature-b", sourceSystemId: "map-system-b", sourceConnectionId: "source-edge",
-        sigId: "DEF-456", sigType: "wormhole", whType: "" },
+        sigId: "DEF-456", sigType: "wormhole", whType: "", name: "SDE Type 197" },
       { sourceSignatureId: "source-signature-unassigned", sourceSystemId: "map-system-a", sourceConnectionId: null,
-        sigId: "", sigType: "unknown", whType: "" },
+        sigId: "", sigType: "unknown", whType: "", name: null },
     ]);
     expect(sync.topology_sync.diagnostics).toContain(
       "signatures[source-signature-b]: validated Wormhole category has no non-empty related name; projected with empty whType");
@@ -1793,8 +1901,8 @@ describe("WormholeSystems service and MCP controls", () => {
       "wormholesystems_reconcile_linked_notes",
       "wormholesystems_set_max_staleness"])
       expect(registered.has(name)).toBe(true);
-    expect(descriptions.get("wormholesystems_sync_map")).toMatch(/fresh complete v3.*Nexum schema-v2 topology\/signature request.*same invocation/i);
-    expect(descriptions.get("wormholesystems_bind_nexum_topology_writer")).toMatch(/confirms.*wormholesystems_sync scope.*v2 endpoint/i);
+    expect(descriptions.get("wormholesystems_sync_map")).toMatch(/fresh complete v3.*Nexum schema-v3 topology\/signature request.*same invocation/i);
+    expect(descriptions.get("wormholesystems_bind_nexum_topology_writer")).toMatch(/confirms.*wormholesystems_sync scope.*v3 endpoint/i);
     expect(descriptions.get("wormholesystems_preview_map_sync")).toMatch(/local-only.*classification.*zero upstream/i);
     expect(descriptions.get("wormholesystems_reconcile_linked_notes")).toMatch(/PATCH.*linked-direction.*never acts on unconnected/i);
     const redacted = redactSecrets([{ jsonrpc: "2.0", method: "tools/call", params: {

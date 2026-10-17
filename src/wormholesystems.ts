@@ -10,6 +10,7 @@ import { NexumStore, type Json } from "./nexum-store.js";
 import { NexumError, normalizeBaseUrl } from "./nexum-client.js";
 import { containsSecretValue, normalizeSourceSnapshot, validateSourceMapDetail } from "./wormholesystems-adapter.js";
 import { mapDecisionBoundary } from "./map-decision-boundary.js";
+import { resolveTypeName } from "./utils.js";
 import {
   WormholeSystemsClient, WormholeSystemsError, validateWormholeSystemsOrigin,
   validateWormholeSystemsPathPrefix, type ApiMapRecord, type WormholeSystemsConfig,
@@ -53,7 +54,7 @@ type SourceConfig = WormholeSystemsConfig & {
   nexumWriterCredentialId?: string;
   nexumBindingBaseUrl?: string;
   nexumRouteMapId?: string;
-  nexumV2ConfirmedAt?: number;
+  nexumV3ConfirmedAt?: number;
 };
 type StalenessPolicy = { max_age_ms: number; origin: "approved_default" | "operator"; revision: string };
 type PolicyState = { policy: StalenessPolicy | null; valid: boolean };
@@ -62,7 +63,8 @@ type SourceNexumWrites = {
     binding: { baseUrl: string; nexumMapId: string }): Promise<Json>;
   invalidateWormholesystemsTopologyCache?(mapId: string): Promise<void>;
   writeWormholesystemsSignatureNotes(mapId: string, changes: Array<{ systemId: string; signatureId: string; notes: string;
-    expectedIdentity: WormholesystemsSignatureNoteIdentity }>, validateSource: () => string[]): Promise<Json>;
+    expectedIdentity: WormholesystemsSignatureNoteIdentity }>, validateSource: () => string[],
+    ownershipBinding?: { credentialId: string; baseUrl: string; nexumMapId: string }): Promise<Json>;
 };
 
 export function canonicalSolarSystemClassFromSde(db: Pick<Database.Database, "prepare">, eveSystemId: number): string | null {
@@ -93,6 +95,11 @@ function solarSystemIdentityExists(eveSystemId: number): boolean {
   catch { return false; }
 }
 
+function invTypesSchemaReadable(): boolean {
+  try { getDatabase().prepare("SELECT typeID, typeName FROM invTypes LIMIT 0").all(); return true; }
+  catch { return false; }
+}
+
 export class WormholeSystemsService {
   private readonly lifetime = new AbortController();
   private readonly syncs = new Map<string, Promise<Json>>();
@@ -107,6 +114,8 @@ export class WormholeSystemsService {
     private readonly nexumWrites: SourceNexumWrites = getNexum(),
     private readonly systemClass: (eveSystemId: number) => string | null = canonicalSolarSystemClass,
     private readonly systemExists: (eveSystemId: number) => boolean = solarSystemIdentityExists,
+    private readonly signatureTypeName: (sourceTypeId: unknown) => string | null = sourceTypeId => resolveTypeName(getDatabase(), sourceTypeId),
+    private readonly invTypesReadable: () => boolean = invTypesSchemaReadable,
   ) {
     store.db.exec(`
       CREATE TABLE IF NOT EXISTS wormholesystems_credentials (id TEXT PRIMARY KEY, metadata TEXT NOT NULL);
@@ -338,9 +347,9 @@ export class WormholeSystemsService {
     return this.configuration();
   }
 
-  bindNexumTopologyWriter(credentialIdInput: string, confirmV2EndpointDeployed: true): Json {
+  bindNexumTopologyWriter(credentialIdInput: string, confirmV3EndpointDeployed: true): Json {
     this.assertNoActiveSync();
-    if (confirmV2EndpointDeployed !== true) throw new Error("Explicit Nexum topology v2 deployment confirmation is required");
+    if (confirmV3EndpointDeployed !== true) throw new Error("Explicit Nexum topology v3 deployment confirmation is required");
     const config = this.config();
     if (!config) throw new Error("Configure a WormholeSystems source before binding a Nexum data writer");
     const credentialId = opaqueId(credentialIdInput, "Nexum writer credential ID");
@@ -353,7 +362,7 @@ export class WormholeSystemsService {
       throw new Error("Selected Nexum writer and map are not bound to the current NEXUM_BASE_URL");
     const routeMapId = opaqueId(map.nexum_map_id, "Nexum route map UUID");
     const updated: SourceConfig = { ...config, configurationRevision: crypto.randomUUID(), nexumWriterCredentialId: credentialId,
-      nexumBindingBaseUrl: baseUrl, nexumRouteMapId: routeMapId, nexumV2ConfirmedAt: this.now() };
+      nexumBindingBaseUrl: baseUrl, nexumRouteMapId: routeMapId, nexumV3ConfirmedAt: this.now() };
     this.assertConfigDoesNotContainCredential(updated);
     this.withMapBoundarySync([config.canonicalMapId], () => this.store.db.transaction(() => {
       const latest = this.config();
@@ -363,16 +372,16 @@ export class WormholeSystemsService {
       this.store.db.prepare("UPDATE wormholesystems_source_snapshots SET eligible_for_matching=0 WHERE map_id=?").run(config.canonicalMapId);
     })());
     return { bound: true, canonical_map_id: config.canonicalMapId, nexum_map_id: routeMapId,
-      nexum_base_url: baseUrl, nexum_writer_credential_id: credentialId, topology_schema_version: 2,
-      nexum_v2_endpoint_confirmed_at: updated.nexumV2ConfirmedAt,
-      note: "The operator confirmed that this selected map-bound key has wormholesystems_sync scope and the v2 endpoint is deployed. No request was sent." };
+      nexum_base_url: baseUrl, nexum_writer_credential_id: credentialId, topology_schema_version: 3,
+      nexum_v3_endpoint_confirmed_at: updated.nexumV3ConfirmedAt,
+      note: "The operator confirmed that this selected map-bound key has wormholesystems_sync scope and the v3 endpoint is deployed. No request was sent." };
   }
 
   private topologyBindingBlockers(config = this.config()): string[] {
     const blockers: string[] = [];
     if (!config?.nexumWriterCredentialId) blockers.push("an explicit Nexum topology writer key has not been selected");
-    if (!Number.isSafeInteger(config?.nexumV2ConfirmedAt) || Number(config?.nexumV2ConfirmedAt) <= 0)
-      blockers.push("Nexum topology v2 deployment has not been explicitly confirmed");
+    if (!Number.isSafeInteger(config?.nexumV3ConfirmedAt) || Number(config?.nexumV3ConfirmedAt) <= 0)
+      blockers.push("Nexum topology v3 deployment has not been explicitly confirmed");
     if (!config?.nexumBindingBaseUrl || !config.nexumRouteMapId) blockers.push("stored Nexum map/base binding is unavailable");
     try {
       if (!config) return [...new Set(blockers)];
@@ -395,6 +404,8 @@ export class WormholeSystemsService {
   private sourceSdeBlockers(candidate: Record<string, unknown>): string[] {
     if (!Array.isArray(candidate.systems)) return ["systems: complete validated source-system projection is unavailable"];
     const blockers: string[] = [];
+    if (candidate.schemaVersion === 3 && !this.invTypesReadable())
+      blockers.push("SDE invTypes table/schema is unavailable; topology writes require a readable installed SDE");
     candidate.systems.forEach((value, index) => {
       if (!value || typeof value !== "object" || Array.isArray(value)) return;
       const system = value as Record<string, unknown>;
@@ -421,7 +432,7 @@ export class WormholeSystemsService {
     return { configured: true, origin: config.origin, api_path_prefix: config.apiPathPrefix, map_route_key: config.mapRouteKey,
       canonical_map_id: config.canonicalMapId, upstream_map_id: config.upstreamMapId, credential_id: config.credentialId,
       nexum_writer_credential_id: config.nexumWriterCredentialId ?? null, nexum_base_url: config.nexumBindingBaseUrl ?? null,
-      nexum_map_id: config.nexumRouteMapId ?? null, nexum_v2_endpoint_confirmed_at: config.nexumV2ConfirmedAt ?? null,
+      nexum_map_id: config.nexumRouteMapId ?? null, nexum_v3_endpoint_confirmed_at: config.nexumV3ConfirmedAt ?? null,
       configured_at: config.configuredAt, schema_validated_at: config.schemaValidatedAt, live_sync_enabled: config.liveSyncEnabled,
       staleness_policy: current.staleness_policy ?? stalenessPolicy,
       stored_snapshot_eligible_for_matching: current.stored_snapshot_eligible_for_matching ?? false,
@@ -789,8 +800,17 @@ export class WormholeSystemsService {
   }
 
   private async reconcileFreshTopologyLocked(mapId: string, fetchedConfig: SourceConfig, fixture: WormholeSystemsFixture,
-    sourceIdentity: string, revision: string): Promise<Json> {
-    const projection = topologyProjectionFromFixture(fixture);
+    sourceIdentity: string, revision: string, frozen?: { requestJson: string; metadata: Record<string, unknown> }): Promise<Json> {
+    let projection: ReturnType<typeof topologyProjectionFromFixture>;
+    if (frozen) {
+      try {
+        projection = { candidate: JSON.parse(frozen.requestJson), blockers: [],
+          diagnostics: Array.isArray(frozen.metadata.projectionDiagnostics) ? frozen.metadata.projectionDiagnostics as string[] : [] };
+      } catch {
+        return { status: "blocked", attempted: false, accepted: false, partial: false, indeterminate: false,
+          blockers: ["frozen topology request is corrupt; fetch a new complete source snapshot"] };
+      }
+    } else projection = topologyProjectionFromFixture(fixture, this.signatureTypeName);
     const policy = this.policyState();
     const stored = this.store.db.prepare("SELECT * FROM wormholesystems_source_snapshots WHERE map_id=?").get(mapId) as any;
     const blockers = [...this.snapshotBlockers(mapId, stored), ...projection.blockers, ...this.sourceSdeBlockers(projection.candidate),
@@ -811,11 +831,13 @@ export class WormholeSystemsService {
     const checked = validateWormholesystemsTopologyRequest(projection.candidate, this.now(), maxAge);
     blockers.push(...checked.blockers);
     const uniqueBlockers = [...new Set(blockers)];
+    let frozenState: Record<string, unknown> | undefined = frozen?.metadata;
     const persist = (outcome: Json): Json => {
       const run = this.store.db.prepare("SELECT id FROM wormholesystems_source_runs WHERE map_id=? ORDER BY id DESC LIMIT 1").get(mapId) as { id: number } | undefined;
+      const saved = frozenState ? { ...(outcome as Record<string, unknown>), frozen_request: frozenState } : outcome;
       if (run) this.store.db.prepare("UPDATE wormholesystems_source_runs SET write_outcomes_json=? WHERE id=?")
-        .run(JSON.stringify(outcome), run.id);
-      return outcome;
+        .run(JSON.stringify(saved), run.id);
+      return saved as Json;
     };
     if (uniqueBlockers.length) return persist({ status: "blocked", attempted: false, accepted: false, partial: false, indeterminate: false, blockers: uniqueBlockers,
       diagnostics: projection.diagnostics });
@@ -826,7 +848,14 @@ export class WormholeSystemsService {
         blockers: ["source configuration or selected Nexum writer changed before the Nexum write"] });
     if (!checked.request) return persist({ status: "blocked", attempted: false, accepted: false, partial: false, indeterminate: false,
       blockers: ["complete validated topology/signature projection is unavailable"] });
-    const request = JSON.parse(JSON.stringify(checked.request)) as Record<string, unknown>;
+    const requestJson = frozen?.requestJson ?? JSON.stringify(checked.request);
+    let request: Record<string, unknown>;
+    try { request = JSON.parse(requestJson) as Record<string, unknown>; }
+    catch { return persist({ status: "blocked", attempted: false, accepted: false, partial: false, indeterminate: false,
+      blockers: ["frozen topology request is corrupt; fetch a new complete source snapshot"] }); }
+    if (stableJson(request) !== stableJson(checked.request))
+      return persist({ status: "blocked", attempted: false, accepted: false, partial: false, indeterminate: false,
+        blockers: ["frozen topology request does not match its validated request digest"] });
     const freeze = (value: unknown): void => {
       if (value && typeof value === "object" && !Object.isFrozen(value)) {
         Object.freeze(value);
@@ -834,9 +863,45 @@ export class WormholeSystemsService {
       }
     };
     freeze(request);
-    if (Buffer.byteLength(JSON.stringify(request), "utf8") > MAX_SOURCE_SNAPSHOT_BYTES)
+    if (Buffer.byteLength(requestJson, "utf8") > MAX_SOURCE_SNAPSHOT_BYTES)
       return persist({ status: "blocked", attempted: false, accepted: false, partial: false, indeterminate: false,
-        blockers: ["complete v2 topology/signature request exceeds the bounded JSON body size"] });
+        blockers: ["complete v3 topology/signature request exceeds the bounded JSON body size"] });
+    if (!frozenState) {
+      const nameEvidence = Array.isArray((request as any).signatures) ? (request as any).signatures.map((signature: any) => {
+        const evidence = fixture.sourceSignatureEvidence?.find(row => row.sourceSignatureId === signature.sourceSignatureId);
+        return { sourceSignatureId: signature.sourceSignatureId, signatureTypeId: evidence?.signatureTypeId ?? null,
+          resolved: typeof signature.name === "string" };
+      }) : [];
+      const policyRevision = policy.policy?.revision ?? null;
+      frozenState = { request_json: requestJson,
+        request_digest: crypto.createHash("sha256").update(stableJson(request)).digest("hex"),
+        provenance: { sourceSchema: "wormholesystems-source-v3", sourceIdentity, sourceRevision: revision,
+          fetchedAt: fixture.fetchedAt, canonicalMapId: mapId, nexumBaseUrl: config.nexumBindingBaseUrl,
+          nexumMapId: config.nexumRouteMapId, sourceConfigurationRevision: fetchedConfig.configurationRevision,
+          credentialId: fetchedConfig.credentialId, credentialVersion: Number(this.metadata(fetchedConfig.credentialId).credential_version) || 1,
+          stalenessPolicyRevision: policyRevision,
+          nameResolutionDigest: crypto.createHash("sha256").update(stableJson(nameEvidence)).digest("hex"),
+          signatureCount: nameEvidence.length, resolvedNameCount: nameEvidence.filter((row: any) => row.resolved).length },
+        projectionDiagnostics: projection.diagnostics };
+      frozenState.integrity_digest = crypto.createHash("sha256").update(stableJson({
+        request_digest: frozenState.request_digest, provenance: frozenState.provenance,
+        projectionDiagnostics: frozenState.projectionDiagnostics,
+      })).digest("hex");
+    } else {
+      const frozenDigest = crypto.createHash("sha256").update(stableJson(request)).digest("hex");
+      const frozenIntegrity = crypto.createHash("sha256").update(stableJson({ request_digest: frozenState.request_digest,
+        provenance: frozenState.provenance, projectionDiagnostics: frozenState.projectionDiagnostics })).digest("hex");
+      if (frozenState.request_json !== requestJson || frozenState.request_digest !== frozenDigest ||
+          frozenState.integrity_digest !== frozenIntegrity)
+        return persist({ status: "blocked", attempted: false, accepted: false, partial: false, indeterminate: false,
+          blockers: ["frozen topology request failed its integrity check; fetch a new complete source snapshot"] });
+    }
+    const run = this.store.db.prepare("SELECT id FROM wormholesystems_source_runs WHERE map_id=? ORDER BY id DESC LIMIT 1").get(mapId) as { id: number } | undefined;
+    if (!run) return { status: "blocked", attempted: false, accepted: false, partial: false, indeterminate: false,
+      blockers: ["durable topology request state is unavailable; no Nexum request was sent"] };
+    this.store.db.transaction(() => this.store.db.prepare("UPDATE wormholesystems_source_runs SET write_outcomes_json=? WHERE id=?")
+      .run(JSON.stringify({ status: "attempting", attempted: true, accepted: null, partial: false,
+        indeterminate: false, frozen_request: frozenState }), run.id))();
     try {
       const response = await this.nexumWrites.writeWormholesystemsTopology(mapId, request,
         config.nexumWriterCredentialId!, { baseUrl: config.nexumBindingBaseUrl!, nexumMapId: config.nexumRouteMapId! });
@@ -860,37 +925,70 @@ export class WormholeSystemsService {
   }
 
   private async retryIndeterminateTopology(mapId: string, fetchedConfig: SourceConfig): Promise<Json | null> {
+    const isRetryableOutcome = (outcome: any) => {
+      const unresolvedAttempt = outcome?.status === "attempting" && outcome?.attempted === true &&
+        outcome?.accepted === null && outcome?.indeterminate === false;
+      const indeterminate = outcome?.status === "indeterminate" && outcome?.attempted === true && outcome?.indeterminate === true;
+      return (unresolvedAttempt || indeterminate) && (outcome?.replay_count === undefined || outcome.replay_count === 0) &&
+        !!outcome?.frozen_request;
+    };
     const latest = this.store.db.prepare("SELECT write_outcomes_json FROM wormholesystems_source_runs WHERE map_id=? ORDER BY id DESC LIMIT 1")
       .get(mapId) as { write_outcomes_json: string | null } | undefined;
     if (!latest?.write_outcomes_json) return null;
     try {
       const previousOutcome = JSON.parse(latest.write_outcomes_json);
-       if (previousOutcome?.status !== "indeterminate" || previousOutcome?.attempted !== true || previousOutcome?.indeterminate !== true ||
-           (previousOutcome.replay_count !== undefined && previousOutcome.replay_count !== 0)) return null;
+      if (!isRetryableOutcome(previousOutcome)) return null;
     } catch { return null; }
     const replay = await mapDecisionBoundary.run(mapId, async () => {
       const currentConfig = this.config();
       if (!currentConfig || currentConfig.configurationRevision !== fetchedConfig.configurationRevision ||
           currentConfig.canonicalMapId !== mapId || currentConfig.nexumWriterCredentialId !== fetchedConfig.nexumWriterCredentialId)
         return null;
-      const stored = this.store.db.prepare("SELECT * FROM wormholesystems_source_snapshots WHERE map_id=?").get(mapId) as any;
-      const run = this.store.db.prepare("SELECT id,revision_or_digest,write_outcomes_json FROM wormholesystems_source_runs WHERE map_id=? ORDER BY id DESC LIMIT 1")
-        .get(mapId) as { id: number; revision_or_digest: string | null; write_outcomes_json: string | null } | undefined;
-      if (!stored || !run || run.revision_or_digest !== stored.revision_or_digest || !run.write_outcomes_json) return null;
-      let previousOutcome: any;
-      try { previousOutcome = JSON.parse(run.write_outcomes_json); } catch { return null; }
-       if (previousOutcome?.status !== "indeterminate" || previousOutcome?.attempted !== true || previousOutcome?.indeterminate !== true ||
-           (previousOutcome.replay_count !== undefined && previousOutcome.replay_count !== 0)) return null;
-      if (this.snapshotBlockers(mapId, stored).length) return null;
+       const run = this.store.db.prepare("SELECT id,revision_or_digest,write_outcomes_json FROM wormholesystems_source_runs WHERE map_id=? ORDER BY id DESC LIMIT 1")
+         .get(mapId) as { id: number; revision_or_digest: string | null; write_outcomes_json: string | null } | undefined;
+       if (!run?.write_outcomes_json) return null;
+       let previousOutcome: any;
+       try { previousOutcome = JSON.parse(run.write_outcomes_json); } catch { return null; }
+        if (!isRetryableOutcome(previousOutcome)) return null;
+        if (previousOutcome.status === "attempting") {
+          previousOutcome = { ...previousOutcome, status: "indeterminate", accepted: false, indeterminate: true };
+          this.store.db.prepare("UPDATE wormholesystems_source_runs SET write_outcomes_json=? WHERE id=?")
+            .run(JSON.stringify(previousOutcome), run.id);
+        }
+        const stored = this.store.db.prepare("SELECT * FROM wormholesystems_source_snapshots WHERE map_id=?").get(mapId) as any;
+        if (!stored || run.revision_or_digest !== stored.revision_or_digest) return null;
+        if (this.snapshotBlockers(mapId, stored).length) return null;
 
-      let payload: any;
+       const frozen = previousOutcome.frozen_request as Record<string, any>;
+       const frozenJson = frozen.request_json;
+       if (typeof frozenJson !== "string" || Buffer.byteLength(frozenJson, "utf8") > MAX_SOURCE_SNAPSHOT_BYTES) return null;
+       let frozenRequest: unknown;
+       try { frozenRequest = JSON.parse(frozenJson); } catch { return null; }
+       if (JSON.stringify(frozenRequest) !== frozenJson ||
+           crypto.createHash("sha256").update(stableJson(frozenRequest)).digest("hex") !== frozen.request_digest ||
+           crypto.createHash("sha256").update(stableJson({ request_digest: frozen.request_digest,
+             provenance: frozen.provenance, projectionDiagnostics: frozen.projectionDiagnostics })).digest("hex") !== frozen.integrity_digest) return null;
+       const provenance = frozen.provenance;
+       const policy = this.policyState(currentConfig);
+       const credentialVersion = Number(this.metadata(currentConfig.credentialId).credential_version) || 1;
+       if (!policy.valid || !policy.policy || !provenance || provenance.sourceSchema !== "wormholesystems-source-v3" ||
+           provenance.sourceIdentity !== stored.source_identity || provenance.sourceRevision !== stored.revision_or_digest ||
+           provenance.fetchedAt !== stored.fetched_at || provenance.canonicalMapId !== mapId ||
+           provenance.nexumBaseUrl !== currentConfig.nexumBindingBaseUrl || provenance.nexumMapId !== currentConfig.nexumRouteMapId ||
+           provenance.sourceConfigurationRevision !== currentConfig.configurationRevision || provenance.credentialId !== currentConfig.credentialId ||
+           provenance.credentialVersion !== credentialVersion || provenance.stalenessPolicyRevision !== policy.policy.revision ||
+           this.topologyBindingBlockers(currentConfig).length) return null;
+       const frozenValidation = validateWormholesystemsTopologyRequest(frozenRequest, this.now(), policy.policy.max_age_ms);
+       if (!frozenValidation.request || stableJson(frozenValidation.request) !== stableJson(frozenRequest)) return null;
+
+       let payload: any;
       try { payload = JSON.parse(stored.payload_json); } catch { return null; }
       const parsed = validateWormholeSystemsFixture(payload?.fixture);
       if (payload?.schema !== "wormholesystems-source-v3" || payload?.adapterVersion !== 3 || !parsed.ok ||
           parsed.value.fetchedAt !== stored.fetched_at || parsed.value.sourceIdentity !== stored.source_identity ||
           parsed.value.revisionOrDigest !== stored.revision_or_digest) return null;
-      const outcome = await this.reconcileFreshTopologyLocked(mapId, fetchedConfig, parsed.value,
-        stored.source_identity, stored.revision_or_digest);
+       const outcome = await this.reconcileFreshTopologyLocked(mapId, fetchedConfig, parsed.value,
+         stored.source_identity, stored.revision_or_digest, { requestJson: frozenJson, metadata: frozen });
        return { stored, payload, outcome: { ...(outcome as Record<string, any>), replay_count: Number(previousOutcome.replay_count ?? 0) + 1 } };
     });
     if (!replay) return null;
@@ -1153,7 +1251,7 @@ export class WormholeSystemsService {
           blockers: allianceNotesEligible ? [] : [...new Set(allianceNotes.flatMap(note => note.blocking_fields ?? []))] } },
         preview: { ...current.preview, topology_eligible: topologyEligible, alliance_note_eligible: allianceNotesEligible,
           writes_enabled: false, authority_dependent_bookmark_notes: "explicit linked-note operation required; status and preview do not write notes",
-          data_write_gate: "requires_same_operation_explicit_sync_and_operator_bound_v2_writer" } };
+           data_write_gate: "requires_same_operation_explicit_sync_and_operator_bound_v3_writer" } };
   }
 
   status(canonicalMapId: string): Json {
@@ -1208,12 +1306,15 @@ export class WormholeSystemsService {
         nexumMapId: String(targetMapId) };
       try {
         const writer = this.nexumWrites ?? getNexum();
+        const ownershipBinding = config?.nexumWriterCredentialId && config.nexumBindingBaseUrl && config.nexumRouteMapId
+          ? { credentialId: config.nexumWriterCredentialId, baseUrl: config.nexumBindingBaseUrl, nexumMapId: config.nexumRouteMapId } : undefined;
         const writeResult = await writer.writeWormholesystemsSignatureNotes(mapId, changes,
-          () => this.allianceNoteSourceBlockers(mapId, expected)) as any;
+          () => this.allianceNoteSourceBlockers(mapId, expected), ownershipBinding) as any;
         const items = Array.isArray(writeResult?.items) ? writeResult.items : [];
         const outcomes = items.slice(0, 500).map((item: any, item_index: number) => ({
           item_index: Number.isSafeInteger(item?.item_index) ? item.item_index : item_index,
           status: ["written", "unchanged", "blocked", "failed", "not_attempted"].includes(item?.status) ? item.status : "unknown",
+          ...(typeof item?.reason_code === "string" ? { reason_code: item.reason_code } : {}),
         }));
         const blockers = Array.isArray(writeResult?.blockers) ? writeResult.blockers.filter((item: unknown): item is string =>
           typeof item === "string").slice(0, 20) : [];
@@ -1221,6 +1322,9 @@ export class WormholeSystemsService {
             ? writeResult.status : "unknown",
           eligible_direction_count: eligible.length, attempted_direction_count: changes.length,
           written_count: Number.isSafeInteger(writeResult?.written) && writeResult.written >= 0 ? writeResult.written : 0,
+          note_applied_count: outcomes.filter((item: any) => item.status === "written").length,
+          note_skipped_for_unproven_ownership_count: outcomes.filter((item: any) => item.reason_code === "note_skipped_unproven_ownership").length,
+          note_skipped_for_matching_count: outcomes.filter((item: any) => item.status === "blocked" && item.reason_code !== "note_skipped_unproven_ownership").length,
           outcomes, outcomes_total: items.length, outcomes_omitted: Math.max(0, items.length - outcomes.length),
           ...(blockers.length ? { blockers } : {}) };
       } catch {
@@ -1317,6 +1421,18 @@ export class WormholeSystemsService {
         ...(classificationCaptured && Object.prototype.hasOwnProperty.call(signature, "wormholeName") ? { wormhole_name: signature.wormholeName } : {}),
       }));
       const classificationStatus = classificationCaptured ? "captured" : "not_captured_in_snapshot";
+      const topologyProjection = topologyProjectionFromFixture(sourceFixture, this.signatureTypeName);
+      const projectedSignatures = Array.isArray(topologyProjection.candidate.signatures)
+        ? topologyProjection.candidate.signatures as Array<Record<string, unknown>> : [];
+      const resolutionEvidence = projectedSignatures.slice(0, 500).map(signature => {
+        const sourceEvidence = classificationRows.find(item => item.sourceSignatureId === signature.sourceSignatureId);
+        return { source_signature_id: signature.sourceSignatureId,
+          ...(sourceEvidence && Object.prototype.hasOwnProperty.call(sourceEvidence, "signatureTypeId")
+            ? { signature_type_id: sourceEvidence.signatureTypeId } : {}),
+          name_status: typeof signature.name === "string" ? "resolved"
+            : sourceEvidence?.signatureTypeId === null || sourceEvidence?.signatureTypeId === undefined ? "type_id_unavailable" : "name_unresolved",
+          ...(typeof signature.name === "string" ? { name: signature.name } : {}) };
+      });
     const state = this.store.state(mapId) as Json;
     const nexumMap = this.store.map(mapId);
     const policyState = this.policyState();
@@ -1462,10 +1578,12 @@ export class WormholeSystemsService {
         if (directionalCandidates.length === 1) {
           targetRow = directionalCandidates[0].row;
           targetEdge = directionalCandidates[0].edge;
-          if (policy && maxStalenessMs !== undefined) expectedIdentity = { connectionId: String(targetEdge.id),
+          if (policy && maxStalenessMs !== undefined && signature?.sourceSignatureId) expectedIdentity = { connectionId: String(targetEdge.id),
             fromSystemId: String(directionalCandidates[0].fromSystem.id), toSystemId: String(directionalCandidates[0].toSystem.id),
             fromEveSystemId: Number(direction.from.eveSolarSystemId), toEveSystemId: Number(direction.to.eveSolarSystemId),
-            signatureCode: String(signature!.signatureCode), maxStalenessMs, stalenessPolicyRevision: policy.revision };
+            signatureCode: String(signature!.signatureCode), sourceIdentity: sourceFixture.sourceIdentity,
+            sourceSignatureId: String(signature.sourceSignatureId), nexumSignatureId: String(targetRow.id),
+            maxStalenessMs, stalenessPolicyRevision: policy.revision };
         } else if (directionalCandidates.length > 1) directionBlockers.push("multiple Nexum connections match this directional signature identity");
         else if (signature && !directionBlockers.length) directionBlockers.push("no exact cached Nexum connection and directional signature match");
         if (targetRow) {
@@ -1507,19 +1625,22 @@ export class WormholeSystemsService {
         const targetEdgeReused = plan.edge && (sourcesByTargetEdge.get(String(plan.edge.id))?.size ?? 0) > 1;
         if (targetEdgeReused) rendered.blockers.push("Nexum connection matches multiple source connections");
         const identityMatched = plan.identityMatched && !targetEdgeReused;
+        const existingNotes = typeof targetRow?.notes === "string" ? targetRow.notes : undefined;
         const eligibility = allianceNoteWriteEligibility({ rendered,
           snapshotFresh: snapshotReasons.length === 0,
           identityMatched, targetRowAvailable: !!targetRow,
-          currentNote: targetRow?.notes, decisionBoundaryHeld: true });
+          // Ownership is attested only by the explicit PATCH operation. Preview
+          // cannot treat a non-empty Nexum note as manual or source authority.
+          currentNote: "", decisionBoundaryHeld: true });
         const pending = eligibility.eligible && typeof rendered.note === "string" && targetRow?.notes !== rendered.note;
         allianceNotes.push({ source_connection_id: connection.sourceConnectionId, source_signature_key: direction.key,
           system_id: targetRow?._systemId ?? null, signature_id: targetRow?.id ?? null,
           ...(expectedIdentity ? { expected_identity: expectedIdentity } : {}),
+          ownership_attestation_required: !!existingNotes && existingNotes !== rendered.note,
           eligible_for_write: eligibility.eligible, pending,
           ...(includeNoteWriteDetails ? { desired_note: rendered.note ?? null, actual_note: targetRow?.notes ?? null } : {}),
           blocking_fields: [...new Set(eligibility.blockers)] });
     }
-      const topologyProjection = topologyProjectionFromFixture(sourceFixture);
       const topologyCheck = validateWormholesystemsTopologyRequest(topologyProjection.candidate, this.now(), maxStalenessMs ?? 0);
       const topologyBlockers = [...new Set([...snapshotReasons, ...topologyProjection.blockers, ...this.sourceSdeBlockers(topologyProjection.candidate),
         ...topologyCheck.blockers,
@@ -1547,8 +1668,10 @@ export class WormholeSystemsService {
         source_snapshot: { source_identity: row.source_identity, source_api_map_id: row.source_api_map_id,
           revision_or_digest: row.revision_or_digest, fetched_at: row.fetched_at,
           fresh_for_matching: snapshotReasons.length === 0, blockers: snapshotReasons },
-        source_signature_classification: { status: classificationStatus, total: classificationRows.length,
-          omitted: Math.max(0, classificationRows.length - sourceSignatureEvidence.length), signatures: sourceSignatureEvidence },
+         source_signature_classification: { status: classificationStatus, total: classificationRows.length,
+           omitted: Math.max(0, classificationRows.length - sourceSignatureEvidence.length), signatures: sourceSignatureEvidence },
+         signature_name_resolution: { status: "local_sde_lookup", total: projectedSignatures.length,
+           omitted: Math.max(0, projectedSignatures.length - resolutionEvidence.length), signatures: resolutionEvidence },
         matching_performed: true, stored_snapshot_eligible_for_matching: !!row.eligible_for_matching,
         source_snapshot_eligible_for_matching: sourceSnapshotEligible, snapshot_eligible_for_matching: sourceSnapshotEligible,
         full_matching_eligible: fullMatchingEligible, full_matching_blockers: [...new Set(fullMatchingBlockers)],
