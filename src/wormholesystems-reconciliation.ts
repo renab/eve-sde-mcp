@@ -151,7 +151,7 @@ export function validateWormholesystemsTopologyRequest(input: unknown, now = Dat
       blockers.push(`${path}.whType: exact evidenced wormhole code or empty value is required`);
     if (!(value.name === null || (typeof value.name === "string" && [...value.name].length >= 1 && [...value.name].length <= 256 &&
       value.name.trim() === value.name && value.name.trim().length > 0 && !/[\p{Cc}\p{Cf}]/u.test(value.name))))
-      blockers.push(`${path}.name: exact SDE type display name or null is required`);
+      blockers.push(`${path}.name: exact validated WHS display name or null is required`);
     if (safeId(value.sourceSignatureId)) {
       if (sourceSignatureIds.has(value.sourceSignatureId)) blockers.push(`${path}.sourceSignatureId: duplicate source signature resource ID`);
       sourceSignatureIds.add(value.sourceSignatureId);
@@ -208,13 +208,11 @@ export function validateWormholesystemsTopologyRequest(input: unknown, now = Dat
 }
 
 /** Build the only complete, deletion-authorizing request from a validated source fixture. */
-export function topologyProjectionFromFixture(fixture: WormholeSystemsFixture,
-  resolveTypeName?: (sourceTypeId: unknown) => string | null): { candidate: UnknownRecord; blockers: string[]; diagnostics: string[] } {
+export function topologyProjectionFromFixture(fixture: WormholeSystemsFixture): { candidate: UnknownRecord; blockers: string[]; diagnostics: string[] } {
   const blockers: string[] = [];
   const diagnostics: string[] = [];
   const maxDiagnostics = 100;
   let omittedDiagnostics = 0;
-  let sdeLookupUnavailable = false;
   const addDiagnostic = (message: string) => {
     if (diagnostics.length < maxDiagnostics - 1) diagnostics.push(message);
     else omittedDiagnostics++;
@@ -269,7 +267,6 @@ export function topologyProjectionFromFixture(fixture: WormholeSystemsFixture,
           blockers.push(`signatures[${sourceSignatureId}].signature_id: source code assignment was not explicitly captured`);
       }
       const category = classification?.signatureCategoryName;
-      const typeId = classification?.signatureTypeId;
       const directWormholeId = classification?.wormholeId;
       const nestedWormholeId = classification?.nestedWormholeId;
       const hasDirectWormholeId = directWormholeId !== undefined && directWormholeId !== null && directWormholeId !== "";
@@ -281,26 +278,25 @@ export function topologyProjectionFromFixture(fixture: WormholeSystemsFixture,
       const hasWormholeName = typeof wormholeName === "string" && wormholeName.length > 0;
       const whType = category === "Wormhole" && hasWormholeRelation && hasWormholeName
         ? wormholeName : "";
-      if (category === "Wormhole" && ((hasWormholeIdEvidence && !hasWormholeRelation) || (hasWormholeName && !hasWormholeRelation)))
+      const incompleteWormholeRelation = !hasWormholeRelation && (hasWormholeIdEvidence || hasWormholeName);
+      if (incompleteWormholeRelation)
         blockers.push(`signatures[${sourceSignatureId}].wormhole_id: Wormhole classification has a partial or contradictory relation/name`);
-      if (["Data Site", "Relic Site", "Combat Site", "Gas Site", "Ore Site"].includes(String(category)) &&
+      const contradictoryNonWormhole = ["Data Site", "Relic Site", "Combat Site", "Gas Site", "Ore Site"].includes(String(category)) &&
           ((directWormholeId !== undefined && directWormholeId !== null) || (nestedWormholeId !== undefined && nestedWormholeId !== null) ||
-            (typeof wormholeName === "string" && wormholeName.length > 0)))
+            (typeof wormholeName === "string" && wormholeName.length > 0));
+      if (contradictoryNonWormhole)
         blockers.push(`signatures[${sourceSignatureId}].wormhole_id: wormhole relation contradicts the validated non-wormhole category`);
       if (sigType === "unknown")
         addDiagnostic(`signatures[${sourceSignatureId}]: source category is absent or unsupported; projected as sigType "unknown" with empty whType (type_unmapped)`);
       else if (category === "Wormhole" && hasWormholeRelation && !whType)
         addDiagnostic(`signatures[${sourceSignatureId}]: validated Wormhole category has no non-empty related name; projected with empty whType`);
-      let name: string | null = null;
-      if (typeId !== undefined && typeId !== null && !sdeLookupUnavailable) {
-        try { name = resolveTypeName?.(typeId) ?? null; }
-        catch {
-          sdeLookupUnavailable = true;
-          blockers.push("SDE invTypes lookup is unavailable; topology writes require a readable installed SDE");
-        }
-      }
-      if (name === null)
-        addDiagnostic(`signatures[${sourceSignatureId}]: SDE display name unresolved (name_unresolved)`);
+      const name = category === "Wormhole" && signature.signatureCode && hasWormholeRelation && hasWormholeName
+        ? `${signature.signatureCode} - ${wormholeName}` : "Unknown";
+      if (name === "Unknown" && classification && Object.prototype.hasOwnProperty.call(classification, "signatureCode") &&
+          !incompleteWormholeRelation && !contradictoryNonWormhole)
+        addDiagnostic(`signatures[${sourceSignatureId}]: WHS display name unavailable from validated category, explicitly unassigned code, or coherent unnamed wormhole (name_unknown)`);
+      if ([...name].length > 256 || name.trim() !== name || /[\p{Cc}\p{Cf}]/u.test(name))
+        blockers.push(`signatures[${sourceSignatureId}].name: WHS-rendered display name is invalid`);
       return { sourceSignatureId: sourceSignatureId ?? "", sourceSystemId: sourceSystemId ?? "",
         sourceConnectionId: signature.sourceConnectionId,
         sigId: signature.signatureCode ?? "", sigType, whType, name };
@@ -322,9 +318,8 @@ export function topologyProjectionFromFixture(fixture: WormholeSystemsFixture,
     blockers: ["topology evidence: complete validated source topology fields are unavailable"], diagnostics: [] };
 }
 
-export function topologyCandidateFromFixture(fixture: WormholeSystemsFixture,
-  resolveTypeName?: (sourceTypeId: unknown) => string | null): UnknownRecord {
-  return topologyProjectionFromFixture(fixture, resolveTypeName).candidate;
+export function topologyCandidateFromFixture(fixture: WormholeSystemsFixture): UnknownRecord {
+  return topologyProjectionFromFixture(fixture).candidate;
 }
 
 export type TopologyWriteDiagnostics = {

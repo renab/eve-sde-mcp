@@ -92,8 +92,8 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
       toSourceSystemId: "member-branch", sourceSignatureId: "signature-resource-a", targetSignatureId: "signature-resource-b",
       connection_type: "standard", ship_size: "medium" }]);
     expect(projection.candidate.signatures).toEqual([
-      { sourceSignatureId: "signature-resource-a", sourceSystemId: "member-home", sourceConnectionId: "edge-a", sigId: "ABC-123", sigType: "unknown", whType: "", name: null },
-      { sourceSignatureId: "signature-resource-b", sourceSystemId: "member-branch", sourceConnectionId: "edge-a", sigId: "DEF-456", sigType: "unknown", whType: "", name: null },
+       { sourceSignatureId: "signature-resource-a", sourceSystemId: "member-home", sourceConnectionId: "edge-a", sigId: "ABC-123", sigType: "unknown", whType: "", name: "Unknown" },
+       { sourceSignatureId: "signature-resource-b", sourceSystemId: "member-branch", sourceConnectionId: "edge-a", sigId: "DEF-456", sigType: "unknown", whType: "", name: "Unknown" },
     ]);
     const request = validateWormholesystemsTopologyRequest(projection.candidate, now);
     expect(request).toEqual({ request: {
@@ -108,8 +108,8 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
         sourceSignatureId: "signature-resource-a", targetSignatureId: "signature-resource-b",
         connection_type: "standard", ship_size: "medium" }],
       signatures: [
-        { sourceSignatureId: "signature-resource-a", sourceSystemId: "member-home", sourceConnectionId: "edge-a", sigId: "ABC-123", sigType: "unknown", whType: "", name: null },
-        { sourceSignatureId: "signature-resource-b", sourceSystemId: "member-branch", sourceConnectionId: "edge-a", sigId: "DEF-456", sigType: "unknown", whType: "", name: null },
+         { sourceSignatureId: "signature-resource-a", sourceSystemId: "member-home", sourceConnectionId: "edge-a", sigId: "ABC-123", sigType: "unknown", whType: "", name: "Unknown" },
+         { sourceSignatureId: "signature-resource-b", sourceSystemId: "member-branch", sourceConnectionId: "edge-a", sigId: "DEF-456", sigType: "unknown", whType: "", name: "Unknown" },
       ],
     }, blockers: [] });
     expect(Object.keys(request.request!.snapshot).sort()).toEqual(["complete", "fetchedAt"]);
@@ -129,18 +129,24 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
     expect(request.request?.connections).toHaveLength(1);
   });
 
-  it("projects exact type names from SDE lookup and leaves unresolved IDs null with keyed diagnostics", () => {
+  it("renders names only from validated WHS evidence, never numeric type IDs or SDE lookup", () => {
     const result = completeSourceSnapshot();
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    Object.assign(result.fixture.sourceSignatureEvidence![0], { signatureTypeId: 197 });
-    Object.assign(result.fixture.sourceSignatureEvidence![1], { signatureTypeId: 999 });
-    const projection = topologyProjectionFromFixture(result.fixture, id => Number(id) === 197 ? "Sleeper Cache" : null);
+    result.fixture.signatures[0].signatureCode = "CLA-864";
+    result.fixture.sourceSignatureEvidence![0].signatureCode = "CLA-864";
+    result.fixture.signatures[1].signatureCode = "MOF-032";
+    result.fixture.sourceSignatureEvidence![1].signatureCode = "MOF-032";
+    Object.assign(result.fixture.sourceSignatureEvidence![0], { signatureTypeId: 197, signatureCategoryName: "Wormhole",
+      wormholeId: 26, nestedWormholeId: 26, wormholeName: "O477" });
+    Object.assign(result.fixture.sourceSignatureEvidence![1], { signatureTypeId: 999, signatureCategoryName: "Wormhole",
+      wormholeId: 27, nestedWormholeId: 27, wormholeName: "B274" });
+    const projection = topologyProjectionFromFixture(result.fixture);
     expect(projection.candidate.signatures).toMatchObject([
-      { sourceSignatureId: "signature-resource-a", name: "Sleeper Cache" },
-      { sourceSignatureId: "signature-resource-b", name: null },
+      { sourceSignatureId: "signature-resource-a", name: "CLA-864 - O477" },
+      { sourceSignatureId: "signature-resource-b", name: "MOF-032 - B274" },
     ]);
-    expect(projection.diagnostics).toContain("signatures[signature-resource-b]: SDE display name unresolved (name_unresolved)");
+    expect(validateWormholesystemsTopologyRequest(projection.candidate, now).blockers).toEqual([]);
   });
 
   it.each([
@@ -161,7 +167,8 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
     const projection = topologyProjectionFromFixture(result.fixture);
     expect(projection.blockers).toEqual([]);
     expect((projection.candidate.signatures as any[]).find(row => row.sourceSignatureId === "signature-resource-a"))
-      .toMatchObject({ sigType: expectedType, whType: expectedWhType });
+      .toMatchObject({ sigType: expectedType, whType: expectedWhType,
+        name: name === "Wormhole" ? "ABC-123 - B274" : "Unknown" });
   });
 
   it("retains unsupported, absent and null categories as unknown and blocks contradictory wormhole relations", () => {
@@ -179,7 +186,7 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
     for (const name of ["Homefront Operations", "Factional Warfare Site", "Future Site", ""] as const) {
       const projection = project(name, true);
       expect(projection.blockers).toEqual([]);
-      expect((projection.candidate.signatures as any[])[0]).toMatchObject({ sigType: "unknown", whType: "" });
+       expect((projection.candidate.signatures as any[])[0]).toMatchObject({ sigType: "unknown", whType: "", name: "Unknown" });
       expect(projection.diagnostics.join(" ")).toContain("type_unmapped");
     }
     for (const name of [null, undefined] as const) {
@@ -190,9 +197,17 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
     const contradictory = project("Data Site", true);
     expect(contradictory.blockers).toContain(
       "signatures[signature-resource-a].wormhole_id: wormhole relation contradicts the validated non-wormhole category");
+    expect(contradictory.diagnostics.some(message => message.includes("signature-resource-a") && message.includes("name_unknown"))).toBe(false);
     const contradictoryNameOnly = project("Relic Site", "name-only");
     expect(contradictoryNameOnly.blockers).toContain(
       "signatures[signature-resource-a].wormhole_id: wormhole relation contradicts the validated non-wormhole category");
+    expect(contradictoryNameOnly.diagnostics.some(message => message.includes("signature-resource-a") && message.includes("name_unknown"))).toBe(false);
+    for (const name of ["Future Site", undefined] as const) {
+      const partial = project(name, "name-only");
+      expect(partial.blockers).toContain(
+        "signatures[signature-resource-a].wormhole_id: Wormhole classification has a partial or contradictory relation/name");
+      expect(partial.diagnostics.some(message => message.includes("signature-resource-a") && message.includes("name_unknown"))).toBe(false);
+    }
     const noCategoryDespiteTypeEvidence = project(undefined, true);
     expect((noCategoryDespiteTypeEvidence.candidate.signatures as any[])[0]).toMatchObject({ sigType: "unknown", whType: "" });
   });
@@ -206,7 +221,7 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
     };
     const noRelationOrName = project({});
     expect(noRelationOrName.blockers).toEqual([]);
-    expect((noRelationOrName.candidate.signatures as any[])[0]).toMatchObject({ sigType: "wormhole", whType: "" });
+     expect((noRelationOrName.candidate.signatures as any[])[0]).toMatchObject({ sigType: "wormhole", whType: "", name: "Unknown" });
 
     for (const relation of [
       { wormholeName: "B274" },
@@ -230,7 +245,8 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
       const projection = project(relation);
       expect(projection.blockers).toEqual([]);
       expect((projection.candidate.signatures as any[])[0]).toMatchObject({
-        sigType: "wormhole", whType: relation.wormholeName || "",
+         sigType: "wormhole", whType: relation.wormholeName || "",
+         name: relation.wormholeName ? "ABC-123 - B274" : "Unknown",
       });
     }
   });
@@ -357,10 +373,10 @@ describe("WormholeSystems source-owned Nexum reconciliation", () => {
     const projection = topologyProjectionFromFixture(normalized.fixture);
     expect(projection.blockers).toEqual([]);
     expect(projection.candidate.signatures).toContainEqual({ sourceSignatureId: "signature-standalone", sourceSystemId: "member-home",
-      sourceConnectionId: null, sigId: "", sigType: "unknown", whType: "", name: null });
+       sourceConnectionId: null, sigId: "", sigType: "unknown", whType: "", name: "Unknown" });
     const checked = validateWormholesystemsTopologyRequest(projection.candidate, now);
     expect(checked.request?.signatures).toContainEqual({ sourceSignatureId: "signature-standalone", sourceSystemId: "member-home",
-      sourceConnectionId: null, sigId: "", sigType: "unknown", whType: "", name: null });
+       sourceConnectionId: null, sigId: "", sigType: "unknown", whType: "", name: "Unknown" });
   });
 
   it("omits unavailable coordinate pairs and rejects partial or malformed pairs", () => {
