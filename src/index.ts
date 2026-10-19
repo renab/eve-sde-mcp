@@ -7,12 +7,13 @@ import { downloadSde } from "./downloader.js";
 import { createMcpServer } from "./server.js";
 import { startKeepWarm,stopKeepWarm } from "./keep-warm.js";
 import { startNexum,stopNexum } from "./nexum.js";
-import { stopWormholeSystems } from "./wormholesystems.js";
+import { startWormholeSystemsSync, stopWormholeSystems } from "./wormholesystems.js";
 
 async function shutdown(): Promise<void> {
+  const wormholeSystemsStopped = stopWormholeSystems();
   stopKeepWarm();
   await stopNexum();
-  await stopWormholeSystems();
+  await wormholeSystemsStopped;
   closeDatabase();
   closeAuthDb();
 }
@@ -44,6 +45,7 @@ async function main(): Promise<void> {
   await server.connect(transport);
   startKeepWarm();
   startNexum();
+  startWormholeSystemsSync();
 }
 
 main().catch(async (err) => {

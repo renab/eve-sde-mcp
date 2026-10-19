@@ -20,6 +20,7 @@ import { allianceNoteWriteEligibility, renderAllianceNote, summarizeTopologyWrit
   topologyProjectionFromFixture, validateWormholesystemsTopologyRequest } from "./wormholesystems-reconciliation.js";
 import { validateWormholeSystemsFixture, type ValidatedSourceSignatureEvidence, type WormholeSystemsFixture } from "./wormholesystems-fixture.js";
 import type { WormholesystemsSignatureNoteIdentity } from "./nexum.js";
+import { WormholeSystemsSyncScheduler, type SyncSchedulerClock } from "./wormholesystems-sync-scheduler.js";
 
 const MAX_SYSTEM_DETAIL_REQUESTS = 100;
 const SYSTEM_DETAIL_PACING_MS = 1_000;
@@ -67,6 +68,30 @@ type SourceNexumWrites = {
     ownershipBinding?: { credentialId: string; baseUrl: string; nexumMapId: string }): Promise<Json>;
 };
 
+export function automaticSyncOutcome(result: Record<string, unknown>): string {
+  const topology = result.topology_sync && typeof result.topology_sync === "object"
+    ? result.topology_sync as Record<string, unknown> : undefined;
+  if (topology?.indeterminate === true || topology?.status === "indeterminate") return "indeterminate";
+  if (topology?.partial === true || topology?.status === "applied_with_conflicts") return "partial";
+  switch (topology?.status) {
+    case "succeeded": return topology.accepted === true ? "complete" : "incomplete";
+    case "blocked": return "blocked";
+    case "not_accepted":
+    case "unauthorized":
+    case "forbidden":
+    case "map_not_found":
+    case "conflict": return "rejected";
+    case "acknowledged_result_incomplete":
+    case "attempting": return "incomplete";
+    case "rate_limited": return "rate_limited";
+    case "unavailable":
+    case "failed": return "failed";
+  }
+  if (result.error_status === 401 || result.error_status === 403) return "authentication_failed";
+  if (result.error_status === 429) return "rate_limited";
+  return result.status === "snapshot_validated" ? "incomplete" : "failed";
+}
+
 export function canonicalSolarSystemClassFromSde(db: Pick<Database.Database, "prepare">, eveSystemId: number): string | null {
   try {
     const row = db.prepare(`SELECT s.security, w.wormholeClassID
@@ -105,6 +130,8 @@ export class WormholeSystemsService {
   private readonly syncs = new Map<string, Promise<Json>>();
   private readonly operations = new Set<Promise<unknown>>();
   private stopping = false;
+  private automaticSyncScheduler: WormholeSystemsSyncScheduler | undefined;
+  private automaticSyncController: AbortController | undefined;
   constructor(
     readonly store: NexumStore,
     private readonly secrets: Pick<SecretStore, "put" | "get" | "remove">,
@@ -285,13 +312,82 @@ export class WormholeSystemsService {
   }
 
   async stop(): Promise<void> {
+    this.automaticSyncScheduler?.stop();
+    this.automaticSyncController?.abort();
     if (!this.stopping) { this.stopping = true; this.lifetime.abort(); }
     await Promise.allSettled([...this.operations]);
   }
 
   private assertNoActiveSync(): void {
     if (this.stopping) throw new Error("WormholeSystems service is stopping");
+    if (this.automaticSyncController && this.syncs.size === 1 && this.operations.size === 1) {
+      // Invalidate a scheduled run before a config or credential mutation. Its existing
+      // revision checks still fence any already-fetched data before a write.
+      this.automaticSyncController.abort();
+      return;
+    }
     if (this.operations.size || this.syncs.size) throw new Error("WormholeSystems configuration cannot change during a source operation");
+  }
+
+  private abortScheduledSyncForConfigurationChange(): void {
+    if (this.automaticSyncController && this.syncs.size === 1 && this.operations.size === 1)
+      this.automaticSyncController.abort();
+  }
+
+  startAutomaticSync(clock?: SyncSchedulerClock): void {
+    if (this.stopping) throw new Error("WormholeSystems service is stopping");
+    if (this.automaticSyncScheduler) return;
+    this.automaticSyncScheduler = new WormholeSystemsSyncScheduler({
+      clock,
+      eligibility: () => this.automaticSyncEligibility(),
+      occupied: () => this.operations.size > 0 || this.syncs.size > 0,
+      run: (mapId, slotAt) => this.runAutomaticSync(mapId, slotAt),
+    });
+    this.automaticSyncScheduler.start();
+  }
+
+  automaticSyncStatus(): Record<string, unknown> {
+    return this.automaticSyncScheduler?.status() ?? {
+      running: false, enabled: false, blocked_reason: "scheduler_stopped", map_id: this.config()?.canonicalMapId ?? null,
+      cadence_ms: 300_000, next_opportunity_at: null, in_progress: false,
+      last_attempted_slot_at: null, last_completed_slot_at: null, last_outcome: null, last_skip_reason: null,
+      coordination: { mode: "single_process", scale_out_supported: false },
+    };
+  }
+
+  private automaticSyncEligibility(): { enabled: boolean; mapId?: string; reason?: string } {
+    const config = this.config();
+    if (!config) return { enabled: false, reason: "source_not_configured" };
+    if (!config.liveSyncEnabled) return { enabled: false, mapId: config.canonicalMapId, reason: "source_sync_disabled" };
+    if (!config.schemaValidatedAt || config.validatedCredentialId !== config.credentialId || !config.validatedApiMapId)
+      return { enabled: false, mapId: config.canonicalMapId, reason: "source_schema_test_required" };
+    const policy = this.policyState(config);
+    if (!policy.valid || !policy.policy) return { enabled: false, mapId: config.canonicalMapId, reason: "invalid_persisted_policy" };
+    try {
+      this.assertConfigDoesNotContainCredential(config);
+      this.metadata(config.credentialId);
+      this.token(config);
+    } catch { return { enabled: false, mapId: config.canonicalMapId, reason: "source_credential_unavailable_or_invalid" }; }
+    if (this.topologyBindingBlockers(config).length)
+      return { enabled: false, mapId: config.canonicalMapId, reason: "nexum_writer_binding_invalid" };
+    return { enabled: true, mapId: config.canonicalMapId };
+  }
+
+  private async runAutomaticSync(mapId: string, slotAt: string): Promise<string> {
+    const eligibility = this.automaticSyncEligibility();
+    if (!eligibility.enabled || eligibility.mapId !== mapId) return eligibility.reason ?? "configuration_changed";
+    if (this.syncs.has(mapId)) return "busy";
+    const controller = new AbortController();
+    this.automaticSyncController = controller;
+    try {
+      const result = await this.syncMapWithSignal(mapId, controller.signal) as Record<string, unknown>;
+      return automaticSyncOutcome(result);
+    } catch {
+      return "failed";
+    } finally {
+      if (this.automaticSyncController === controller) this.automaticSyncController = undefined;
+      void slotAt;
+    }
   }
 
   private canonicalMap(id: string): string {
@@ -314,7 +410,6 @@ export class WormholeSystemsService {
   }
 
   configure(input: { origin: string; api_path_prefix: string; map_route_key: "id" | "slug"; canonical_map_id: string; upstream_map_id: string; credential_id: string }): Json {
-    this.assertNoActiveSync();
     const origin = validateWormholeSystemsOrigin(input.origin);
     const apiPathPrefix = validateWormholeSystemsPathPrefix(input.api_path_prefix);
     if (input.map_route_key !== "id" && input.map_route_key !== "slug") throw new Error("Invalid WormholeSystems map route-key mode");
@@ -329,6 +424,7 @@ export class WormholeSystemsService {
     this.assertTokenDoesNotMatchConfig(token, configFields);
     const existing = this.config();
     if (existing) this.assertTokenDoesNotMatchConfig(this.token(existing), configFields);
+    this.assertNoActiveSync();
     this.withMapBoundarySync([...(existing ? [existing.canonicalMapId] : []), canonicalMapId], () => this.store.db.transaction(() => {
       const latest = this.config();
       if (latest?.configurationRevision !== existing?.configurationRevision || latest?.canonicalMapId !== existing?.canonicalMapId)
@@ -348,7 +444,6 @@ export class WormholeSystemsService {
   }
 
   bindNexumTopologyWriter(credentialIdInput: string, confirmV3EndpointDeployed: true): Json {
-    this.assertNoActiveSync();
     if (confirmV3EndpointDeployed !== true) throw new Error("Explicit Nexum topology v3 deployment confirmation is required");
     const config = this.config();
     if (!config) throw new Error("Configure a WormholeSystems source before binding a Nexum data writer");
@@ -364,6 +459,7 @@ export class WormholeSystemsService {
     const updated: SourceConfig = { ...config, configurationRevision: crypto.randomUUID(), nexumWriterCredentialId: credentialId,
       nexumBindingBaseUrl: baseUrl, nexumRouteMapId: routeMapId, nexumV3ConfirmedAt: this.now() };
     this.assertConfigDoesNotContainCredential(updated);
+    this.assertNoActiveSync();
     this.withMapBoundarySync([config.canonicalMapId], () => this.store.db.transaction(() => {
       const latest = this.config();
       if (!latest || latest.configurationRevision !== config.configurationRevision)
@@ -425,7 +521,8 @@ export class WormholeSystemsService {
         source_snapshot_eligible_for_matching: false, stored_snapshot_eligible_for_matching: false, eligible_for_writes: false,
         source_snapshot_blockers: blockers, nexum_matching_blockers: [],
         full_matching_blockers: blockers,
-        staleness_policy: stalenessPolicy, ...(policyState.valid ? {} : { activation_blockers: ["invalid_persisted_policy"] }) };
+        staleness_policy: stalenessPolicy, automatic_sync: this.automaticSyncStatus(),
+        ...(policyState.valid ? {} : { activation_blockers: ["invalid_persisted_policy"] }) };
     }
     this.assertConfigDoesNotContainCredential(config);
     const current = this.status(config.canonicalMapId) as Json;
@@ -442,6 +539,7 @@ export class WormholeSystemsService {
       full_matching_blockers: current.full_matching_blockers ?? current.matching_blockers ?? [],
       eligible_for_matching: current.eligible_for_matching ?? false, eligible_for_writes: current.eligible_for_writes ?? false,
       write_eligibility: current.write_eligibility ?? { topology: { eligible: false }, alliance_notes: { eligible: false } },
+      automatic_sync: this.automaticSyncStatus(),
       activation_blockers: [...(config.schemaValidatedAt && config.validatedCredentialId === config.credentialId ? [] : ["run a successful connection and selected-map schema test"]),
         ...(config.liveSyncEnabled ? [] : ["source snapshot synchronization is not operator-enabled"]),
         ...(policyState.valid ? [] : ["invalid_persisted_policy"])],
@@ -468,6 +566,7 @@ export class WormholeSystemsService {
     if (!initialPolicy.valid || !initialPolicy.policy)
       return { committed: false, error: "invalid_persisted_policy; restore durable policy state before retrying" };
     if (!initialConfig) return { committed: false, error: "Configure a WormholeSystems source before setting the policy" };
+    this.abortScheduledSyncForConfigurationChange();
     const result = mapDecisionBoundary.runSync(initialConfig.canonicalMapId, () => {
       if (this.stopping) return { committed: false, error: "WormholeSystems service is stopping; policy was not changed", retryable: true };
       try {
@@ -521,7 +620,6 @@ export class WormholeSystemsService {
   }
 
   updateCredential(id: string, input: { api_token?: string; label?: string }): Json {
-    this.assertNoActiveSync();
     const current = this.metadata(opaqueId(id, "credential ID"));
     const updated: Json = { ...current, updated_at: this.now() };
     if (input.label !== undefined) {
@@ -537,6 +635,7 @@ export class WormholeSystemsService {
         mapRouteKey: config.mapRouteKey, canonicalMapId: config.canonicalMapId, upstreamMapId: config.upstreamMapId, credentialId: config.credentialId });
       updated.validation_status = "not_tested";
       updated.credential_version = (Number(current.credential_version) || 1) + 1;
+      this.assertNoActiveSync();
       const affectedMap = config?.credentialId === id ? config.canonicalMapId : undefined;
       this.withMapBoundarySync(affectedMap ? [affectedMap] : [], () => this.store.db.transaction(() => {
         this.secrets.put(current.secret_ref, input.api_token!);
@@ -547,14 +646,17 @@ export class WormholeSystemsService {
           this.store.db.prepare("UPDATE wormholesystems_source_snapshots SET eligible_for_matching=0 WHERE map_id=?").run(config.canonicalMapId);
         }
       })());
-    } else this.store.db.prepare("UPDATE wormholesystems_credentials SET metadata=? WHERE id=?").run(JSON.stringify(updated), id);
+    } else {
+      this.assertNoActiveSync();
+      this.store.db.prepare("UPDATE wormholesystems_credentials SET metadata=? WHERE id=?").run(JSON.stringify(updated), id);
+    }
     return this.credentialResult(id);
   }
 
   removeCredential(id: string): Json {
-    this.assertNoActiveSync();
     const metadata = this.metadata(opaqueId(id, "credential ID"));
     const config = this.config();
+    this.assertNoActiveSync();
     const affectedMap = config?.credentialId === id ? config.canonicalMapId : undefined;
     this.withMapBoundarySync(affectedMap ? [affectedMap] : [], () => this.store.db.transaction(() => {
       this.secrets.remove(metadata.secret_ref);
@@ -685,6 +787,7 @@ export class WormholeSystemsService {
   }
 
   async testConnection(): Promise<Json> {
+    this.abortScheduledSyncForConfigurationChange();
     return this.track(async () => {
       let config: SourceConfig | undefined;
       try {
@@ -748,7 +851,6 @@ export class WormholeSystemsService {
   }
 
   enableSync(): Json {
-    this.assertNoActiveSync();
     const config = this.config();
     if (!config) throw new Error("WormholeSystems source is not configured");
     if (!config.schemaValidatedAt || config.validatedCredentialId !== config.credentialId || !config.validatedApiMapId)
@@ -756,6 +858,7 @@ export class WormholeSystemsService {
     const resolved = this.store.map(config.canonicalMapId);
     if (resolved.id !== config.canonicalMapId || config.upstreamMapId !== opaqueId(config.upstreamMapId, "upstream map ID"))
       throw new Error("WormholeSystems map scope validation failed");
+    this.assertNoActiveSync();
     this.withMapBoundarySync([config.canonicalMapId], () => this.store.db.transaction(() => {
       this.saveConfig({ ...config, configurationRevision: crypto.randomUUID(), canonicalMapId: resolved.id, liveSyncEnabled: true });
       this.store.db.prepare("UPDATE wormholesystems_source_snapshots SET eligible_for_matching=0 WHERE map_id=?").run(config.canonicalMapId);
@@ -787,13 +890,17 @@ export class WormholeSystemsService {
   }
 
   async syncMap(canonicalMapId: string): Promise<Json> {
+    return this.syncMapWithSignal(canonicalMapId, this.lifetime.signal);
+  }
+
+  private async syncMapWithSignal(canonicalMapId: string, signal: AbortSignal): Promise<Json> {
     const mapId = this.canonicalMap(canonicalMapId);
     const config = this.config();
     if (!config || config.canonicalMapId !== mapId) throw new Error("WormholeSystems sync target is not the explicitly configured canonical map");
     this.assertConfigDoesNotContainCredential(config);
     const pending = this.syncs.get(mapId);
     if (pending) return pending;
-    const task = this.track(() => this.syncConfiguredMap(mapId, config));
+    const task = this.track(() => this.syncConfiguredMap(mapId, config, signal));
     this.syncs.set(mapId, task);
     try { return await task; }
     finally { if (this.syncs.get(mapId) === task) this.syncs.delete(mapId); }
@@ -1022,7 +1129,7 @@ export class WormholeSystemsService {
       note: "Replayed the identical validated topology request while its original source snapshot remained fresh." };
   }
 
-  private async syncConfiguredMap(mapId: string, config: SourceConfig): Promise<Json> {
+  private async syncConfiguredMap(mapId: string, config: SourceConfig, signal: AbortSignal): Promise<Json> {
     const attemptedAt = this.now();
     const initialPolicy = this.policyState(config).policy ?? { max_age_ms: null, origin: "invalid", revision: null };
     let revisionOrdering: "unknown" | "observed_at" = "unknown";
@@ -1047,7 +1154,7 @@ export class WormholeSystemsService {
       const client = this.client(config);
       const token = this.token(config);
       sourceCalls++;
-      const maps = await client.listMaps(this.lifetime.signal);
+      const maps = await client.listMaps(signal);
       this.rejectSecretEcho(maps, token);
       const selected = this.selectedMap(maps, config);
       if (!selected) {
@@ -1065,7 +1172,7 @@ export class WormholeSystemsService {
       if (selected.id !== config.validatedApiMapId)
         throw new WormholeSystemsError(0, 0, "Configured WormholeSystems map identity changed since validation");
       sourceCalls++;
-      const detail = await client.mapDetail(selected.id, this.lifetime.signal);
+      const detail = await client.mapDetail(selected.id, signal);
       if (containsSecretValue(detail, token)) throw new WormholeSystemsError(0, 0, "Malformed WormholeSystems map response");
       const mapValidation = validateSourceMapDetail(detail, selected.id);
       if (mapValidation.issues.length) throw new WormholeSystemsError(0, 0,
@@ -1078,7 +1185,7 @@ export class WormholeSystemsService {
       for (let index = 0; index < mapSystems.length; index++) {
         if (index > 0) await this.sleep(SYSTEM_DETAIL_PACING_MS);
         sourceCalls++;
-        const systemDetail = await client.solarSystemDetail(String(mapSystems[index].id), this.lifetime.signal);
+        const systemDetail = await client.solarSystemDetail(String(mapSystems[index].id), signal);
         if (containsSecretValue(systemDetail, token)) throw new WormholeSystemsError(0, 0, "Malformed WormholeSystems solar-system response");
         responseBytes += Buffer.byteLength(JSON.stringify(systemDetail), "utf8");
         if (responseBytes > MAX_SOURCE_SNAPSHOT_BYTES) throw new WormholeSystemsError(0, 0, "WormholeSystems source snapshot exceeded the size limit");
@@ -1257,10 +1364,10 @@ export class WormholeSystemsService {
   status(canonicalMapId: string): Json {
     const mapId = this.canonicalMap(canonicalMapId);
     const locked = mapDecisionBoundary.runSync(mapId, () => this.statusLocked(mapId));
-    if (locked.acquired) return locked.value;
+    if (locked.acquired) return { ...locked.value, automatic_sync: this.automaticSyncStatus() };
     const current = this.statusBase(mapId);
     const reason = "Nexum map decision boundary is busy; status eligibility is unavailable until state is coherent";
-    return { ...current, eligible_for_matching: false, source_snapshot_eligible_for_matching: false,
+    return { ...current, automatic_sync: this.automaticSyncStatus(), eligible_for_matching: false, source_snapshot_eligible_for_matching: false,
       matching_blockers: [reason], full_matching_blockers: [reason], nexum_matching_blockers: [reason],
       source_snapshot_blockers: [reason], status_blockers: [reason], eligible_for_topology_write: false,
       eligible_for_alliance_note_writes: false, eligible_for_writes: false,
@@ -1695,5 +1802,6 @@ export function getWormholeSystems(): WormholeSystemsService {
   }
   return service;
 }
+export function startWormholeSystemsSync(): void { getWormholeSystems().startAutomaticSync(); }
 export async function resetWormholeSystemsForTests(): Promise<void> { await service?.stop(); service = undefined; }
 export async function stopWormholeSystems(): Promise<void> { await service?.stop(); }

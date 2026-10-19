@@ -14,6 +14,7 @@ import {
 import { canonicalSolarSystemClassFromSde, WormholeSystemsService } from "../../src/wormholesystems.js";
 import { normalizeSourceSnapshot } from "../../src/wormholesystems-adapter.js";
 import { mapDecisionBoundary } from "../../src/map-decision-boundary.js";
+import type { SyncSchedulerClock } from "../../src/wormholesystems-sync-scheduler.js";
 
 const tmpDirs: string[] = [];
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); for (const dir of tmpDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
@@ -64,6 +65,36 @@ async function enableAfterTest(service: WormholeSystemsService) {
   const result = await service.testConnection();
   expect(result).toMatchObject({ status: "maps_detail_schema_ok", authenticated: true });
   service.enableSync();
+}
+
+class SchedulerTestClock implements SyncSchedulerClock {
+  private current = 0;
+  private readonly epoch = Date.parse("2026-10-18T12:00:00.000Z");
+  private id = 0;
+  private readonly timers = new Map<number, { at: number; callback: () => void; unref(): void }>();
+  monotonicNow(): number { return this.current; }
+  wallNow(): number { return this.epoch + this.current; }
+  setTimeout(callback: () => void, delayMs: number): ReturnType<typeof setTimeout> {
+    const id = ++this.id;
+    const timer = Object.assign({ at: this.current + delayMs, callback, unref() {} }, { id });
+    this.timers.set(id, timer);
+    return timer as unknown as ReturnType<typeof setTimeout>;
+  }
+  clearTimeout(timer: ReturnType<typeof setTimeout>): void { this.timers.delete((timer as any).id); }
+  async advanceBy(ms: number): Promise<void> {
+    const target = this.current + ms;
+    for (;;) {
+      const next = [...this.timers.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+      if (!next || next[1].at > target) break;
+      this.current = next[1].at;
+      this.timers.delete(next[0]);
+      next[1].callback();
+      await this.flush();
+    }
+    this.current = target;
+    await this.flush();
+  }
+  async flush(): Promise<void> { for (let i = 0; i < 20; i++) await Promise.resolve(); }
 }
 
 describe("WormholeSystems GET client", () => {
@@ -1922,6 +1953,154 @@ describe("WormholeSystems service and MCP controls", () => {
     expect(JSON.parse(noteResult.content[0].text)).toMatchObject({ map_id: h.targetMap, status: "blocked", attempted_direction_count: 0 });
     expect(h.nexumWrites.writeWormholesystemsSignatureNotes).not.toHaveBeenCalled();
     expect(transport).not.toHaveBeenCalled();
+    h.db.close();
+  });
+
+  it("automatically syncs the bound selected map on five-minute fixed-rate opportunities and reports sanitized status", async () => {
+    vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: selectedMapDetail() });
+      return response(testSystemDetail());
+    });
+    const h = harness(transport as typeof fetch);
+    await configured(h.service, h.targetMap);
+    await enableAfterTest(h.service);
+    h.service.bindNexumTopologyWriter("nexum-test", true);
+    const clock = new SchedulerTestClock();
+    h.service.startAutomaticSync(clock);
+    expect(h.service.automaticSyncStatus()).toMatchObject({ enabled: true, cadence_ms: 300_000,
+      next_opportunity_at: "2026-10-18T12:05:00.000Z", last_attempted_slot_at: null });
+    const token = "token-do-not-echo";
+    expect(JSON.stringify(h.service.status(h.targetMap))).not.toContain(token);
+    await clock.advanceBy(299_999);
+    expect(transport).toHaveBeenCalledTimes(3); // only the explicit connection/schema test
+    await clock.advanceBy(1);
+    expect(transport).toHaveBeenCalledTimes(6);
+    expect(h.db.prepare("SELECT count(*) AS n FROM wormholesystems_source_runs WHERE map_id=?").get(h.targetMap)).toMatchObject({ n: 1 });
+    expect(h.service.status(h.targetMap)).toMatchObject({ automatic_sync: { running: true, enabled: true,
+      last_attempted_slot_at: "2026-10-18T12:05:00.000Z", last_completed_slot_at: null,
+      last_outcome: "incomplete", coordination: { mode: "single_process", scale_out_supported: false } } });
+    expect(h.nexumWrites.writeWormholesystemsSignatureNotes).not.toHaveBeenCalled();
+    const safeStatus = JSON.stringify(h.service.configuration());
+    expect(safeStatus).not.toContain(token);
+    expect(safeStatus).not.toContain("map_connections");
+    await h.service.stop();
+    h.db.close();
+  });
+
+  it("blocks unbound scheduled fetches and aborts/deduplicates an in-flight scheduled run on disable", async () => {
+    vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
+    let mapCalls = 0;
+    let aborted = false;
+    const transport = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) {
+        mapCalls++;
+        if (mapCalls === 2) return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => { aborted = true; reject(new Error("aborted")); }, { once: true });
+        });
+        return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      }
+      if (url.endsWith("/maps/api-map-7")) return response({ data: selectedMapDetail() });
+      return response(testSystemDetail());
+    });
+    const h = harness(transport as typeof fetch);
+    await configured(h.service, h.targetMap);
+    await enableAfterTest(h.service);
+    const clock = new SchedulerTestClock();
+    h.service.startAutomaticSync(clock);
+    expect(h.service.automaticSyncStatus()).toMatchObject({ enabled: false, blocked_reason: "nexum_writer_binding_invalid" });
+    await clock.advanceBy(300_000);
+    expect(mapCalls).toBe(1); // unbound source did not authorize a background source fetch
+    h.service.bindNexumTopologyWriter("nexum-test", true);
+    expect(h.service.automaticSyncStatus()).toMatchObject({ enabled: true });
+    await clock.advanceBy(300_000);
+    const manual = h.service.syncMap(h.targetMap);
+    expect(mapCalls).toBe(2); // manual caller joins, rather than duplicating, the scheduled sync
+    h.service.disableSync();
+    await expect(manual).resolves.toMatchObject({ status: "fetch_failed", nexum_writes_attempted: false });
+    expect(aborted).toBe(true);
+    await clock.advanceBy(300_000);
+    expect(mapCalls).toBe(2);
+    expect(h.service.automaticSyncStatus()).toMatchObject({ enabled: false, blocked_reason: "source_sync_disabled" });
+    await h.service.stop();
+    h.db.close();
+  });
+
+  it("rejects invalid configuration, writer binding and credential updates without aborting a scheduled fetch", async () => {
+    vi.stubEnv("NEXUM_BASE_URL", "https://nexum.invalid");
+    let mapCalls = 0;
+    let aborted = false;
+    let releaseFetch!: (value: Response) => void;
+    const transport = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) {
+        if (++mapCalls === 2) return new Promise<Response>((resolve, reject) => {
+          releaseFetch = resolve;
+          init?.signal?.addEventListener("abort", () => { aborted = true; reject(new Error("aborted")); }, { once: true });
+        });
+        return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      }
+      if (url.endsWith("/maps/api-map-7")) return response({ data: selectedMapDetail() });
+      return response(testSystemDetail());
+    });
+    const h = harness(transport as typeof fetch);
+    await configured(h.service, h.targetMap);
+    await enableAfterTest(h.service);
+    h.service.bindNexumTopologyWriter("nexum-test", true);
+    h.db.prepare(`INSERT INTO wormholesystems_source_snapshots(map_id,source_identity,source_origin,source_api_map_id,revision_or_digest,fetched_at,observed_at,payload_json,eligible_for_matching)
+      VALUES (?,?,?,?,?,?,?,?,1)`).run(h.targetMap, "previous", "https://wormholes.invalid", "api-map-7", "previous-revision",
+      "2026-10-13T12:00:00.000Z", "2026-10-13T12:00:00.000Z", JSON.stringify({ retained: true }));
+    const clock = new SchedulerTestClock();
+    h.service.startAutomaticSync(clock);
+    await clock.advanceBy(300_000);
+    expect(mapCalls).toBe(2);
+    expect(h.service.automaticSyncStatus()).toMatchObject({ in_progress: true });
+    const before = h.service.configuration();
+    expect(() => h.service.configure({ origin: "http://invalid.example", api_path_prefix: "/api", map_route_key: "id",
+      canonical_map_id: h.targetMap, upstream_map_id: "api-map-7", credential_id: "invalid" })).toThrow();
+    expect(() => h.service.bindNexumTopologyWriter("missing-writer", true)).toThrow();
+    expect(() => h.service.bindNexumTopologyWriter("nexum-test", false as true)).toThrow();
+    const credentialId = String(before.credential_id);
+    expect(() => h.service.updateCredential(credentialId, { api_token: "id" })).toThrow("Credential value");
+    expect(() => h.service.updateCredential(credentialId, { label: "token-do-not-echo" })).toThrow("Invalid credential label");
+    expect(() => h.service.updateCredential("missing-credential", { label: "unused" })).toThrow();
+    expect(aborted).toBe(false);
+    expect(h.service.configuration()).toEqual(before);
+    expect(h.service.automaticSyncStatus()).toMatchObject({ in_progress: true, enabled: true });
+    expect(h.db.prepare("SELECT eligible_for_matching FROM wormholesystems_source_snapshots WHERE map_id=?").get(h.targetMap))
+      .toMatchObject({ eligible_for_matching: 1 });
+    releaseFetch(response({ data: [{ id: "api-map-7", slug: "api-slug" }] }));
+    await clock.flush();
+    expect(aborted).toBe(false);
+    expect(h.db.prepare("SELECT status FROM wormholesystems_source_runs WHERE map_id=? ORDER BY id DESC LIMIT 1").get(h.targetMap))
+      .not.toMatchObject({ status: "fetch_failed" });
+    await h.service.stop();
+    h.db.close();
+  });
+
+  it("blocks automatic source fetches when the persisted freshness policy is invalid", async () => {
+    const transport = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/maps")) return response({ data: [{ id: "api-map-7", slug: "api-slug" }] });
+      if (url.endsWith("/maps/api-map-7")) return response({ data: selectedMapDetail() });
+      return response(testSystemDetail());
+    });
+    const h = harness(transport as typeof fetch);
+    await configured(h.service, h.targetMap);
+    await enableAfterTest(h.service);
+    const row = h.db.prepare("SELECT config_json FROM wormholesystems_config WHERE id='singleton'").get() as { config_json: string };
+    const invalid = { ...JSON.parse(row.config_json), max_staleness_ms: -1 };
+    h.db.prepare("UPDATE wormholesystems_config SET config_json=? WHERE id='singleton'").run(JSON.stringify(invalid));
+    const clock = new SchedulerTestClock();
+    h.service.startAutomaticSync(clock);
+    expect(h.service.automaticSyncStatus()).toMatchObject({ enabled: false, blocked_reason: "invalid_persisted_policy" });
+    await clock.advanceBy(300_000);
+    expect(transport).toHaveBeenCalledTimes(3); // explicit connection/schema test only
+    expect(h.db.prepare("SELECT count(*) AS n FROM wormholesystems_source_runs WHERE map_id=?").get(h.targetMap)).toMatchObject({ n: 0 });
+    await h.service.stop();
     h.db.close();
   });
 });

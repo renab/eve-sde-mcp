@@ -34,15 +34,15 @@ export function registerWormholeSystemsTools(server: McpServer, getService: () =
     {}, service => service.removeConfiguration());
   tool("wormholesystems_test_connection", "Explicitly test bearer access by listing accessible maps and requesting the explicitly selected map detail. This does not enable sync.",
     {}, service => service.testConnection());
-  tool("wormholesystems_enable_sync", "Explicitly enable on-demand source snapshot synchronization after a successful connection and selected-map schema test. Data writes still require the separately bound Nexum schema-v3 writer and a fresh complete source-v3 snapshot.",
+  tool("wormholesystems_enable_sync", "Explicitly enable source snapshot synchronization after a successful connection and selected-map schema test. An eligible selected map is synchronized automatically every five minutes; manual sync remains available. Data writes still require the separately bound Nexum schema-v3 writer and a fresh complete source-v3 snapshot.",
     {}, service => service.enableSync());
-  tool("wormholesystems_disable_sync", "Disable on-demand WormholeSystems source synchronization. This never changes Nexum data.",
+  tool("wormholesystems_disable_sync", "Disable automatic and manual WormholeSystems source synchronization. This never changes Nexum data.",
     {}, service => service.disableSync());
   tool("wormholesystems_list_maps", "List accessible WormholeSystems API map IDs and slugs using the configured origin and credential. Explicit upstream GET; no sync or writes.",
     {}, service => service.listAccessibleMaps());
   tool("wormholesystems_sync_map", "Fetch and validate a fresh complete v3 selected alliance-map snapshot, resolve signature type display names from the installed SDE, store its provenance, then reconcile it using the Nexum schema-v3 topology/signature request to its explicitly bound Nexum map in this same invocation. Blocked projections send no partial PUT. Never writes linked notes. Preview remains local-only and is not an approval step.",
     { map_id: id }, (service, args) => service.syncMap(args.map_id));
-  tool("wormholesystems_map_sync_status", "Read local source snapshot/run status and a local-only preview summary. No upstream calls or Nexum writes.",
+  tool("wormholesystems_map_sync_status", "Read local source snapshot/run status, automatic five-minute scheduler state and a local-only preview summary. No upstream calls or Nexum writes.",
     { map_id: id }, (service, args) => service.status(args.map_id));
   tool("wormholesystems_preview_map_sync", "Local-only preview of the stored source snapshot, freshness/blockers, bounded allowlisted signature classification fields and per-row SDE display-name resolution status. Makes zero upstream requests and performs no Nexum writes; legacy v1/v2 snapshots report category names as not_captured_in_snapshot and are read-only.",
     { map_id: id }, (service, args) => service.preview(args.map_id));
