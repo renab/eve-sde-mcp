@@ -14,7 +14,7 @@ import { createMcpServer, SERVER_INFO } from "./server.js";
 import { beginForeground } from "./work-priority.js";
 import { startKeepWarm,stopKeepWarm } from "./keep-warm.js";
 import { startNexum,stopNexum } from "./nexum.js";
-import { stopWormholeSystems } from "./wormholesystems.js";
+import { startWormholeSystemsSync, stopWormholeSystems } from "./wormholesystems.js";
 import { redactSecrets } from "./secrets.js";
 
 const host = process.env.HOST || "127.0.0.1";
@@ -131,11 +131,23 @@ async function prepareData(): Promise<void> {
 
 export async function startHttpServer() {
   await prepareData();
-  return app.listen(port, host, () => {
+  const httpServer = await new Promise<ReturnType<typeof app.listen>>((resolve, reject) => {
+    const server = app.listen(port, host);
+    server.once("listening", () => resolve(server));
+    server.once("error", reject);
+  });
+  try {
     startKeepWarm();
     startNexum();
+    startWormholeSystemsSync();
     console.log(`EVE SDE MCP listening on http://${host}:${port}`);
-  });
+    return httpServer;
+  } catch (error) {
+    const wormholeSystemsStopped = stopWormholeSystems();
+    stopKeepWarm();
+    await Promise.allSettled([wormholeSystemsStopped, stopNexum(), new Promise<void>(resolve => httpServer.close(() => resolve()))]);
+    throw error;
+  }
 }
 
 const isMainModule =
@@ -144,10 +156,11 @@ const isMainModule =
 if (isMainModule) {
   const httpServer = await startHttpServer();
   const shutdown = async (signal: string) => {
+    const wormholeSystemsStopped = stopWormholeSystems();
     stopKeepWarm();
     await stopNexum();
     const httpClosed = new Promise<void>(resolve => httpServer.close(() => resolve()));
-    await stopWormholeSystems();
+    await wormholeSystemsStopped;
     console.log(`Received ${signal}; shutting down.`);
     await httpClosed;
     closeDatabase();

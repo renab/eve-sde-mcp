@@ -127,7 +127,7 @@ Kubernetes set `fsGroup: 1000` on the pod):
   is disabled by default and requires a successful explicit connection/schema
   test followed by `wormholesystems_enable_sync`; registration or testing alone
   does not activate it. This repository has not tested the actual alliance
-  deployment. Source sync remains on-demand and GET-only. A validated complete
+  deployment. Unit 06 implements automatic selected-map sync every five minutes once enabled and validly bound; the currently deployed scheduler has not been verified, so confirm the running Galaxy revision before relying on it. Source HTTP remains GET-only, while eligible sync writes a versioned Nexum topology/signature PUT (never linked notes). Manual sync remains available. A validated complete
   map snapshot may qualify for the configured Nexum topology and note gates;
   deployed source credentials, routes, schema and rate limits remain unverified.
 
@@ -137,7 +137,7 @@ Kubernetes set `fsGroup: 1000` on the pod):
 - `login.eveonline.com` — EVE SSO OAuth
 - `www.fuzzwork.co.uk` — SDE download (first start / `refresh_sde`)
 - `eve-nexum.com` — Nexum wormhole maps (`NEXUM_BASE_URL`)
-- Operator-configured self-hosted WormholeSystems HTTPS origin — explicit GET-only connection tests and operator-activated, on-demand source snapshot sync; no origin is assumed or configured by default. Actual deployment compatibility remains unverified and must be confirmed before operator activation.
+- Operator-configured self-hosted WormholeSystems HTTPS origin — explicit GET-only connection tests and operator-activated five-minute selected-map source snapshot sync; no origin is assumed or configured by default. Actual deployment compatibility remains unverified and must be confirmed before operator activation.
 
 ### Health and readiness
 

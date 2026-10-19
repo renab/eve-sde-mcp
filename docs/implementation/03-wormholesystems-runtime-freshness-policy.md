@@ -2,7 +2,7 @@
 
 ## Objective
 
-Replace the env-only `GALAXY_WORMSYSTEMS_MAX_STALENESS_MS` matching limit with an operator-configurable, restart-persistent runtime policy. The operator-approved initial maximum age is **60,000 ms**. This policy limits a complete validated WormholeSystems source snapshot for data apply and note matching, and additionally limits required Nexum map/signature cache evidence for **note matching**. Missing target rows/cache must not prevent unit 04 from creating validated source-owned systems and signatures. The policy alone does not activate source sync or Nexum writes.
+Replace the env-only `GALAXY_WORMSYSTEMS_MAX_STALENESS_MS` matching limit with an operator-configurable, restart-persistent runtime policy. The operator-approved initial maximum age is **60,000 ms**. This policy limits a complete validated WormholeSystems source snapshot for data apply and note matching, and additionally limits required Nexum map/signature cache evidence for **note matching**. Missing target rows/cache must not prevent unit 04 from creating validated source-owned systems and signatures. The policy alone does not activate source sync or Nexum writes. Unit 06 schedules the existing validated selected-map sync every five minutes once separately enabled and validly writer-bound; the 60,000 ms snapshot-age gate remains a per-send limit, not the polling period.
 
 ## Authority and dependencies
 
