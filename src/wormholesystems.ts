@@ -10,7 +10,6 @@ import { NexumStore, type Json } from "./nexum-store.js";
 import { NexumError, normalizeBaseUrl } from "./nexum-client.js";
 import { containsSecretValue, normalizeSourceSnapshot, validateSourceMapDetail } from "./wormholesystems-adapter.js";
 import { mapDecisionBoundary } from "./map-decision-boundary.js";
-import { resolveTypeName } from "./utils.js";
 import {
   WormholeSystemsClient, WormholeSystemsError, validateWormholeSystemsOrigin,
   validateWormholeSystemsPathPrefix, type ApiMapRecord, type WormholeSystemsConfig,
@@ -120,11 +119,6 @@ function solarSystemIdentityExists(eveSystemId: number): boolean {
   catch { return false; }
 }
 
-function invTypesSchemaReadable(): boolean {
-  try { getDatabase().prepare("SELECT typeID, typeName FROM invTypes LIMIT 0").all(); return true; }
-  catch { return false; }
-}
-
 export class WormholeSystemsService {
   private readonly lifetime = new AbortController();
   private readonly syncs = new Map<string, Promise<Json>>();
@@ -141,8 +135,9 @@ export class WormholeSystemsService {
     private readonly nexumWrites: SourceNexumWrites = getNexum(),
     private readonly systemClass: (eveSystemId: number) => string | null = canonicalSolarSystemClass,
     private readonly systemExists: (eveSystemId: number) => boolean = solarSystemIdentityExists,
-    private readonly signatureTypeName: (sourceTypeId: unknown) => string | null = sourceTypeId => resolveTypeName(getDatabase(), sourceTypeId),
-    private readonly invTypesReadable: () => boolean = invTypesSchemaReadable,
+    // Retained positional test-injection slots for compatibility; signature naming never calls SDE.
+    _signatureTypeName?: (sourceTypeId: unknown) => string | null,
+    _invTypesReadable?: () => boolean,
   ) {
     store.db.exec(`
       CREATE TABLE IF NOT EXISTS wormholesystems_credentials (id TEXT PRIMARY KEY, metadata TEXT NOT NULL);
@@ -500,8 +495,6 @@ export class WormholeSystemsService {
   private sourceSdeBlockers(candidate: Record<string, unknown>): string[] {
     if (!Array.isArray(candidate.systems)) return ["systems: complete validated source-system projection is unavailable"];
     const blockers: string[] = [];
-    if (candidate.schemaVersion === 3 && !this.invTypesReadable())
-      blockers.push("SDE invTypes table/schema is unavailable; topology writes require a readable installed SDE");
     candidate.systems.forEach((value, index) => {
       if (!value || typeof value !== "object" || Array.isArray(value)) return;
       const system = value as Record<string, unknown>;
@@ -917,7 +910,7 @@ export class WormholeSystemsService {
         return { status: "blocked", attempted: false, accepted: false, partial: false, indeterminate: false,
           blockers: ["frozen topology request is corrupt; fetch a new complete source snapshot"] };
       }
-    } else projection = topologyProjectionFromFixture(fixture, this.signatureTypeName);
+    } else projection = topologyProjectionFromFixture(fixture);
     const policy = this.policyState();
     const stored = this.store.db.prepare("SELECT * FROM wormholesystems_source_snapshots WHERE map_id=?").get(mapId) as any;
     const blockers = [...this.snapshotBlockers(mapId, stored), ...projection.blockers, ...this.sourceSdeBlockers(projection.candidate),
@@ -976,8 +969,10 @@ export class WormholeSystemsService {
     if (!frozenState) {
       const nameEvidence = Array.isArray((request as any).signatures) ? (request as any).signatures.map((signature: any) => {
         const evidence = fixture.sourceSignatureEvidence?.find(row => row.sourceSignatureId === signature.sourceSignatureId);
-        return { sourceSignatureId: signature.sourceSignatureId, signatureTypeId: evidence?.signatureTypeId ?? null,
-          resolved: typeof signature.name === "string" };
+         return { sourceSignatureId: signature.sourceSignatureId, signatureCode: evidence?.signatureCode ?? null,
+           category: evidence?.signatureCategoryName ?? null, wormholeId: evidence?.wormholeId ?? null,
+           nestedWormholeId: evidence?.nestedWormholeId ?? null, wormholeName: evidence?.wormholeName ?? null,
+           name: signature.name };
       }) : [];
       const policyRevision = policy.policy?.revision ?? null;
       frozenState = { request_json: requestJson,
@@ -987,8 +982,8 @@ export class WormholeSystemsService {
           nexumMapId: config.nexumRouteMapId, sourceConfigurationRevision: fetchedConfig.configurationRevision,
           credentialId: fetchedConfig.credentialId, credentialVersion: Number(this.metadata(fetchedConfig.credentialId).credential_version) || 1,
           stalenessPolicyRevision: policyRevision,
-          nameResolutionDigest: crypto.createHash("sha256").update(stableJson(nameEvidence)).digest("hex"),
-          signatureCount: nameEvidence.length, resolvedNameCount: nameEvidence.filter((row: any) => row.resolved).length },
+           nameRenderingDigest: crypto.createHash("sha256").update(stableJson(nameEvidence)).digest("hex"),
+           signatureCount: nameEvidence.length, renderedNameCount: nameEvidence.filter((row: any) => typeof row.name === "string").length },
         projectionDiagnostics: projection.diagnostics };
       frozenState.integrity_digest = crypto.createHash("sha256").update(stableJson({
         request_digest: frozenState.request_digest, provenance: frozenState.provenance,
@@ -1528,17 +1523,16 @@ export class WormholeSystemsService {
         ...(classificationCaptured && Object.prototype.hasOwnProperty.call(signature, "wormholeName") ? { wormhole_name: signature.wormholeName } : {}),
       }));
       const classificationStatus = classificationCaptured ? "captured" : "not_captured_in_snapshot";
-      const topologyProjection = topologyProjectionFromFixture(sourceFixture, this.signatureTypeName);
+      const topologyProjection = topologyProjectionFromFixture(sourceFixture);
       const projectedSignatures = Array.isArray(topologyProjection.candidate.signatures)
         ? topologyProjection.candidate.signatures as Array<Record<string, unknown>> : [];
       const resolutionEvidence = projectedSignatures.slice(0, 500).map(signature => {
-        const sourceEvidence = classificationRows.find(item => item.sourceSignatureId === signature.sourceSignatureId);
+        const invalidEvidence = topologyProjection.blockers.some(blocker =>
+          blocker.startsWith(`signatures[${signature.sourceSignatureId}].`));
         return { source_signature_id: signature.sourceSignatureId,
-          ...(sourceEvidence && Object.prototype.hasOwnProperty.call(sourceEvidence, "signatureTypeId")
-            ? { signature_type_id: sourceEvidence.signatureTypeId } : {}),
-          name_status: typeof signature.name === "string" ? "resolved"
-            : sourceEvidence?.signatureTypeId === null || sourceEvidence?.signatureTypeId === undefined ? "type_id_unavailable" : "name_unresolved",
-          ...(typeof signature.name === "string" ? { name: signature.name } : {}) };
+          name_status: !categoryNameCaptured ? "not_captured_in_snapshot"
+            : invalidEvidence ? "invalid_source_evidence" : signature.name === "Unknown" ? "name_unknown" : "rendered_from_whs",
+          ...(categoryNameCaptured && !invalidEvidence && typeof signature.name === "string" ? { name: signature.name } : {}) };
       });
     const state = this.store.state(mapId) as Json;
     const nexumMap = this.store.map(mapId);
@@ -1777,7 +1771,7 @@ export class WormholeSystemsService {
           fresh_for_matching: snapshotReasons.length === 0, blockers: snapshotReasons },
          source_signature_classification: { status: classificationStatus, total: classificationRows.length,
            omitted: Math.max(0, classificationRows.length - sourceSignatureEvidence.length), signatures: sourceSignatureEvidence },
-         signature_name_resolution: { status: "local_sde_lookup", total: projectedSignatures.length,
+           signature_name_resolution: { status: categoryNameCaptured ? "whs_source_rendering" : "not_captured_in_snapshot", total: projectedSignatures.length,
            omitted: Math.max(0, projectedSignatures.length - resolutionEvidence.length), signatures: resolutionEvidence },
         matching_performed: true, stored_snapshot_eligible_for_matching: !!row.eligible_for_matching,
         source_snapshot_eligible_for_matching: sourceSnapshotEligible, snapshot_eligible_for_matching: sourceSnapshotEligible,
