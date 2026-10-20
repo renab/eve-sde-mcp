@@ -8,7 +8,6 @@ import { SecretStore } from "./secrets.js";
 import { NexumStore, resourceKinds, type Json, type ResourceKind } from "./nexum-store.js";
 import { HttpNexumTransport, NexumError, normalizeBaseUrl, type NexumStream, type NexumTransport } from "./nexum-client.js";
 import { defaultChainNoteFormat, planChain, validateChainNoteFormat } from "./nexum-chain.js";
-import { mapDecisionBoundary } from "./map-decision-boundary.js";
 
 const prefix=(m:Json)=>`/api/v1/maps/${encodeURIComponent(m.nexum_map_id)}`;
 const object=(v:any):v is Json=>!!v && typeof v==="object" && !Array.isArray(v);
@@ -21,11 +20,6 @@ const presenceCoverage=()=>({
   limitation:"Nexum's numbered alt and fleet badges use browser-session-only /api/character/account-locations and /api/character/fleet endpoints. Those locations are not included in API-key presence events. A missing viewer does not mean a character is absent from the system.",
 });
 type Worker={controller:AbortController; task:Promise<void>; credential?:string; stream?:NexumStream};
-export type WormholesystemsSignatureNoteIdentity={connectionId:string;fromSystemId:string;toSystemId:string;
-  fromEveSystemId:number;toEveSystemId:number;signatureCode:string;sourceIdentity:string;sourceSignatureId:string;nexumSignatureId:string;
-  maxStalenessMs:number;stalenessPolicyRevision:string};
-export type WormholesystemsSignatureNoteChange={systemId:string;signatureId:string;notes:string;expectedIdentity:WormholesystemsSignatureNoteIdentity};
-export type WormholesystemsOwnershipBinding={credentialId:string;baseUrl:string;nexumMapId:string};
 export interface NexumOptions { debounceMs?:number; staleMs?:number; retentionMs?:number; retryMs?:number; accessRefreshMs?:number; random?:()=>number; }
 
 export class NexumService {
@@ -149,7 +143,7 @@ export class NexumService {
     this.stopped=false;
     if(this.lifetime.signal.aborted)this.lifetime=new AbortController();
     if(this.pruneTimer)return;
-    for(const m of this.store.maps())void mapDecisionBoundary.run(m.id,()=>this.store.patchMap(m.id,{stream_connected:false,health:m.hydrated_at?"degraded":"uninitialized",disconnected_at:this.now()}));
+    for(const m of this.store.maps())this.store.patchMap(m.id,{stream_connected:false,health:m.hydrated_at?"degraded":"uninitialized",disconnected_at:this.now()});
     this.pruneTimer=setInterval(()=>{this.store.prune(this.options.retentionMs);this.esiLocations.prune(this.options.retentionMs);this.refreshAccess();this.ensureWorkers();},60_000);this.pruneTimer.unref();
     // Background discovery has bounded HTTP calls and cannot block Galaxy startup.
     this.esiLocations.start();
@@ -186,9 +180,9 @@ export class NexumService {
     if(this.stopped)return;
     for(const m of this.store.maps()) {
       if(this.workers.has(m.id))continue;
-       if(!this.candidates(m.id).length){void mapDecisionBoundary.run(m.id,()=>this.store.patchMap(m.id,{stream_connected:false,health:"auth_failed",disconnected_at:m.disconnected_at??this.now()}));continue;}
+      if(!this.candidates(m.id).length){this.store.patchMap(m.id,{stream_connected:false,health:"auth_failed",disconnected_at:m.disconnected_at??this.now()});continue;}
       const w:Worker={controller:new AbortController(),task:Promise.resolve()};this.workers.set(m.id,w);
-       w.task=this.run(m.id,w).catch(()=>mapDecisionBoundary.run(m.id,()=>this.store.patchMap(m.id,{health:"degraded",last_error:"Nexum worker stopped"})))
+      w.task=this.run(m.id,w).catch(()=>{this.store.patchMap(m.id,{health:"degraded",last_error:"Nexum worker stopped"});})
         .finally(()=>{if(this.workers.get(m.id)===w)this.workers.delete(m.id);});
     }
   }
@@ -217,27 +211,22 @@ export class NexumService {
         if(ended)throw new NexumError();
         while(buffered.length)await this.enqueue(id,()=>this.handleEvent(id,buffered.shift()!,c,signal));
         ready=true;failures=0;
-        await mapDecisionBoundary.run(id,()=>this.store.patchMap(id,{health:"live",stream_connected:true,stream_credential_id:c.id,disconnected_at:null,last_error:null}));
+        this.store.patchMap(id,{health:"live",stream_connected:true,stream_credential_id:c.id,disconnected_at:null,last_error:null});
         this.store.patchCredential(c.id,{health:"healthy",capabilities:["read","live_events"],last_success_at:this.now(),last_error:null});
         await pump;if(!signal.aborted)throw new NexumError();
       }catch(e){
         if(!w.controller.signal.aborted){this.failure(c,e,id);failures++;
-          await mapDecisionBoundary.run(id,()=>this.store.patchMap(id,{last_error:safeError(e),reconnect_attempts:(this.store.map(id).reconnect_attempts??0)+1}));}
+          this.store.patchMap(id,{last_error:safeError(e),reconnect_attempts:(this.store.map(id).reconnect_attempts??0)+1});}
       }finally{
         session.abort();w.stream?.close();await pump?.catch(()=>{});
         for(const [key,t]of this.pending)if(key.startsWith(id+":")){clearTimeout(t);this.pending.delete(key);}
-        await mapDecisionBoundary.run(id,()=>{const map=this.store.map(id);this.store.patchMap(id,{stream_connected:false,health:this.candidates(id).length?(map.hydrated_at?"degraded":"uninitialized"):"auth_failed",disconnected_at:map.disconnected_at??this.now()});});
+        const map=this.store.map(id);this.store.patchMap(id,{stream_connected:false,health:this.candidates(id).length?(map.hydrated_at?"degraded":"uninitialized"):"auth_failed",disconnected_at:map.disconnected_at??this.now()});
       }
       await this.delay(Math.min(300_000,this.options.retryMs*2**Math.min(failures,8))*(0.75+this.options.random()*0.5),w.controller.signal);
     }
   }
   private enqueue(id:string,fn:()=>Promise<void>):Promise<void>{
     const next=(this.queues.get(id)??Promise.resolve()).catch(()=>{}).then(fn);this.queues.set(id,next);return next;
-  }
-  private enqueueValue<T>(id:string,fn:()=>Promise<T>):Promise<T>{
-    let value!:T;
-    const next=(this.queues.get(id)??Promise.resolve()).catch(()=>{}).then(async()=>{value=await fn();});
-    this.queues.set(id,next);return next.then(()=>value);
   }
   async hydrate(id:string,c:Json,signal?:AbortSignal,mergeResync=false):Promise<void>{
     const m=this.store.map(id),full=await this.get(c,prefix(m),signal);
@@ -254,10 +243,7 @@ export class NexumService {
       if(!Array.isArray(data))throw new NexumError(0,0,"Malformed Nexum resource");resources.push({system:String(s.id),kind,data});
     }
     if(signal?.aborted)return;
-    let committed=false;
-    await mapDecisionBoundary.run(id,()=>{
-      if(signal?.aborted)return;
-      this.store.db.transaction(()=>{
+    this.store.db.transaction(()=>{
       this.store.saveState(id,full);
       if(mergeResync){
         const ids=new Set(full.systems.map((s:Json)=>String(s.id)));
@@ -270,10 +256,7 @@ export class NexumService {
         if(r.kind==="signatures")this.store.retireAbsentChainReservations(id,r.system,r.data,full);
       }
       this.store.patchMap(id,{name:full.name,hydrated_at:this.now(),last_rest_success_at:this.now(),last_resync_at:m.hydrated_at?this.now():null});
-      })();
-      committed=true;
-    });
-    if(!committed)return;
+    })();
     this.scheduleChain(id,c);
   }
   private scheduleChain(id:string,c:Json):void {
@@ -282,21 +265,6 @@ export class NexumService {
     timer.unref();this.chainPending.set(id,timer);
   }
   private async reconcileChain(id:string,c:Json):Promise<void> {
-    return mapDecisionBoundary.run(id,()=>this.reconcileChainLocked(id,c));
-  }
-  private async reconcileChainLocked(id:string,c:Json):Promise<void> {
-    const hasSourceConfig=!!this.store.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='wormholesystems_config'").get();
-    if(hasSourceConfig){
-      const source=this.store.db.prepare("SELECT config_json FROM wormholesystems_config WHERE id='singleton'").get() as {config_json:string}|undefined;
-      if(source){
-        const config=JSON.parse(source.config_json) as Json;
-        if(config.canonicalMapId===id&&config.liveSyncEnabled===true){
-          this.store.patchMap(id,{chain_sync:{at:this.now(),note_format:"wormholesystems_source",desired_note_changes:0,
-            desired_label_changes:0,label_write_status:"unavailable_by_external_api",warnings:["legacy chain notes suppressed while WormholeSystems is enabled; source authority/rendering is not yet write-eligible"]}});
-          return;
-        }
-      }
-    }
     const m=this.store.map(id), noteFormat=this.chainNoteFormat(id).format;
     let plan=planChain(this.store.state(id),systemId=>this.store.resources(id,systemId),noteFormat,this.store.chainReservations(id));
     if(plan.reservations.length){this.store.saveChainReservations(id,plan.reservations);plan=planChain(this.store.state(id),systemId=>this.store.resources(id,systemId),noteFormat,this.store.chainReservations(id));}
@@ -332,18 +300,15 @@ export class NexumService {
   }
   private schedule(id:string,key:string,fn:()=>Promise<void>):void {
     const k=id+":"+key;if(this.pending.has(k))return;
-    const t=setTimeout(()=>{this.pending.delete(k);void this.enqueue(id,fn).catch(e=>mapDecisionBoundary.run(id,()=>{
+    const t=setTimeout(()=>{this.pending.delete(k);void this.enqueue(id,fn).catch(e=>{
       this.store.patchMap(id,{health:"degraded",last_error:safeError(e)});
       // A failed targeted refresh must recover even if no further event arrives.
       const w=this.workers.get(id);
       if(w?.credential)this.failure(this.store.credential(w.credential),e);
       w?.stream?.close();
-    }));},this.options.debounceMs);t.unref();this.pending.set(k,t);
+    });},this.options.debounceMs);t.unref();this.pending.set(k,t);
   }
   async handleEvent(id:string,e:Json,c:Json,signal?:AbortSignal):Promise<void>{
-    return mapDecisionBoundary.run(id,()=>this.handleEventLocked(id,e,c,signal));
-  }
-  private async handleEventLocked(id:string,e:Json,c:Json,signal?:AbortSignal):Promise<void>{
     if(signal?.aborted)return;
     if(!object(e)||typeof e.type!=="string"){this.store.patchMap(id,{last_error:"Malformed Nexum event"});return;}
     if(e.type==="__heartbeat"){this.store.patchMap(id,{last_stream_activity_at:this.now()});return;}
@@ -361,11 +326,11 @@ export class NexumService {
         if(signal?.aborted||!this.store.state(id).systems.some((s:Json)=>String(s.id)===String(e.systemId)))return;
         const data=await this.get(c,`${prefix(this.store.map(id))}/systems/${encodeURIComponent(String(e.systemId))}/${kind}`,signal);
         if(!Array.isArray(data))throw new NexumError(0,0,"Malformed Nexum resource");
-        await mapDecisionBoundary.run(id,()=>{if(!signal?.aborted&&this.store.state(id).systems.some((s:Json)=>String(s.id)===String(e.systemId))){
+        if(!signal?.aborted){
           this.store.saveResource(id,String(e.systemId),kind,data);
           if(kind==="signatures")this.store.retireAbsentChainReservations(id,String(e.systemId),data,this.store.state(id));
           this.store.patchMap(id,{last_rest_success_at:this.now()});this.scheduleChain(id,c);
-        }});
+        }
       });return;
     }
     if(e.type==="map.resync"){
@@ -477,140 +442,6 @@ export class NexumService {
     if(credential)await this.reconcileChain(m.id,credential);
     return this.chainDiagnostics(m.id);
   });}
-  async writeWormholesystemsTopology(map:string,request:Record<string,unknown>,writerCredentialId:string,
-    binding:{baseUrl:string;nexumMapId:string}):Promise<Json>{
-    const m=this.store.map(map),base=this.nexumBase();
-    if(!writerCredentialId||!binding||binding.baseUrl!==base||m.base_url!==base||m.nexum_map_id!==binding.nexumMapId)
-      throw new NexumError(0,0,"Selected Nexum map/base binding changed");
-    const writer=this.store.credentials().find(candidate=>candidate.id===writerCredentialId);
-    if(!writer||!writer.enabled||writer.base_url!==base||
-      !this.store.access(m.id).some(access=>access.credential_id===writerCredentialId))
-      throw new NexumError(0,0,"The explicitly selected Nexum writer is unavailable or lacks access to the selected map");
-    if(!this.transport.put)throw new NexumError(0,0,"Configured Nexum transport has no PUT support");
-    const retryAt=this.store.credential(writer.id).retry_at??0;
-    if(retryAt>this.now())throw new NexumError(429,retryAt-this.now(),"Nexum rate limited");
-    return this.transport.put(base,this.secrets.get(writer.secret_ref),
-      `${prefix(m)}/wormholesystems/topology`,request,this.lifetime.signal);
-  }
-  invalidateWormholesystemsTopologyCache(map:string):Promise<void>{
-    const m=this.store.map(map);
-    return mapDecisionBoundary.run(m.id,()=>this.store.db.transaction(()=>{
-      this.store.db.prepare("DELETE FROM nexum_resources WHERE map_id=? AND kind='signatures'").run(m.id);
-      this.store.patchMap(m.id,{hydrated_at:null,health:"degraded",last_rest_success_at:null});
-    })());
-  }
-  writeWormholesystemsSignatureNotes(map:string,changes:WormholesystemsSignatureNoteChange[],validateSource:()=>string[],
-    ownershipBinding?:WormholesystemsOwnershipBinding):Promise<Json>{
-    const m=this.store.map(map);
-    if(!changes.length)return Promise.resolve({written:0});
-    return this.enqueueValue(m.id,()=>mapDecisionBoundary.run(m.id,()=>this.writeWormholesystemsSignatureNotesLocked(m.id,changes,validateSource,ownershipBinding)));
-  }
-  private async attestOwnedSignature(mapId:string,identity:WormholesystemsSignatureNoteIdentity,
-    binding?:WormholesystemsOwnershipBinding):Promise<boolean>{
-    if(!binding||!this.transport.post)return false;
-    const map=this.store.map(mapId),base=this.nexumBase();
-    if(binding.baseUrl!==base||map.base_url!==base||binding.nexumMapId!==map.nexum_map_id)return false;
-    const writer=this.store.credentials().find(candidate=>candidate.id===binding.credentialId);
-    if(!writer||!writer.enabled||writer.base_url!==base||!this.store.access(mapId).some(access=>access.credential_id===writer.id))return false;
-    const retryAt=this.store.credential(writer.id).retry_at??0;
-    if(retryAt>this.now())return false;
-    try{
-      const result=await this.transport.post(base,this.secrets.get(writer.secret_ref),
-        `${prefix(map)}/wormholesystems/ownership`,{sourceIdentity:identity.sourceIdentity,
-          items:[{sourceSignatureId:identity.sourceSignatureId,rowId:identity.nexumSignatureId}]},this.lifetime.signal);
-      const items=Array.isArray(result?.items)?result.items:[];
-      return items.length===1&&items[0]?.sourceSignatureId===identity.sourceSignatureId&&
-        items[0]?.rowId===identity.nexumSignatureId&&items[0]?.owned===true;
-    }catch{return false;}
-  }
-  private async writeWormholesystemsSignatureNotesLocked(mapId:string,changes:WormholesystemsSignatureNoteChange[],validateSource:()=>string[],
-    ownershipBinding?:WormholesystemsOwnershipBinding):Promise<Json>{
-    const m=this.store.map(mapId);
-    const writer=this.candidates(m.id)[0];
-    if(!writer)throw new NexumError(0,0,"No Nexum credential has access to the selected map");
-    if(!this.transport.patch)throw new NexumError(0,0,"Configured Nexum transport has no PATCH support");
-    const retryAt=this.store.credential(writer.id).retry_at??0;
-    if(retryAt>this.now())throw new NexumError(429,retryAt-this.now(),"Nexum rate limited");
-    const items:Array<{item_index:number;status:"written"|"unchanged"|"blocked"|"failed"|"not_attempted";warnings?:string[];reason_code?:string}>=
-      changes.map((_,item_index)=>({item_index,status:"not_attempted"}));
-    const localCacheWarnings:string[]=[];
-    const result=(status:"blocked"|"unchanged"|"completed"|"failed",blockers:string[]=[]):Json=>({
-      written:items.filter(item=>item.status==="written").length,status,items,...(blockers.length?{blockers}:{}),
-      ...(localCacheWarnings.length?{local_cache_status:"degraded",warnings:[...localCacheWarnings]}:{}),
-    });
-    const block=(itemIndex:number,blockers:string[],reasonCode?:string)=>{items[itemIndex].status="blocked";if(reasonCode)items[itemIndex].reason_code=reasonCode;return result("blocked",blockers);};
-    for(const [itemIndex,change] of changes.entries()){
-      const sourceBlockers=validateSource();
-      if(sourceBlockers.length)return block(itemIndex,sourceBlockers);
-      const {expectedIdentity:identity}=change;
-      const currentState=this.store.state(m.id),systems=(currentState.systems??[]) as Json[],edges=(currentState.connections??[]) as Json[];
-      const fromSystems=systems.filter(system=>String(system.id)===identity.fromSystemId && Number(system.eveSystemId)===identity.fromEveSystemId);
-      const toSystems=systems.filter(system=>String(system.id)===identity.toSystemId && Number(system.eveSystemId)===identity.toEveSystemId);
-      const identityEdges=edges.filter(edge=>{
-        const forward=String(edge.sourceId)===identity.fromSystemId&&String(edge.targetId)===identity.toSystemId;
-        const reverse=String(edge.sourceId)===identity.toSystemId&&String(edge.targetId)===identity.fromSystemId;
-        return String(edge.id)===identity.connectionId && (forward||reverse) &&
-          String(forward?edge.sourceSignatureId:edge.targetSignatureId)===change.signatureId;
-      });
-      const identityEdge=identityEdges[0];
-      const edgeStatus=String(identityEdge?.timeStatus??"").toLowerCase();
-      if(fromSystems.length!==1||toSystems.length!==1||identityEdges.length!==1||identityEdge.broken!==false||
-          !edgeStatus||["unknown","unavailable","broken","expired"].includes(edgeStatus))
-        return block(itemIndex,["current Nexum directional signature identity changed after alliance-note preview"]);
-      const resource=this.store.resources(m.id,change.systemId),signatures=resource.signatures.items as Json[];
-      const matchingRows=signatures.filter(signature=>String(signature.id)===change.signatureId);
-      const actual=matchingRows[0];
-       if(matchingRows.length!==1||String(change.systemId)!==identity.fromSystemId||actual.signature!==identity.signatureCode||actual.status!=="active")
-         return block(itemIndex,["current Nexum directional signature identity changed after alliance-note preview"]);
-       if(typeof actual.notes!=="string")return block(itemIndex,["current Nexum signature note is unknown"]);
-       const owned=await this.attestOwnedSignature(m.id,identity,ownershipBinding);
-       if(actual.notes===change.notes){items[itemIndex].status="unchanged";continue;}
-       if(actual.notes!==""&&!owned)return block(itemIndex,["current non-empty Nexum note is preserved because Galaxy ownership could not be proven"],
-         "note_skipped_unproven_ownership");
-      const map=this.store.map(m.id),mapFetchedAt=map.hydrated_at===null||map.hydrated_at===undefined?NaN:Number(map.hydrated_at),resourceFetchedAt=resource.signatures.fetched_at===null||resource.signatures.fetched_at===undefined?NaN:Number(resource.signatures.fetched_at);
-      if(!Number.isSafeInteger(identity.maxStalenessMs)||identity.maxStalenessMs<1||typeof identity.stalenessPolicyRevision!=="string"||!identity.stalenessPolicyRevision||
-          map.health!=="live"||!Number.isFinite(mapFetchedAt)||mapFetchedAt>this.now()||this.now()-mapFetchedAt>identity.maxStalenessMs||
-          !Number.isFinite(resourceFetchedAt)||resourceFetchedAt>this.now()||this.now()-resourceFetchedAt>identity.maxStalenessMs)
-        return block(itemIndex,["current Nexum map or signature cache is stale after alliance-note preview"]);
-      try{
-        await this.transport.patch(this.nexumBase(),this.secrets.get(writer.secret_ref),
-          `${prefix(m)}/systems/${encodeURIComponent(change.systemId)}/signatures/${encodeURIComponent(change.signatureId)}`,
-          {notes:change.notes},this.lifetime.signal);
-      }catch(error){
-        const status=error instanceof NexumError?error.status:0;
-        this.store.patchCredential(writer.id,{chain_write_status:status===401||status===403?"unavailable":"degraded",
-          chain_write_error:safeError(error),chain_write_error_at:this.now()});
-        items[itemIndex].status="failed";
-        return result("failed");
-      }
-      // The PATCH acknowledgement, not a later cache equality check, is the write outcome.
-      items[itemIndex].status="written";
-      const itemWarnings:string[]=[];
-      try{
-        this.store.saveResource(m.id,change.systemId,"signatures",signatures.map(signature=>String(signature.id)===change.signatureId?{...signature,notes:change.notes}:signature));
-      }catch{
-        itemWarnings.push("Nexum acknowledged the alliance-note PATCH, but local signature cache persistence failed; cached notes may be stale.");
-      }
-      try{
-        this.store.patchCredential(writer.id,{chain_write_status:"available",chain_write_error:null,last_chain_write_at:this.now()});
-      }catch{
-        itemWarnings.push("Nexum acknowledged the alliance-note PATCH, but local credential write status could not be persisted.");
-      }
-      if(itemWarnings.length){
-        items[itemIndex].warnings=itemWarnings;
-        localCacheWarnings.push(...itemWarnings);
-      }
-      try{
-        this.store.patchMap(m.id,{local_cache_status:localCacheWarnings.length?"degraded":"healthy",
-          local_cache_warning:localCacheWarnings[0]??null});
-      }catch{
-        const warning="Nexum acknowledged the alliance-note PATCH, but local cache health status could not be persisted.";
-        items[itemIndex].warnings=[...(items[itemIndex].warnings??[]),warning];
-        localCacheWarnings.push(warning);
-      }
-    }
-    return result(items.some(item=>item.status==="written")?"completed":"unchanged");
-  }
   chainDiagnostics(map:string):Json {
     const m=this.store.map(map),state=this.store.state(m.id),config=this.chainNoteFormat(m.id),noteFormat=config.format,plan=planChain(state,systemId=>this.store.resources(m.id,systemId),noteFormat,this.store.chainReservations(m.id));
     const systems=(state.systems??[]) as Json[];
