@@ -1,6 +1,5 @@
 import crypto from "node:crypto";
 import type Database from "better-sqlite3";
-import { normalizeWormholeSystemsFixture, validateWormholeSystemsFixture, type WormholePreview, type WormholeSystemsFixture } from "./wormholesystems-fixture.js";
 
 export type Json = Record<string, any>;
 export type ChainReservation = {systemId:string;signatureId:string;identifier:string;destinationClass:string;targetSystemId?:string};
@@ -35,25 +34,6 @@ export class NexumStore {
       CREATE TABLE IF NOT EXISTS nexum_presence_events (id INTEGER PRIMARY KEY, map_id TEXT NOT NULL,
         character_id TEXT NOT NULL, event TEXT NOT NULL, payload TEXT NOT NULL, observed_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS nexum_presence_time ON nexum_presence_events(map_id,observed_at);
-      -- Local synthetic fixtures only; these rows do not configure or activate a source.
-      CREATE TABLE IF NOT EXISTS wormholesystems_fixture_snapshots (
-        map_id TEXT PRIMARY KEY REFERENCES nexum_maps(id) ON DELETE CASCADE,
-        fixture_json TEXT NOT NULL CHECK(json_valid(fixture_json)), source_identity TEXT NOT NULL,
-        revision_or_digest TEXT NOT NULL, fetched_at TEXT NOT NULL, observed_at TEXT,
-        fixture_version INTEGER NOT NULL CHECK(fixture_version=1), validated_at INTEGER NOT NULL,
-        fixture_preview_eligible INTEGER NOT NULL CHECK(fixture_preview_eligible=1), write_eligible INTEGER NOT NULL CHECK(write_eligible=0)
-      );
-      CREATE TABLE IF NOT EXISTS wormholesystems_fixture_runs (
-        id INTEGER PRIMARY KEY, map_id TEXT NOT NULL REFERENCES nexum_maps(id) ON DELETE CASCADE,
-        status TEXT NOT NULL CHECK(status='fixture_validated'), revision_or_digest TEXT NOT NULL,
-        validated_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS wormholesystems_fixture_previews (
-        map_id TEXT PRIMARY KEY REFERENCES nexum_maps(id) ON DELETE CASCADE,
-        source_revision TEXT NOT NULL, preview_json TEXT NOT NULL CHECK(json_valid(preview_json)), created_at INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS wormholesystems_fixture_runs_map_time
-        ON wormholesystems_fixture_runs(map_id,validated_at);
     `);
     if(!(db.prepare("PRAGMA table_info(nexum_chain_reservations)").all() as any[]).some(column=>column.name==="target_system_id"))
       db.exec("ALTER TABLE nexum_chain_reservations ADD COLUMN target_system_id TEXT");
@@ -104,73 +84,6 @@ export class NexumStore {
   }
   saveResource(map: string, system: string, kind: ResourceKind, data: Json[]): void {
     this.db.prepare("INSERT OR REPLACE INTO nexum_resources VALUES (?,?,?,?,?)").run(map,system,kind,JSON.stringify(data),this.now());
-  }
-  saveWormholeSystemsFixture(mapId: string, input: unknown): { mapId: string; revisionOrDigest: string; fixtureOnly: true; writeEligible: false } {
-    const parsed = normalizeWormholeSystemsFixture(input);
-    if (!parsed.ok) throw new Error(`Invalid WormholeSystems fixture: ${parsed.issues.slice(0, 4).map(issue => issue.path).join(", ")}`);
-    const fixture = parsed.value;
-    if (fixture.scope.canonicalMapId !== mapId) throw new Error("Fixture canonical map identity mismatch");
-    if (!(this.db.prepare("SELECT 1 FROM nexum_maps WHERE id=?").get(mapId))) throw new Error("Map not found");
-    const validatedAt = this.now();
-    this.db.transaction(() => {
-      this.db.prepare(`INSERT INTO wormholesystems_fixture_snapshots
-        (map_id,fixture_json,source_identity,revision_or_digest,fetched_at,observed_at,fixture_version,validated_at,fixture_preview_eligible,write_eligible)
-        VALUES (?,?,?,?,?,?,1,?,1,0)
-        ON CONFLICT(map_id) DO UPDATE SET fixture_json=excluded.fixture_json,source_identity=excluded.source_identity,
-          revision_or_digest=excluded.revision_or_digest,fetched_at=excluded.fetched_at,observed_at=excluded.observed_at,
-          fixture_version=excluded.fixture_version,validated_at=excluded.validated_at,fixture_preview_eligible=1,write_eligible=0`)
-        .run(mapId, JSON.stringify(fixture), fixture.sourceIdentity, fixture.revisionOrDigest, fixture.fetchedAt, fixture.observedAt, validatedAt);
-      this.db.prepare("INSERT INTO wormholesystems_fixture_runs(map_id,status,revision_or_digest,validated_at) VALUES (?,'fixture_validated',?,?)")
-        .run(mapId, fixture.revisionOrDigest, validatedAt);
-      // Never leave a previously rendered preview attached to replacement data.
-      this.db.prepare("DELETE FROM wormholesystems_fixture_previews WHERE map_id=?").run(mapId);
-    })();
-    return { mapId, revisionOrDigest: fixture.revisionOrDigest, fixtureOnly: true, writeEligible: false };
-  }
-  wormholeSystemsFixture(mapId: string): WormholeSystemsFixture | undefined {
-    const row = this.db.prepare("SELECT fixture_json FROM wormholesystems_fixture_snapshots WHERE map_id=?").get(mapId) as { fixture_json: string } | undefined;
-    if (!row) return undefined;
-    const parsed = validateWormholeSystemsFixture(JSON.parse(row.fixture_json));
-    if (!parsed.ok) throw new Error("Stored WormholeSystems fixture failed validation");
-    return parsed.value;
-  }
-  saveWormholeSystemsFixturePreview(mapId: string, preview: WormholePreview): void {
-    if (preview?.fixtureOnly !== true || preview.writeEligible !== false || !Array.isArray(preview.matched) || !Array.isArray(preview.skipped))
-      throw new Error("Only non-writable fixture previews may be stored");
-    if (preview.canonicalMapId !== mapId) throw new Error("Preview canonical map identity mismatch");
-    const source = this.wormholeSystemsFixture(mapId);
-    if (!source || source.scope.canonicalMapId !== mapId ||
-        preview.canonicalMapId !== source.scope.canonicalMapId || source.revisionOrDigest !== preview.sourceRevision)
-      throw new Error("Preview does not match the stored fixture identity or revision");
-    this.db.prepare(`INSERT INTO wormholesystems_fixture_previews(map_id,source_revision,preview_json,created_at) VALUES (?,?,?,?)
-      ON CONFLICT(map_id) DO UPDATE SET source_revision=excluded.source_revision,preview_json=excluded.preview_json,created_at=excluded.created_at`)
-      .run(mapId, preview.sourceRevision, JSON.stringify(preview), this.now());
-  }
-  wormholeSystemsFixturePreview(mapId: string): WormholePreview | undefined {
-    const row = this.db.prepare("SELECT source_revision,preview_json FROM wormholesystems_fixture_previews WHERE map_id=?").get(mapId) as { source_revision: string; preview_json: string } | undefined;
-    if (!row) return undefined;
-    const preview = JSON.parse(row.preview_json) as WormholePreview;
-    if (preview.fixtureOnly !== true || preview.writeEligible !== false) throw new Error("Stored fixture preview failed safety validation");
-    const source = this.wormholeSystemsFixture(mapId);
-    if (!source || source.scope.canonicalMapId !== mapId || preview.canonicalMapId !== source.scope.canonicalMapId ||
-        source.revisionOrDigest !== row.source_revision || preview.sourceRevision !== row.source_revision) return undefined;
-    return preview;
-  }
-  wormholeSystemsFixtureStatus(mapId: string): Json {
-    const row = this.db.prepare("SELECT source_identity,revision_or_digest,fetched_at,observed_at,fixture_version,validated_at,fixture_preview_eligible,write_eligible FROM wormholesystems_fixture_snapshots WHERE map_id=?").get(mapId) as any;
-    const latestRun = this.db.prepare("SELECT status,revision_or_digest,validated_at FROM wormholesystems_fixture_runs WHERE map_id=? ORDER BY id DESC LIMIT 1").get(mapId) as any;
-    let latestPreview = this.db.prepare("SELECT source_revision,created_at FROM wormholesystems_fixture_previews WHERE map_id=?").get(mapId) as any;
-    if (latestPreview && latestPreview.source_revision !== row?.revision_or_digest) latestPreview = undefined;
-    const preview = latestPreview ? this.wormholeSystemsFixturePreview(mapId) : undefined;
-    if (!preview) latestPreview = undefined;
-    return { map_id: mapId, integration_mode: "disabled_fixture_only", present: !!row,
-      ...(row ? { source_identity: row.source_identity, revision_or_digest: row.revision_or_digest,
-        fetched_at: row.fetched_at, observed_at: row.observed_at, fixture_version: row.fixture_version,
-        validated_at: row.validated_at, eligible_for_fixture_preview: !!row.fixture_preview_eligible,
-        eligible_for_writes: !!row.write_eligible } : { eligible_for_fixture_preview: false, eligible_for_writes: false }),
-      last_fixture_validation: latestRun ? { status: latestRun.status, revision_or_digest: latestRun.revision_or_digest, validated_at: latestRun.validated_at } : null,
-      last_fixture_preview: latestPreview ? { source_revision: latestPreview.source_revision, created_at: latestPreview.created_at,
-        matched_count: preview?.matched.length ?? 0, skipped_count: preview?.skipped.length ?? 0, write_eligible: false } : null };
   }
   chainReservations(map: string): ChainReservation[] {
     return (this.db.prepare("SELECT * FROM nexum_chain_reservations WHERE map_id=? ORDER BY created_at, signature_id").all(map) as any[])

@@ -13,34 +13,8 @@ export function normalizeBaseUrl(value: string): string {
 export interface NexumStream { events: AsyncIterable<Json>; close(): void; }
 export interface NexumTransport {
   get(base: string, key: string, endpoint: string, signal?: AbortSignal): Promise<any>;
-  post?(base: string, key: string, endpoint: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<any>;
   patch?(base: string, key: string, endpoint: string, body: Record<string,unknown>, signal?: AbortSignal): Promise<any>;
-  put?(base: string, key: string, endpoint: string, body: Record<string,unknown>, signal?: AbortSignal): Promise<any>;
   stream(base: string, key: string, endpoint: string, signal?: AbortSignal): Promise<NexumStream>;
-}
-const MAX_TOPOLOGY_REQUEST_BYTES = 16 * 1024 * 1024;
-const MAX_TOPOLOGY_RESPONSE_BYTES = 1024 * 1024;
-async function readBoundedText(response: Response, limit: number): Promise<string> {
-  if (!response.body) return "";
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > limit) {
-        await reader.cancel().catch(() => undefined);
-        throw new NexumError(0, 0, "Nexum topology response exceeds the size limit");
-      }
-      chunks.push(value);
-    }
-  } finally { reader.releaseLock(); }
-  const bytes = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-  return new TextDecoder().decode(bytes);
 }
 /** Nexum uses unnamed data frames, no event IDs/replay, and comment heartbeats every 25s. */
 export async function* decodeSse(body: ReadableStream<Uint8Array>, signal: AbortSignal): AsyncGenerator<Json> {
@@ -80,35 +54,12 @@ export class HttpNexumTransport implements NexumTransport {
     const r=await this.request(base,key,endpoint,s);
     try{return parseEsiJson(await r.text());}catch{throw new NexumError(0,0,"Malformed Nexum response");}
   }
-  async post(base:string,key:string,endpoint:string,body:Record<string,unknown>,signal?:AbortSignal):Promise<any> {
-    const s=AbortSignal.any([AbortSignal.timeout(20_000),...(signal?[signal]:[])]);
-    let serialized:string;
-    try{serialized=JSON.stringify(body);}catch{throw new NexumError(400,0,"Invalid Nexum JSON request");}
-    if(Buffer.byteLength(serialized,"utf8")>256_000)throw new NexumError(413,0,"Nexum ownership request exceeds the size limit");
-    try {
-      const r=await fetch(base+endpoint,{method:"POST",headers:{Authorization:`Bearer ${key}`,Accept:"application/json","Content-Type":"application/json"},body:serialized,redirect:"error",signal:s});
-      if(!r.ok){const retry=r.headers.get("retry-after"),ms=retry?(/^\d+(\.\d+)?$/.test(retry)?Number(retry)*1000:Math.max(0,Date.parse(retry)-Date.now())):0;await r.body?.cancel();throw new NexumError(r.status,Number.isFinite(ms)?ms:0,`Nexum HTTP ${r.status}`);}
-      const text=await readBoundedText(r,1024*1024); return text?parseEsiJson(text):{};
-    } catch(e){if(e instanceof NexumError)throw e;throw new NexumError();}
-  }
   async patch(base:string,key:string,endpoint:string,body:Record<string,unknown>,signal?:AbortSignal):Promise<any> {
     const s=AbortSignal.any([AbortSignal.timeout(20_000),...(signal?[signal]:[])]);
     try {
       const r=await fetch(base+endpoint,{method:"PATCH",headers:{Authorization:`Bearer ${key}`,Accept:"application/json","Content-Type":"application/json"},body:JSON.stringify(body),redirect:"error",signal:s});
       if(!r.ok){const retry=r.headers.get("retry-after"),ms=retry?(/^\d+(\.\d+)?$/.test(retry)?Number(retry)*1000:Math.max(0,Date.parse(retry)-Date.now())):0;await r.body?.cancel();throw new NexumError(r.status,Number.isFinite(ms)?ms:0,`Nexum HTTP ${r.status}`);}
       const text=await r.text(); return text?parseEsiJson(text):{};
-    } catch(e){if(e instanceof NexumError)throw e;throw new NexumError();}
-  }
-  async put(base:string,key:string,endpoint:string,body:Record<string,unknown>,signal?:AbortSignal):Promise<any> {
-    const s=AbortSignal.any([AbortSignal.timeout(20_000),...(signal?[signal]:[])]);
-    let serialized:string;
-    try{serialized=JSON.stringify(body);}catch{throw new NexumError(400,0,"Invalid Nexum JSON request");}
-    if(Buffer.byteLength(serialized,"utf8")>MAX_TOPOLOGY_REQUEST_BYTES)
-      throw new NexumError(413,0,"Nexum topology request exceeds the size limit");
-    try {
-      const r=await fetch(base+endpoint,{method:"PUT",headers:{Authorization:`Bearer ${key}`,Accept:"application/json","Content-Type":"application/json"},body:serialized,redirect:"error",signal:s});
-      if(!r.ok){const retry=r.headers.get("retry-after"),ms=retry?(/^\d+(\.\d+)?$/.test(retry)?Number(retry)*1000:Math.max(0,Date.parse(retry)-Date.now())):0;await r.body?.cancel();throw new NexumError(r.status,Number.isFinite(ms)?ms:0,`Nexum HTTP ${r.status}`);}
-      const text=await readBoundedText(r,MAX_TOPOLOGY_RESPONSE_BYTES); return text?parseEsiJson(text):{};
     } catch(e){if(e instanceof NexumError)throw e;throw new NexumError();}
   }
   async stream(base:string,key:string,endpoint:string,signal?:AbortSignal):Promise<NexumStream> {

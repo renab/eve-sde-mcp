@@ -103,8 +103,8 @@ Kubernetes set `fsGroup: 1000` on the pod):
 | `metadata.json` | SDE download metadata | Written by the downloader |
 | `auth.db` | Encrypted EVE SSO tokens | Sensitive. Encrypted with the persistent random key in `auth-secret.key` on this volume (a legacy hostname-derived install is migrated to it automatically on first start), so tokens decrypt on any host as long as the volume — key file included — is preserved |
 | `config.json` | EVE SSO `clientId` | Sensitive; create it or enroll via `esi_login` |
-| `galaxy-state.db` | Permanent ledger, ESI cache, keep-warm subscriptions, Nexum and WormholeSystems configuration/snapshots | Sensitive; back this up |
-| `galaxy-secret.key` | Random key encrypting stored Nexum and WormholeSystems credentials | Sensitive; lives next to the state DB |
+| `galaxy-state.db` | Permanent ledger, ESI cache, keep-warm subscriptions, Nexum data | Sensitive; back this up |
+| `galaxy-secret.key` | Random key encrypting stored Nexum credentials | Sensitive; lives next to the state DB |
 | `auth-secret.key` | Random 32-byte key encrypting the EVE SSO tokens in `auth.db` | Sensitive; lives next to `auth.db`; losing it makes stored characters undecryptable until they are re-enrolled via `esi_login` |
 
 ### Secrets
@@ -120,16 +120,6 @@ Kubernetes set `fsGroup: 1000` on the pod):
   callback targets `http://localhost:8085` *inside the container* and can
   only be reached via `kubectl port-forward`, or by pre-seeding
   `auth.db`/`config.json` into the volume.
-- WormholeSystems bearer credentials are enrolled/replaced through the
-  existing Cloudflare Access-protected Galaxy MCP operator path and encrypted
-  in `galaxy-state.db` using `galaxy-secret.key`. Back up and restore both
-  together; losing the key makes stored source credentials unrecoverable. Sync
-  is disabled by default and requires a successful explicit connection/schema
-  test followed by `wormholesystems_enable_sync`; registration or testing alone
-  does not activate it. This repository has not tested the actual alliance
-  deployment. Unit 06 implements automatic selected-map sync every five minutes once enabled and validly bound; the currently deployed scheduler has not been verified, so confirm the running Galaxy revision before relying on it. Source HTTP remains GET-only, while eligible sync writes a versioned Nexum topology/signature PUT (never linked notes). Manual sync remains available. A validated complete
-  map snapshot may qualify for the configured Nexum topology and note gates;
-  deployed source credentials, routes, schema and rate limits remain unverified.
 
 ### External dependencies (outbound HTTPS)
 
@@ -137,7 +127,6 @@ Kubernetes set `fsGroup: 1000` on the pod):
 - `login.eveonline.com` — EVE SSO OAuth
 - `www.fuzzwork.co.uk` — SDE download (first start / `refresh_sde`)
 - `eve-nexum.com` — Nexum wormhole maps (`NEXUM_BASE_URL`)
-- Operator-configured self-hosted WormholeSystems HTTPS origin — explicit GET-only connection tests and operator-activated five-minute selected-map source snapshot sync; no origin is assumed or configured by default. Actual deployment compatibility remains unverified and must be confirmed before operator activation.
 
 ### Health and readiness
 
@@ -247,11 +236,8 @@ A single-replica StatefulSet gives stable pod identity and a stable
 `spec.hostname` is not recommended: with a single `ReadWriteOnce` volume, a
 rolling update's surge pod cannot attach the volume while the old pod still
 runs. If the volume is lost or replaced, `auth.db` and `galaxy-secret.key`/
-`auth-secret.key` are lost with it — tokens and Nexum/WormholeSystems
-credentials become undecryptable until characters are re-enrolled via
-`esi_login` and source credentials are enrolled again. Restore the state
-database and `galaxy-secret.key` together; encrypted SQLite data alone is not
-sufficient.
+`auth-secret.key` are lost with it — tokens and Nexum credentials become
+undecryptable until characters are re-enrolled via `esi_login`.
 
 Do not scale beyond one replica: the `auth.db` and `galaxy-state.db` SQLite
 files are single-writer, and the `ReadWriteOnce` volume attaches to one pod
